@@ -15,6 +15,8 @@ export type RetirementCalculatorConfig = {
     name: string;
     amount: number;
     return: number;
+    targetRate?: number;
+    glideYears?: number;
   }[];
   oneTimeExpenses: {
     id: number;
@@ -22,10 +24,22 @@ export type RetirementCalculatorConfig = {
     yearsFromNow: number;
     currentCost: number;
     inflationRate: number;
+    linkedSavingsBucketId?: number;
+  }[];
+  postRetirementBuckets: {
+    id: number;
+    name: string;
+    allocationPct: number;
+    return: number;
   }[];
   nextBucketId: number;
   nextSavingsBucketId: number;
   nextExpenseId: number;
+  nextPostRetirementBucketId: number;
+  targetAge: number;
+  portfolioVolatility: number;
+  inflationVolatility: number;
+  monteCarloIterations: number;
 };
 
 const STORAGE_KEY = "retirement_calculator_config";
@@ -58,9 +72,19 @@ const defaultConfig: RetirementCalculatorConfig = {
       inflationRate: 8,
     },
   ],
+  postRetirementBuckets: [
+    { id: 1, name: "Cash / Liquid", allocationPct: 10, return: 6 },
+    { id: 2, name: "Debt", allocationPct: 30, return: 8 },
+    { id: 3, name: "Equity", allocationPct: 60, return: 11 },
+  ],
   nextBucketId: 4,
   nextSavingsBucketId: 1,
   nextExpenseId: 3,
+  nextPostRetirementBucketId: 4,
+  targetAge: 90,
+  portfolioVolatility: 12,
+  inflationVolatility: 1.5,
+  monteCarloIterations: 2000,
 };
 
 /**
@@ -73,7 +97,6 @@ export function getInitialRetirementConfig(): RetirementCalculatorConfig {
       const raw = window.localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
-        // Basic validation: check required fields
         if (
           typeof parsed.currentAge === "number" &&
           typeof parsed.inflation === "number" &&
@@ -85,7 +108,9 @@ export function getInitialRetirementConfig(): RetirementCalculatorConfig {
           typeof parsed.nextBucketId === "number" &&
           typeof parsed.nextExpenseId === "number"
         ) {
-          return parsed;
+          // Forward-fill any missing fields with defaults so older saved
+          // configs keep working after schema additions.
+          return { ...defaultConfig, ...parsed };
         }
       }
     } catch (e) {

@@ -25,4 +25,12 @@ export default tseslint.config(
       ],
     },
   },
+  // Test files run under Node (via tsx), so they need Node globals like
+  // process, console, etc.  React-specific rules don't apply here.
+  {
+    files: ['tests/**/*.{ts,tsx}'],
+    languageOptions: {
+      globals: { ...globals.node },
+    },
+  },
 )
