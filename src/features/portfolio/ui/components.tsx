@@ -1,7 +1,8 @@
 // Small, reusable UI primitives + dependency-free SVG charts. Mobile-first
 // Tailwind. Kept generic so every screen composes from the same vocabulary.
 
-import type { ChangeEvent, ReactNode } from "react";
+import { useEffect, useRef } from "react";
+import type { ChangeEvent, KeyboardEvent, ReactNode } from "react";
 
 export function Button({
   children,
@@ -28,6 +29,9 @@ export function Button({
       type={type}
       onClick={onClick}
       disabled={disabled}
+      // Exposes the variant so Modal can find the PRIMARY action button for
+      // Enter-to-submit (and deliberately never the "danger"/"ghost" ones).
+      data-variant={variant}
       className={`rounded-lg px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed ${styles[variant]} ${className}`}
     >
       {children}
@@ -156,14 +160,53 @@ export function Modal({
   children: ReactNode;
   onClose: () => void;
 }) {
+  const contentRef = useRef<HTMLDivElement>(null);
+
+  // Autofocus the first field when the dialog opens, so you can start typing
+  // immediately (standard form UX).
+  useEffect(() => {
+    const first = contentRef.current?.querySelector<HTMLElement>(
+      "input:not([type=checkbox]):not([type=radio]):not([type=button]):not([disabled]), select:not([disabled]), textarea:not([disabled])",
+    );
+    first?.focus();
+  }, []);
+
+  // Enter from a text input triggers the PRIMARY action (Add/Save) — but NOT
+  // Delete (danger) or Cancel (ghost), so a stray Enter can never destroy data.
+  // Ignored on textarea (newline), <select>/buttons (native behaviour), with a
+  // modifier held, during IME composition, or when the primary button is disabled
+  // (an invalid form) — matching exactly what a manual click would do.
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>): void => {
+    if (e.key !== "Enter" || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.nativeEvent.isComposing) return;
+    const t = e.target as HTMLElement;
+    if (t.tagName !== "INPUT") return;
+    const inputType = (t as HTMLInputElement).type;
+    if (inputType === "checkbox" || inputType === "radio" || inputType === "button" || inputType === "submit") return;
+    // This Enter belongs to THIS dialog's field. Dialogs can nest (the holding
+    // editor / event form open INSIDE the holding-detail dialog, DOM-nested), so
+    // stop it bubbling — otherwise a parent dialog's handler would also fire on the
+    // same keystroke and double-trigger its primary action.
+    e.stopPropagation();
+    const primary = contentRef.current?.querySelector<HTMLButtonElement>(
+      'button[data-variant="primary"]:not([disabled])',
+    );
+    if (primary) {
+      e.preventDefault();
+      primary.click();
+    }
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-0 sm:items-center sm:p-4"
       onClick={onClose}
     >
       <div
+        ref={contentRef}
         className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-t-2xl bg-white p-5 shadow-xl sm:rounded-2xl"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={onKeyDown}
       >
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-lg font-semibold text-slate-800">{title}</h3>
