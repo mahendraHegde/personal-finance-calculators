@@ -474,7 +474,7 @@ function HoldingForm({
         </Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Owner">
-            <Select value={personId} onChange={setPersonId} options={personOptions(state)} />
+            <Select value={personId} onChange={setPersonId} options={personOptions(state, true, personId)} />
           </Field>
           <Field label="Account / broker">
             <Select

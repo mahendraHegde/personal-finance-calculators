@@ -46,15 +46,19 @@ export function Expenses() {
 
   // Merge the year selection into the filter as inclusive date bounds.
   const effFilter = useMemo<TxnFilter>(() => {
-    // Drop a currency filter that no longer matches any data (e.g. its rows were
-    // deleted): the Select to clear it is hidden once only one currency remains,
-    // so otherwise it would silently filter everything out and stick totals at 0.
-    const f: TxnFilter =
-      filter.currency && !currencies.includes(filter.currency)
-        ? { ...filter, currency: undefined }
-        : filter;
+    // Drop a filter value that no longer resolves, so the ledger + totals can't
+    // stay SILENTLY scoped to something the dropdown no longer shows (which would
+    // make the headline numbers look wrong with no visible cause):
+    //  - currency: its Select hides once only one currency remains.
+    //  - personId: a person who was hard-deleted is gone from state.people.
+    //    (An ARCHIVED person still resolves — they stay selectable in this filter.)
+    let f: TxnFilter = filter;
+    if (f.currency && !currencies.includes(f.currency)) f = { ...f, currency: undefined };
+    if (f.personId && f.personId !== SHARED && !state.people.some((p) => p.id === f.personId)) {
+      f = { ...f, personId: undefined };
+    }
     return year ? { ...f, from: `${year}-01-01`, to: `${year}-12-31` } : f;
-  }, [filter, year, currencies]);
+  }, [filter, year, currencies, state.people]);
   const rows = useMemo(
     () => sortByDateDesc(filterTransactions(state.transactions, effFilter)),
     [state.transactions, effFilter],
@@ -120,7 +124,7 @@ export function Expenses() {
           <Select
             value={filter.personId ?? ""}
             onChange={(v) => updateFilter({ personId: v || undefined })}
-            options={[{ value: "", label: "All people" }, ...personOptions(state)]}
+            options={[{ value: "", label: "All people" }, ...personOptions(state, true, undefined, true)]}
           />
         </div>
         {currencies.length > 1 && (
@@ -353,7 +357,7 @@ function TransactionForm({
           </Field>
         </div>
         <Field label="Account">
-          <Select value={accountId} onChange={selectAccount} options={accountOptions(state)} />
+          <Select value={accountId} onChange={selectAccount} options={accountOptions(state, accountId)} />
         </Field>
         {type === "transfer" ? (
           <Field label="To account">
@@ -366,7 +370,7 @@ function TransactionForm({
         ) : (
           <>
             <Field label="Person">
-              <Select value={personId} onChange={setPersonId} options={personOptions(state)} />
+              <Select value={personId} onChange={setPersonId} options={personOptions(state, true, personId)} />
             </Field>
             <div className="grid grid-cols-2 gap-3">
               <Field label="Category">
@@ -376,14 +380,14 @@ function TransactionForm({
                     setParentCat(v);
                     setSubCat(""); // subcategories belong to a parent
                   }}
-                  options={categoryOptions(state, type)}
+                  options={categoryOptions(state, type, parentCat)}
                 />
               </Field>
               <Field label="Subcategory">
                 <Select
                   value={subCat}
                   onChange={setSubCat}
-                  options={subcategoryOptions(state, parentCat)}
+                  options={subcategoryOptions(state, parentCat, subCat)}
                 />
               </Field>
             </div>

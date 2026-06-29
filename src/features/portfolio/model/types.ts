@@ -45,6 +45,9 @@ export interface Category {
   /** Parent category id for a SUB-category; absent for a top-level category.
    *  A subcategory inherits its parent's `kind`. (Two levels only.) */
   parentId?: ID;
+  /** Hidden from the Add/Edit pickers but kept for history (old transactions
+   *  still resolve its name). Set when a referenced category can't be deleted. */
+  archived?: boolean;
 }
 
 export type TxnType = "expense" | "income" | "transfer";

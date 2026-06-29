@@ -7,8 +7,11 @@ import { newId } from "../../../lib/util/id";
 import { usePortfolio } from "../state/context";
 import type { Account, AccountType, Category, CategoryKind, Person } from "../model/types";
 import { SHARED } from "../model/types";
-import { Button, Card, EmptyState, Field, Modal, Select, SectionTitle, TextInput } from "./components";
-import { CURRENCY_CHOICES, ownerLabel, personOptions } from "./helpers";
+import { Badge, Button, Card, EmptyState, Field, Modal, Select, SectionTitle, TextInput } from "./components";
+import { CURRENCY_CHOICES, ownerLabel, personOptions, referenceSummary } from "./helpers";
+
+type EntityKind = "person" | "account" | "category";
+type Entity = Person | Account | Category;
 
 const ACCOUNT_TYPES: AccountType[] = [
   "bank",
@@ -41,17 +44,42 @@ export function Accounts() {
   const { state, store } = usePortfolio();
   const [form, setForm] = useState<FormState>(null);
   const [error, setError] = useState<string | null>(null);
+  const [del, setDel] = useState<{ kind: EntityKind; rec: Entity } | null>(null);
 
   const remove = (fn: Promise<void>): void => {
     setError(null);
     void fn.catch((e: unknown) => setError(String(e)));
   };
 
-  // Row that opens the editor on click; the "remove" button stops propagation.
+  const setArchived = (kind: EntityKind, rec: Entity, archived: boolean): Promise<void> => {
+    if (kind === "person") return store.savePerson({ ...(rec as Person), archived });
+    if (kind === "account") return store.saveAccount({ ...(rec as Account), archived });
+    return store.saveCategory({ ...(rec as Category), archived });
+  };
+
+  // Row that opens the editor on click; the action buttons stop propagation.
   const rowProps = (onEdit: () => void) => ({
     onClick: onEdit,
     className: "flex cursor-pointer items-center justify-between gap-2 py-2 hover:bg-slate-50",
   });
+
+  // Per-row actions: archive/unarchive (reversible, no confirm) + delete (opens a
+  // dialog that hard-deletes only when nothing references it, else offers Archive).
+  const actions = (kind: EntityKind, rec: Entity) => (
+    <span className="flex shrink-0 items-center gap-3" onClick={(e) => e.stopPropagation()}>
+      {rec.archived && <Badge>archived</Badge>}
+      <button
+        onClick={() => remove(setArchived(kind, rec, !rec.archived))}
+        className="text-xs text-slate-500 hover:underline"
+      >
+        {rec.archived ? "unarchive" : "archive"}
+      </button>
+      <button onClick={() => setDel({ kind, rec })} className="text-xs text-red-500 hover:underline">
+        delete
+      </button>
+    </span>
+  );
+  const nameCls = (archived?: boolean): string => (archived ? "text-slate-400" : "text-slate-700");
 
   return (
     <div className="space-y-6">
@@ -69,16 +97,8 @@ export function Accounts() {
           <ul className="divide-y divide-slate-100 text-sm">
             {state.people.map((p) => (
               <li key={p.id} {...rowProps(() => setForm({ kind: "person", rec: p }))}>
-                <span className="text-slate-700">{p.name}</span>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    remove(store.deletePerson(p.id));
-                  }}
-                  className="text-xs text-red-500 hover:underline"
-                >
-                  remove
-                </button>
+                <span className={nameCls(p.archived)}>{p.name}</span>
+                {actions("person", p)}
               </li>
             ))}
           </ul>
@@ -98,21 +118,13 @@ export function Accounts() {
           <ul className="divide-y divide-slate-100 text-sm">
             {state.accounts.map((a) => (
               <li key={a.id} {...rowProps(() => setForm({ kind: "account", rec: a }))}>
-                <span className="text-slate-700">
+                <span className={nameCls(a.archived)}>
                   {a.name}{" "}
                   <span className="text-xs text-slate-400">
                     {a.type} · {a.currency} · {ownerLabel(state, a.personId)}
                   </span>
                 </span>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    remove(store.deleteAccount(a.id));
-                  }}
-                  className="text-xs text-red-500 hover:underline"
-                >
-                  remove
-                </button>
+                {actions("account", a)}
               </li>
             ))}
           </ul>
@@ -132,19 +144,11 @@ export function Accounts() {
           <ul className="divide-y divide-slate-100 text-sm">
             {state.categories.map((c) => (
               <li key={c.id} {...rowProps(() => setForm({ kind: "category", rec: c }))}>
-                <span className="text-slate-700">
+                <span className={nameCls(c.archived)}>
                   {c.parentId ? <span className="text-slate-400">↳ </span> : null}
                   {c.name} <span className="text-xs text-slate-400">{c.kind}</span>
                 </span>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    remove(store.deleteCategory(c.id));
-                  }}
-                  className="text-xs text-red-500 hover:underline"
-                >
-                  remove
-                </button>
+                {actions("category", c)}
               </li>
             ))}
           </ul>
@@ -154,7 +158,93 @@ export function Accounts() {
       {form?.kind === "person" && <PersonForm initial={form.rec} onClose={() => setForm(null)} />}
       {form?.kind === "account" && <AccountForm initial={form.rec} onClose={() => setForm(null)} />}
       {form?.kind === "category" && <CategoryForm initial={form.rec} onClose={() => setForm(null)} />}
+      {del && <DeleteDialog kind={del.kind} rec={del.rec} onClose={() => setDel(null)} />}
     </div>
+  );
+}
+
+// Delete confirm that protects history: hard-delete only when nothing references
+// the entity; otherwise explain what uses it and offer Archive (hide from menus,
+// keep history) instead.
+function DeleteDialog({
+  kind,
+  rec,
+  onClose,
+}: {
+  kind: EntityKind;
+  rec: Entity;
+  onClose: () => void;
+}) {
+  const { state, store } = usePortfolio();
+  const [err, setErr] = useState<string | null>(null);
+  const { total, summary } = referenceSummary(state, kind, rec.id);
+  const label = kind === "person" ? "family member" : kind;
+  const run = (p: Promise<void>): void => {
+    setErr(null);
+    p.then(onClose).catch((e: unknown) => setErr(String(e)));
+  };
+  const archive = (): Promise<void> => {
+    if (kind === "person") return store.savePerson({ ...(rec as Person), archived: true });
+    if (kind === "account") return store.saveAccount({ ...(rec as Account), archived: true });
+    return store.saveCategory({ ...(rec as Category), archived: true });
+  };
+  const hardDelete = (): Promise<void> => {
+    if (kind === "person") return store.deletePerson(rec.id);
+    if (kind === "account") return store.deleteAccount(rec.id);
+    return store.deleteCategory(rec.id);
+  };
+
+  return (
+    <Modal title={`Delete ${label}?`} onClose={onClose}>
+      <div className="space-y-3 text-sm">
+        {err && <p className="text-red-600">{err}</p>}
+        {total === 0 ? (
+          <>
+            <p className="text-slate-600">
+              Permanently delete <b>{rec.name}</b>? Nothing uses it, so this is safe — but it can't be
+              undone.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button variant="danger" onClick={() => run(hardDelete())}>
+                Delete
+              </Button>
+            </div>
+          </>
+        ) : !rec.archived ? (
+          <>
+            <p className="text-slate-600">
+              <b>{rec.name}</b> is used by {summary}. Deleting it would orphan that history, so it's
+              protected.
+            </p>
+            <p className="text-slate-500">
+              Archive it instead — it's hidden from the menus when you add or edit entries, but your
+              history and totals stay intact. You can unarchive it anytime.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button onClick={() => run(archive())}>Archive</Button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="text-slate-600">
+              <b>{rec.name}</b> is used by {summary} and is already archived (hidden from menus). To
+              delete it, reassign or remove those entries first.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" onClick={onClose}>
+                Close
+              </Button>
+            </div>
+          </>
+        )}
+      </div>
+    </Modal>
   );
 }
 
@@ -231,7 +321,7 @@ function AccountForm({ initial, onClose }: { initial?: Account; onClose: () => v
           </Field>
         </div>
         <Field label="Owner">
-          <Select value={personId} onChange={setPersonId} options={personOptions(state)} />
+          <Select value={personId} onChange={setPersonId} options={personOptions(state, true, personId)} />
         </Field>
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
@@ -269,8 +359,9 @@ function CategoryForm({ initial, onClose }: { initial?: Category; onClose: () =>
   // two levels), so editing it can't move it under a parent.
   const hasChildren = initial ? state.categories.some((c) => c.parentId === initial.id) : false;
   // Eligible parents: top-level categories of the chosen kind, never itself.
+  // Hide archived parents, but keep the currently-selected one visible.
   const parents = state.categories.filter(
-    (c) => !c.parentId && c.kind === kind && c.id !== initial?.id,
+    (c) => !c.parentId && c.kind === kind && c.id !== initial?.id && (!c.archived || c.id === parentId),
   );
   const parent = state.categories.find((c) => c.id === parentId);
   // A subcategory inherits its parent's kind.
@@ -288,6 +379,7 @@ function CategoryForm({ initial, onClose }: { initial?: Category; onClose: () =>
         name: name.trim(),
         kind: effectiveKind,
         parentId: parentId || undefined,
+        archived: initial?.archived, // preserve archived state across an edit
       });
       // Keep subcategories' kind in sync if a parent's kind changed (they inherit it).
       if (initial) {
