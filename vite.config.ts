@@ -6,4 +6,8 @@ import { defineConfig } from "vite";
 export default defineConfig({
   base: "/personal-finance-calculators/",
   plugins: [react(), tailwindcss()],
+  server: {
+    host: true,
+    allowedHosts: [".srv.us"],
+  },
 });
