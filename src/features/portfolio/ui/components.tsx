@@ -1,8 +1,9 @@
 // Small, reusable UI primitives + dependency-free SVG charts. Mobile-first
 // Tailwind. Kept generic so every screen composes from the same vocabulary.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent, ReactNode } from "react";
+import { ChevronDown, ChevronUp, Eye, EyeOff } from "lucide-react";
 
 export function Button({
   children,
@@ -44,6 +45,44 @@ export function Card({ children, className = "" }: { children: ReactNode; classN
     <div className={`rounded-2xl border border-slate-200 bg-white p-4 shadow-sm ${className}`}>
       {children}
     </div>
+  );
+}
+
+/** A card whose body is hidden until the user reveals it. The body is rendered
+ *  only when `open`, so callers can gate expensive computation behind it (nothing
+ *  runs until you open the section). `variant="eye"` reads as privacy/disclose
+ *  (for sensitive figures); "chevron" as expand (for charts/tables). Controlled,
+ *  so the parent owns `open` and can lazily compute the data it needs. */
+export function RevealCard({
+  title,
+  subtitle,
+  open,
+  onToggle,
+  variant = "chevron",
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  open: boolean;
+  onToggle: () => void;
+  variant?: "chevron" | "eye";
+  children: ReactNode;
+}) {
+  const Icon = variant === "eye" ? (open ? EyeOff : Eye) : open ? ChevronUp : ChevronDown;
+  return (
+    <Card>
+      <button onClick={onToggle} aria-expanded={open} className="flex w-full items-center justify-between gap-3 text-left">
+        <div>
+          <h2 className="text-lg font-semibold text-slate-800">{title}</h2>
+          {subtitle && <p className="mt-0.5 text-xs text-slate-400">{subtitle}</p>}
+        </div>
+        <span className="flex shrink-0 items-center gap-1 text-xs font-medium text-slate-400">
+          <span className="hidden sm:inline">{open ? "Hide" : "Show"}</span>
+          <Icon size={18} />
+        </span>
+      </button>
+      {open && <div className="mt-4">{children}</div>}
+    </Card>
   );
 }
 
@@ -245,69 +284,147 @@ export interface Segment {
 }
 
 /** Donut chart from segments (dependency-free SVG). */
-export function Donut({ segments, size = 160 }: { segments: Segment[]; size?: number }) {
+export function Donut({
+  segments,
+  size = 160,
+  format,
+}: {
+  segments: Segment[];
+  size?: number;
+  /** Formats a segment value for the hover label (e.g. money). */
+  format?: (v: number) => string;
+}) {
+  const [hi, setHi] = useState<number | null>(null);
   const total = segments.reduce((s, x) => s + Math.max(0, x.value), 0);
   const r = size / 2 - 12;
   const c = 2 * Math.PI * r;
+  const fmt = format ?? ((v: number) => String(v));
+  const active = hi !== null ? segments[hi] : null;
   let offset = 0;
   return (
-    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0">
-      <g transform={`translate(${size / 2},${size / 2}) rotate(-90)`}>
-        {total > 0 &&
-          segments.map((seg) => {
-            const frac = Math.max(0, seg.value) / total;
-            const dash = frac * c;
-            const el = (
-              <circle
-                key={seg.label}
-                r={r}
-                fill="none"
-                stroke={seg.color}
-                strokeWidth={16}
-                strokeDasharray={`${dash} ${c - dash}`}
-                strokeDashoffset={-offset}
-              />
-            );
-            offset += dash;
-            return el;
-          })}
-        {total === 0 && <circle r={r} fill="none" stroke="#e2e8f0" strokeWidth={16} />}
-      </g>
-    </svg>
+    <div className="relative shrink-0" style={{ width: size, height: size }}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+        <g transform={`translate(${size / 2},${size / 2}) rotate(-90)`}>
+          {total > 0 &&
+            segments.map((seg, i) => {
+              const frac = Math.max(0, seg.value) / total;
+              const dash = frac * c;
+              const el = (
+                <circle
+                  key={seg.label}
+                  r={r}
+                  fill="none"
+                  stroke={seg.color}
+                  strokeWidth={hi === i ? 20 : 16}
+                  strokeDasharray={`${dash} ${c - dash}`}
+                  strokeDashoffset={-offset}
+                  opacity={hi === null || hi === i ? 1 : 0.35}
+                  className="cursor-pointer transition-[stroke-width,opacity]"
+                  onMouseEnter={() => setHi(i)}
+                  onMouseLeave={() => setHi(null)}
+                />
+              );
+              offset += dash;
+              return el;
+            })}
+          {total === 0 && <circle r={r} fill="none" stroke="#e2e8f0" strokeWidth={16} />}
+        </g>
+      </svg>
+      {/* Center read-out: the hovered slice, or the total at rest. */}
+      <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center px-6 text-center leading-tight">
+        {active ? (
+          <>
+            <span className="text-xs capitalize text-slate-500">{active.label}</span>
+            <span className="text-sm font-semibold text-slate-800">{fmt(Math.max(0, active.value))}</span>
+            <span className="text-xs text-slate-400">
+              {total > 0 ? Math.round((Math.max(0, active.value) / total) * 100) : 0}%
+            </span>
+          </>
+        ) : (
+          <>
+            <span className="text-[10px] uppercase tracking-wide text-slate-400">Total</span>
+            <span className="text-sm font-semibold text-slate-700">{fmt(total)}</span>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
 /** Grouped income/expense bars per month (dependency-free SVG). */
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const monthAbbr = (ym: string): string => MONTH_ABBR[Number(ym.slice(5, 7)) - 1] ?? ym;
+const monthLong = (ym: string): string => `${monthAbbr(ym)} ${ym.slice(0, 4)}`;
+
 export function BarTrend({
   data,
-  width = 320,
+  width = 360,
   height = 140,
+  format,
 }: {
   data: Array<{ month: string; income: number; expense: number }>;
   width?: number;
   height?: number;
+  /** Formats income/expense for the hover read-out (e.g. money). */
+  format?: (v: number) => string;
 }) {
+  const [hi, setHi] = useState<number | null>(null);
   if (data.length === 0) return <EmptyState>No activity yet.</EmptyState>;
-  const recent = data.slice(-6);
+  const recent = data.slice(-12);
   const max = Math.max(1, ...recent.flatMap((d) => [d.income, d.expense]));
+  const fmt = format ?? ((v: number) => String(v));
   const groupW = width / recent.length;
-  const barW = groupW / 3;
+  const barW = Math.min(groupW / 3, 18);
+  const active = hi !== null ? recent[hi] : null;
   return (
-    <svg width="100%" viewBox={`0 0 ${width} ${height + 20}`}>
-      {recent.map((d, i) => {
-        const x = i * groupW + groupW / 2;
-        const ih = (d.income / max) * height;
-        const eh = (d.expense / max) * height;
-        return (
-          <g key={d.month}>
-            <rect x={x - barW} y={height - ih} width={barW - 2} height={ih} fill="#16a34a" rx={2} />
-            <rect x={x + 2} y={height - eh} width={barW - 2} height={eh} fill="#dc2626" rx={2} />
-            <text x={x} y={height + 14} textAnchor="middle" className="fill-slate-400 text-[9px]">
-              {d.month.slice(5)}
-            </text>
-          </g>
-        );
-      })}
-    </svg>
+    <div>
+      {/* Legend at rest; the hovered month's figures when hovering. */}
+      <div className="mb-2 flex min-h-[1.25rem] flex-wrap items-center justify-between gap-2 text-xs">
+        <div className="flex gap-3 text-slate-500">
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-green-600" /> Income
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="inline-block h-2.5 w-2.5 rounded-sm bg-red-600" /> Expense
+          </span>
+        </div>
+        {active && (
+          <span className="text-slate-600">
+            <span className="font-medium">{monthLong(active.month)}</span> ·{" "}
+            <span className="text-green-600">+{fmt(active.income)}</span> /{" "}
+            <span className="text-red-600">−{fmt(active.expense)}</span>
+          </span>
+        )}
+      </div>
+      <svg width="100%" viewBox={`0 0 ${width} ${height + 30}`} preserveAspectRatio="none">
+        {recent.map((d, i) => {
+          const cx = i * groupW + groupW / 2;
+          const ih = (d.income / max) * height;
+          const eh = (d.expense / max) * height;
+          // Label the year under the first bar of each year (data may skip months
+          // and cross year boundaries), so "Mar" is never ambiguous on the axis.
+          const showYear = i === 0 || d.month.slice(0, 4) !== recent[i - 1].month.slice(0, 4);
+          return (
+            <g key={d.month} onMouseEnter={() => setHi(i)} onMouseLeave={() => setHi(null)}>
+              {/* full-height hit area so hovering anywhere in the column works */}
+              <rect x={i * groupW} y={0} width={groupW} height={height} fill="transparent" />
+              <rect x={cx - barW - 1} y={height - ih} width={barW} height={ih} fill="#16a34a" rx={2}
+                opacity={hi === null || hi === i ? 1 : 0.4} />
+              <rect x={cx + 1} y={height - eh} width={barW} height={eh} fill="#dc2626" rx={2}
+                opacity={hi === null || hi === i ? 1 : 0.4} />
+              <text x={cx} y={height + 14} textAnchor="middle"
+                className={hi === i ? "fill-slate-700 text-[9px] font-medium" : "fill-slate-400 text-[9px]"}>
+                {monthAbbr(d.month)}
+              </text>
+              {showYear && (
+                <text x={cx} y={height + 25} textAnchor="middle" className="fill-slate-300 text-[8px]">
+                  {d.month.slice(0, 4)}
+                </text>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
   );
 }
