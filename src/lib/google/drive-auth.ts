@@ -35,8 +35,10 @@ export class GoogleAuth {
   private token: string | null = null;
   private expiresAt = 0;
   /** Shared in-flight token request, so concurrent callers don't clobber the
-   *  single GIS callback slot. */
+   *  single GIS callback slot. `inFlightInteractive` records whether it will show
+   *  consent — a silent in-flight request can't satisfy an interactive caller. */
   private inFlight: Promise<string> | null = null;
+  private inFlightInteractive = false;
 
   constructor(clientId: string) {
     this.clientId = clientId;
@@ -60,32 +62,80 @@ export class GoogleAuth {
   /** Get a valid access token, requesting consent only when necessary. */
   async getToken(interactive = false): Promise<string> {
     if (this.token && Date.now() < this.expiresAt - 60_000) return this.token;
-    // Coalesce concurrent requests: GIS exposes ONE shared `callback` slot, so
-    // two overlapping requestAccessToken calls (e.g. Drive autosave AND the
-    // Sheets price oracle after a cold start) would overwrite each other's
-    // resolver, leaving one promise hung forever. Share a single in-flight fetch.
-    if (!this.inFlight) {
-      this.inFlight = this.requestToken(interactive).finally(() => {
+    // Coalesce concurrent requests: GIS exposes ONE shared `callback` slot, so two
+    // overlapping requestAccessToken calls (e.g. Drive autosave AND the Sheets
+    // price oracle) would clobber each other's resolver. BUT only ride an in-flight
+    // request that already satisfies the needed interactivity: a silent caller can
+    // ride anything; an INTERACTIVE caller (a user Connect / 401 re-consent) must
+    // NOT ride a silent request — that would never show the consent dialog and the
+    // click would fail. Instead it CHAINS after the silent one settles, so the two
+    // never run concurrently (callback-slot safety preserved) yet consent still
+    // opens on the first click.
+    if (this.inFlight && (!interactive || this.inFlightInteractive)) return this.inFlight;
+    const wait = this.inFlight ? this.inFlight.catch(() => undefined) : Promise.resolve();
+    const run = wait.then(() => this.requestToken(interactive));
+    this.inFlight = run;
+    this.inFlightInteractive = interactive;
+    // Only the LATEST request clears the slot, so an orphaned silent promise that
+    // settles late (via its watchdog) can't null a newer interactive request.
+    void run.finally(() => {
+      if (this.inFlight === run) {
         this.inFlight = null;
-      });
-    }
-    return this.inFlight;
+        this.inFlightInteractive = false;
+      }
+    });
+    return run;
   }
 
   private async requestToken(interactive: boolean): Promise<string> {
     const client = await this.ensureClient();
     return new Promise<string>((resolve, reject) => {
-      client.callback = (resp: TokenResponse) => {
-        if (resp.error || !resp.access_token) {
-          reject(new Error(resp.error ?? "no access token"));
-          return;
-        }
-        this.token = resp.access_token;
-        this.expiresAt = Date.now() + resp.expires_in * 1000;
-        resolve(this.token);
+      // Settle EXACTLY once. With prompt:"none", GIS routes a silent-auth failure
+      // (interaction_required: expired session / revoked consent / ambiguous
+      // multi-account) to error_callback — and may never fire the success
+      // callback. Without handling that, the Promise would hang forever, pinning
+      // getToken's `inFlight` so even a later interactive reconnect returns the
+      // dead promise and the UI wedges. error_callback + a watchdog guarantee it
+      // always settles, so a failure cleanly rejects → the caller shows a
+      // reconnect state and the user's Connect click can self-heal.
+      let done = false;
+      // No watchdog for an interactive request — the user paces the consent dialog
+      // and GIS reports cancel/closed via error_callback. Silent requests expect
+      // no human, so a few seconds is ample.
+      const timer = interactive
+        ? null
+        : setTimeout(() => {
+            if (done) return;
+            done = true;
+            reject(new Error("silent token request timed out"));
+          }, 15_000);
+      const settle = (fn: () => void): void => {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        fn();
       };
-      // Empty prompt = silent reuse of prior consent; 'consent' forces the dialog.
-      client.requestAccessToken({ prompt: interactive ? "consent" : "" });
+      client.callback = (resp: TokenResponse) => {
+        settle(() => {
+          if (resp.error || !resp.access_token) {
+            reject(new Error(resp.error ?? "no access token"));
+            return;
+          }
+          this.token = resp.access_token;
+          this.expiresAt = Date.now() + resp.expires_in * 1000;
+          resolve(this.token);
+        });
+      };
+      client.error_callback = (err) => {
+        settle(() => reject(new Error(err?.type ?? err?.message ?? "token request failed")));
+      };
+      // Background refresh must be SILENT. Access tokens aren't persisted across
+      // page reloads, so every refresh re-requests one — and prompt:"" pops the
+      // account chooser EVERY time (the reported bug). prompt:"none" issues a token
+      // with NO UI when the user is signed in and has already granted access.
+      // Only an explicit user action passes interactive=true → 'consent', which
+      // intentionally shows the dialog once.
+      client.requestAccessToken({ prompt: interactive ? "consent" : "none" });
     });
   }
 

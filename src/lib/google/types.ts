@@ -7,8 +7,17 @@ export interface TokenResponse {
   error?: string;
 }
 
+/** GIS routes interaction-required / popup failures to error_callback (NOT the
+ *  success callback), so prompt:"none" silent failures must be handled here or
+ *  the token request hangs forever. */
+export interface TokenError {
+  type?: string;
+  message?: string;
+}
+
 export interface TokenClient {
   callback: (resp: TokenResponse) => void;
+  error_callback?: (err: TokenError) => void;
   requestAccessToken: (opts?: { prompt?: string }) => void;
 }
 
