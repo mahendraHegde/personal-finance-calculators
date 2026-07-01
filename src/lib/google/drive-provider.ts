@@ -4,6 +4,7 @@
 
 import type { SnapshotMeta, SyncProvider } from "../sync/types";
 import type { GoogleAuth } from "./drive-auth";
+import { SignInRequiredError } from "./drive-auth";
 
 const FILES = "https://www.googleapis.com/drive/v3/files";
 const UPLOAD = "https://www.googleapis.com/upload/drive/v3/files";
@@ -72,15 +73,11 @@ export class DriveSyncProvider implements SyncProvider {
       headers: { ...(init.headers ?? {}), Authorization: `Bearer ${token}` },
     });
     if (res.status === 401) {
-      // Token expired/revoked between refreshes — drop the dead cached token so
-      // the retry actually re-fetches one (getToken would otherwise return the
-      // same dead token from its cache), then re-acquire once and retry.
+      // Token revoked/expired server-side. Drop it and fail — do NOT open a popup
+      // in the background (that's the every-refresh-chooser bug + Windows popup
+      // failures). The user reconnects explicitly (Settings → Reconnect Google).
       this.auth.invalidate();
-      const fresh = await this.auth.getToken(true);
-      return fetch(url, {
-        ...init,
-        headers: { ...(init.headers ?? {}), Authorization: `Bearer ${fresh}` },
-      });
+      throw new SignInRequiredError("Google sign-in expired — reconnect in Settings");
     }
     return res;
   }

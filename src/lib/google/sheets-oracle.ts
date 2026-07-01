@@ -14,6 +14,7 @@
 // network or a real Sheet.
 
 import type { GoogleAuth } from "./drive-auth";
+import { SignInRequiredError } from "./drive-auth";
 
 const SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets";
 
@@ -84,10 +85,9 @@ export class SheetsOracle {
     const headers = { ...(init.headers ?? {}), Authorization: `Bearer ${token}` };
     const res = await fetch(url, { ...init, headers });
     if (res.status === 401) {
-      // Drop the dead cached token first, else getToken returns it again.
+      // Drop the dead token and fail — never pop a popup in the background.
       this.auth.invalidate();
-      const fresh = await this.auth.getToken(true);
-      return fetch(url, { ...init, headers: { ...headers, Authorization: `Bearer ${fresh}` } });
+      throw new SignInRequiredError("Google sign-in expired");
     }
     return res;
   }

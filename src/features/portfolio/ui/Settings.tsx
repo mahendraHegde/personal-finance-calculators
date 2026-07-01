@@ -223,6 +223,13 @@ export function Settings() {
             <Button disabled={busy !== null} onClick={() => run("sync", () => sync.syncNow())}>
               Sync now
             </Button>
+            {/* Only for a sign-in/token failure — NOT a conflict/data-loss error
+                (which needs Pull latest, and Reconnect can't resolve). */}
+            {status.needsAuth && (
+              <Button disabled={busy !== null} onClick={() => run("reconnect", () => sync.reconnect())}>
+                Reconnect Google
+              </Button>
+            )}
             <Button
               variant="ghost"
               disabled={busy !== null}

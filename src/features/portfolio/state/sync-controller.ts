@@ -13,7 +13,7 @@ import { bytesToUtf8 } from "../../../lib/crypto/base64";
 import type { EncryptedBlob, KdfParams } from "../../../lib/crypto/vault";
 import { decryptJson, deriveKey, encryptJson, newSalt } from "../../../lib/crypto/vault";
 import { clearVaultKey, loadVaultKey, saveVaultKey } from "../../../lib/crypto/keystore";
-import { GoogleAuth, pickFolder } from "../../../lib/google/drive-auth";
+import { GoogleAuth, pickFolder, SignInRequiredError } from "../../../lib/google/drive-auth";
 import { DriveSyncProvider } from "../../../lib/google/drive-provider";
 import { SheetsOracle } from "../../../lib/google/sheets-oracle";
 import { SCHEMA } from "../model/schema";
@@ -53,6 +53,10 @@ export interface SyncStatus {
   phase: SyncPhase;
   message?: string;
   remoteVersion?: number;
+  /** True only when the error is specifically a sign-in/token failure — the UI
+   *  shows "Reconnect Google" for this, NOT for a conflict / data-loss / vault
+   *  error (those need "Pull latest", and Reconnect can't resolve them). */
+  needsAuth?: boolean;
 }
 
 export interface RemoteCheck {
@@ -126,7 +130,12 @@ export class SyncController {
   getStatus = (): SyncStatus => this.status;
 
   private set(status: Partial<SyncStatus>): void {
-    this.status = { ...this.status, ...status };
+    // needsAuth is a property of ONE specific error; any phase transition clears it
+    // unless the patch explicitly re-asserts it — so it can't linger onto a later
+    // conflict/ready state and show a misleading Reconnect button.
+    const next: SyncStatus = { ...this.status, ...status };
+    if (status.phase !== undefined && status.needsAuth === undefined) next.needsAuth = false;
+    this.status = next;
     for (const cb of this.listeners) cb();
   }
 
@@ -258,6 +267,16 @@ export class SyncController {
     await this.reconcileVaultWithFolder();
     this.refreshPhase();
     return folder;
+  }
+
+  /** Explicit user re-auth (opens the consent popup) WITHOUT re-picking the folder
+   *  — for when the stored token expired or was revoked and background sync started
+   *  failing. Refreshes the token, then resyncs any pending changes. */
+  async reconnect(): Promise<void> {
+    if (!this.auth) throw new Error("configure the Drive client id first");
+    await this.auth.getToken(true); // interactive popup — user-initiated
+    this.refreshPhase();
+    if (this.engine && this.store.getState().dirty) await this.syncNow();
   }
 
   /** If the connected folder's snapshots use a different salt than our local
@@ -499,11 +518,18 @@ export class SyncController {
       this.scheduleAutosave();
     } catch (e) {
       // A THROWN error here is a transport/unexpected failure (the intentional
-      // data-loss guard and conflict path use `return`, not throw). Surface it
-      // but schedule a retry so a transient Drive blip doesn't wedge autosave
-      // forever — local data stays durable meanwhile.
-      this.set({ phase: "error", message: String(e) });
-      this.scheduleRetry();
+      // data-loss guard and conflict path use `return`, not throw).
+      const authNeeded = e instanceof SignInRequiredError;
+      this.set({
+        phase: "error",
+        message: authNeeded ? "Google sign-in needed — click Reconnect to resume sync." : String(e),
+        needsAuth: authNeeded,
+      });
+      // Retry a TRANSIENT Drive blip so autosave isn't wedged forever (local data
+      // stays durable meanwhile) — but do NOT auto-retry a sign-in failure: it
+      // can't succeed without the user, and looping would churn + flicker the
+      // Reconnect button. The user's Reconnect click resumes sync.
+      if (!authNeeded) this.scheduleRetry();
       throw e;
     }
   }

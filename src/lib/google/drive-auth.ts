@@ -8,6 +8,17 @@ import type { GoogleAccountsOAuth2, TokenClient, TokenResponse } from "./types";
 
 export const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 
+/** Thrown when a usable token can't be obtained WITHOUT opening a popup (no valid
+ *  stored token in the background, or a 401). Callers use it to surface a
+ *  "Reconnect" prompt and to NOT auto-retry — retrying can't succeed without the
+ *  user, and would just churn. */
+export class SignInRequiredError extends Error {
+  constructor(message = "Google sign-in required") {
+    super(message);
+    this.name = "SignInRequiredError";
+  }
+}
+
 const GIS_SRC = "https://accounts.google.com/gsi/client";
 const GAPI_SRC = "https://apis.google.com/js/api.js";
 
@@ -28,20 +39,53 @@ function loadScript(src: string): Promise<void> {
   });
 }
 
-/** Holds an access token and silently refreshes it when expired. */
+/** Holds a Google access token, PERSISTED across reloads (localStorage) so a page
+ *  refresh reuses the still-valid token instead of re-prompting. The GIS token
+ *  flow is POPUP-based — a fresh token can only come from a popup — so we open one
+ *  ONLY on an explicit user action (interactive=true). Background callers reuse the
+ *  stored token or fail (never a popup), which is what stops the account chooser
+ *  appearing on every refresh and trips of popup_closed / COOP errors on the
+ *  browsers (notably Windows Chrome) where the silent popup flow misbehaves. */
 export class GoogleAuth {
   private readonly clientId: string;
+  private readonly storeKey: string;
   private client: TokenClient | null = null;
   private token: string | null = null;
   private expiresAt = 0;
-  /** Shared in-flight token request, so concurrent callers don't clobber the
-   *  single GIS callback slot. `inFlightInteractive` records whether it will show
-   *  consent — a silent in-flight request can't satisfy an interactive caller. */
+  /** One shared in-flight INTERACTIVE request, so concurrent Connect/Reconnect
+   *  clicks open a SINGLE popup instead of clobbering GIS's one callback slot. */
   private inFlight: Promise<string> | null = null;
-  private inFlightInteractive = false;
 
   constructor(clientId: string) {
     this.clientId = clientId;
+    this.storeKey = `pf-gtoken-${clientId}`;
+    this.load();
+  }
+
+  private valid(): boolean {
+    return this.token !== null && Date.now() < this.expiresAt - 60_000;
+  }
+
+  // Persist the (user's own, ~1h-lived) token so a reload reuses it without a popup.
+  private save(): void {
+    try {
+      localStorage.setItem(this.storeKey, JSON.stringify({ token: this.token, expiresAt: this.expiresAt }));
+    } catch {
+      /* private mode / quota — fall back to in-memory only */
+    }
+  }
+  private load(): void {
+    try {
+      const raw = localStorage.getItem(this.storeKey);
+      if (!raw) return;
+      const v = JSON.parse(raw) as { token?: unknown; expiresAt?: unknown };
+      if (typeof v.token === "string" && typeof v.expiresAt === "number") {
+        this.token = v.token;
+        this.expiresAt = v.expiresAt;
+      }
+    } catch {
+      /* ignore a corrupt entry */
+    }
   }
 
   private async ensureClient(): Promise<TokenClient> {
@@ -59,63 +103,52 @@ export class GoogleAuth {
     return this.client;
   }
 
-  /** Get a valid access token, requesting consent only when necessary. */
+  /**
+   * A valid access token. `interactive=false` (background: autosave, price refresh)
+   * NEVER opens a popup — it returns the stored token or THROWS, so the UI can show
+   * a "reconnect" prompt. Only `interactive=true` (an explicit Connect / Reconnect
+   * click) opens the GIS popup. This is what keeps the chooser off every refresh.
+   */
   async getToken(interactive = false): Promise<string> {
-    if (this.token && Date.now() < this.expiresAt - 60_000) return this.token;
-    // Coalesce concurrent requests: GIS exposes ONE shared `callback` slot, so two
-    // overlapping requestAccessToken calls (e.g. Drive autosave AND the Sheets
-    // price oracle) would clobber each other's resolver. BUT only ride an in-flight
-    // request that already satisfies the needed interactivity: a silent caller can
-    // ride anything; an INTERACTIVE caller (a user Connect / 401 re-consent) must
-    // NOT ride a silent request — that would never show the consent dialog and the
-    // click would fail. Instead it CHAINS after the silent one settles, so the two
-    // never run concurrently (callback-slot safety preserved) yet consent still
-    // opens on the first click.
-    if (this.inFlight && (!interactive || this.inFlightInteractive)) return this.inFlight;
-    const wait = this.inFlight ? this.inFlight.catch(() => undefined) : Promise.resolve();
-    const run = wait.then(() => this.requestToken(interactive));
-    this.inFlight = run;
-    this.inFlightInteractive = interactive;
-    // Only the LATEST request clears the slot, so an orphaned silent promise that
-    // settles late (via its watchdog) can't null a newer interactive request.
-    void run.finally(() => {
-      if (this.inFlight === run) {
-        this.inFlight = null;
-        this.inFlightInteractive = false;
-      }
-    });
-    return run;
+    if (this.valid()) return this.token as string;
+    if (!interactive) throw new SignInRequiredError();
+    // Coalesce concurrent interactive requests onto ONE popup (GIS has a single
+    // shared callback slot). The rejection is handled both here (so it never
+    // surfaces as an unhandled rejection) and by the awaiting caller.
+    if (!this.inFlight) {
+      const req = this.requestToken();
+      this.inFlight = req;
+      void req.then(
+        () => {
+          this.inFlight = null;
+        },
+        () => {
+          this.inFlight = null;
+        },
+      );
+    }
+    return this.inFlight;
   }
 
-  private async requestToken(interactive: boolean): Promise<string> {
+  private async requestToken(): Promise<string> {
     const client = await this.ensureClient();
     return new Promise<string>((resolve, reject) => {
-      // Settle EXACTLY once. With prompt:"none", GIS routes a silent-auth failure
-      // (interaction_required: expired session / revoked consent / ambiguous
-      // multi-account) to error_callback — and may never fire the success
-      // callback. Without handling that, the Promise would hang forever, pinning
-      // getToken's `inFlight` so even a later interactive reconnect returns the
-      // dead promise and the UI wedges. error_callback + a watchdog guarantee it
-      // always settles, so a failure cleanly rejects → the caller shows a
-      // reconnect state and the user's Connect click can self-heal.
+      // Settle exactly once. error_callback handles the popup cancel/closed/blocked
+      // cases; the watchdog is a generous backstop so a hung popup can't wedge the
+      // Connect button forever (the user paces the dialog).
       let done = false;
-      // No watchdog for an interactive request — the user paces the consent dialog
-      // and GIS reports cancel/closed via error_callback. Silent requests expect
-      // no human, so a few seconds is ample.
-      const timer = interactive
-        ? null
-        : setTimeout(() => {
-            if (done) return;
-            done = true;
-            reject(new Error("silent token request timed out"));
-          }, 15_000);
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        reject(new Error("sign-in timed out"));
+      }, 120_000);
       const settle = (fn: () => void): void => {
         if (done) return;
         done = true;
-        if (timer) clearTimeout(timer);
+        clearTimeout(timer);
         fn();
       };
-      client.callback = (resp: TokenResponse) => {
+      client.callback = (resp: TokenResponse) =>
         settle(() => {
           if (resp.error || !resp.access_token) {
             reject(new Error(resp.error ?? "no access token"));
@@ -123,36 +156,32 @@ export class GoogleAuth {
           }
           this.token = resp.access_token;
           this.expiresAt = Date.now() + resp.expires_in * 1000;
+          this.save();
           resolve(this.token);
         });
-      };
-      client.error_callback = (err) => {
-        settle(() => reject(new Error(err?.type ?? err?.message ?? "token request failed")));
-      };
-      // Background refresh must be SILENT. Access tokens aren't persisted across
-      // page reloads, so every refresh re-requests one — and prompt:"" pops the
-      // account chooser EVERY time (the reported bug). prompt:"none" issues a token
-      // with NO UI when the user is signed in and has already granted access.
-      // Only an explicit user action passes interactive=true → 'consent', which
-      // intentionally shows the dialog once.
-      client.requestAccessToken({ prompt: interactive ? "consent" : "none" });
+      client.error_callback = (err) =>
+        settle(() => reject(new Error(err?.type ?? err?.message ?? "sign-in failed")));
+      // Empty prompt reuses prior consent when possible (quick re-auth) and shows
+      // the chooser/consent the first time. Reached only via an explicit user
+      // action, so a popup here is expected.
+      client.requestAccessToken({ prompt: "" });
     });
   }
 
-  /** Drop the cached token so the NEXT getToken forces a fresh GIS fetch. Call on
-   *  a 401 before retrying: getToken's cache fast-path (line above) returns the
-   *  cached token regardless of the `interactive` flag, so without invalidating
-   *  first, the retry would hand back the SAME dead token and could never recover
-   *  until the cached clock-expiry (~1h). (A fresh requestAccessToken always
-   *  issues a NEW token, so this is the only thing standing in the way.) */
+  /** Forget the token (e.g. after a 401) so the next INTERACTIVE request re-auths.
+   *  Never opens a popup — background callers reject and the UI prompts to reconnect. */
   invalidate(): void {
     this.token = null;
     this.expiresAt = 0;
+    try {
+      localStorage.removeItem(this.storeKey);
+    } catch {
+      /* ignore */
+    }
   }
 
   signOut(): void {
-    this.token = null;
-    this.expiresAt = 0;
+    this.invalidate();
   }
 }
 
