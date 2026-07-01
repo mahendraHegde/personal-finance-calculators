@@ -7,6 +7,7 @@ import {
   holdingPnl,
   holdingXirr,
   netUnits,
+  portfolioReturn,
 } from "../src/features/portfolio/domain/holdings";
 import { accountBalances, accountBalancesByPerson, netWorth } from "../src/features/portfolio/domain/networth";
 import type { Account, Holding, HoldingEvent, Transaction } from "../src/features/portfolio/model/types";
@@ -382,6 +383,73 @@ section("[networth] valid same-currency transfer nets to zero + per-person sums 
   near(nw.total, 1000, 1e-9, "net worth = 1000 (transfer nets to zero)");
   const sumByPerson = Object.values(nw.byPerson).reduce((s, v) => s + v, 0);
   near(sumByPerson, nw.total, 1e-9, "sum(byPerson) === total");
+}
+
+section("[portfolio] money-weighted return (XIRR) across holdings, multi-currency");
+{
+  const usd: FxTable = { base: "USD", rates: { USD: 1, INR: 80 } };
+  const fxAt = (): FxTable => usd; // flat rates for the test
+  const holdings: Holding[] = [
+    { id: "H1", name: "US ETF", personId: "p1", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+    { id: "H2", name: "IN Fund", personId: "p1", assetClass: "equity", currency: "INR", incomeMode: "accumulating" },
+    { id: "H3", name: "No basis", personId: "p1", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+  ];
+  const events = new Map<string, HoldingEvent[]>([
+    // +50% over exactly one year (buy 100 → worth 150).
+    ["H1", [ev({ type: "buy", date: "2024-01-01", units: 100, price: 1 }), ev({ type: "valuation", date: "2025-01-01", amount: 150 })]],
+    // INR holding, also +50% over the year (8000 INR → 12000 INR); converts to USD 1:80.
+    ["H2", [ev({ type: "buy", date: "2024-01-01", units: 80, price: 100 }), ev({ type: "valuation", date: "2025-01-01", amount: 12000 })]],
+    // value-only (no cost basis) → excluded from the return.
+    ["H3", [ev({ type: "valuation", date: "2025-01-01", amount: 999 })]],
+  ]);
+  const r = portfolioReturn(holdings, events, "USD", fxAt, "2025-01-01");
+  eq(r.included, 2, "the two cost-basis holdings contribute; value-only one excluded");
+  eq(r.total, 3, "all three counted in the total");
+  near(r.invested, 200, 1e-9, "invested = 100 USD + 8000 INR/80 = 200 USD");
+  near(r.value, 300, 1e-9, "value = 150 USD + 12000 INR/80 = 300 USD");
+  near(r.xirr ?? NaN, 0.5, 0.02, "~50% p.a. money-weighted (both holdings +50% over 1y)");
+}
+
+section("[portfolio] a holding added TODAY (0-day span) is still counted, not dropped");
+{
+  const fxAt = (): FxTable => ({ base: "USD", rates: { USD: 1 } });
+  const today = "2025-06-30";
+  const holdings: Holding[] = [
+    { id: "H1", name: "Bought today", personId: "p1", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+  ];
+  const events = new Map<string, HoldingEvent[]>([
+    ["H1", [
+      ev({ type: "buy", date: today, units: 100, price: 1, createdAt: "2025-06-30T10:00:00Z" }),
+      ev({ type: "valuation", date: today, amount: 110, createdAt: "2025-06-30T11:00:00Z" }),
+    ]],
+  ]);
+  const r = portfolioReturn(holdings, events, "USD", fxAt, today);
+  eq(r.included, 1, "same-day holding IS counted (regression: was wrongly dropped)");
+  near(r.invested, 100, 1e-9, "invested counted");
+  near(r.value, 110, 1e-9, "value counted");
+  eq(r.xirr, null, "annualized return undefined over a 0-day span → honest —, not a fake %");
+}
+
+section("[portfolio] same-day holding + a 1-year holding → both counted, return solvable");
+{
+  const fxAt = (): FxTable => ({ base: "USD", rates: { USD: 1 } });
+  const asOf = "2025-01-01";
+  const holdings: Holding[] = [
+    { id: "H1", name: "Today", personId: "p1", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+    { id: "H2", name: "One year", personId: "p1", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+  ];
+  const events = new Map<string, HoldingEvent[]>([
+    ["H1", [
+      ev({ type: "buy", date: asOf, units: 100, price: 1, createdAt: "2025-01-01T10:00:00Z" }),
+      ev({ type: "valuation", date: asOf, amount: 110, createdAt: "2025-01-01T11:00:00Z" }),
+    ]],
+    ["H2", [ev({ type: "buy", date: "2024-01-01", units: 100, price: 1 }), ev({ type: "valuation", date: asOf, amount: 150 })]],
+  ]);
+  const r = portfolioReturn(holdings, events, "USD", fxAt, asOf);
+  eq(r.included, 2, "both holdings counted");
+  near(r.invested, 200, 1e-9, "invested = 100 + 100");
+  near(r.value, 260, 1e-9, "value = 110 + 150");
+  ok(r.xirr !== null && r.xirr > 0, "combined return solvable + positive (the 1yr holding gives a nonzero span)");
 }
 
 done();

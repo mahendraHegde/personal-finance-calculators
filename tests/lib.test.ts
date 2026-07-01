@@ -164,6 +164,24 @@ section("[xirr] not computable cases → null");
     null,
     "no sign change → null",
   );
+  // Zero-day span (all flows one date) → undefined IRR, regardless of net —
+  // break-even is the sneaky one (constant-zero NPV must not return the guess).
+  eq(
+    xirr([
+      { date: "2025-06-30", amount: -100 },
+      { date: "2025-06-30", amount: 100 },
+    ]),
+    null,
+    "0-day span, break-even → null (not the initial guess)",
+  );
+  eq(
+    xirr([
+      { date: "2025-06-30", amount: -100 },
+      { date: "2025-06-30", amount: 110 },
+    ]),
+    null,
+    "0-day span, gain → null",
+  );
 }
 
 section("[xirr] invalid date fails closed (null, not an absurd rate)");

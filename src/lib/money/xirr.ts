@@ -53,6 +53,11 @@ export function xirr(cashflows: Cashflow[], guess = 0.1): number | null {
   if (times.some((t) => !Number.isFinite(t))) return null;
 
   const t0 = Math.min(...times);
+  // Zero-day span (every flow on ONE date): there's no elapsed time to annualize
+  // over, so an IRR is undefined regardless of the net. Reject explicitly — a
+  // break-even 0-span series makes NPV a constant zero, which would otherwise let
+  // Newton's first step return the initial guess as a bogus "solved" rate.
+  if (t0 === Math.max(...times)) return null;
   const flows: Normalised[] = valid.map((c, i) => ({
     years: (times[i] - t0) / MS_PER_YEAR,
     amount: c.amount,

@@ -6,7 +6,9 @@
 
 import type { Cashflow } from "../../../lib/money/xirr";
 import { xirr } from "../../../lib/money/xirr";
-import type { DataQuality, HoldingEvent } from "../model/types";
+import { tryConvert } from "../../../lib/money/currency";
+import type { CurrencyCode, FxTable } from "../../../lib/money/currency";
+import type { DataQuality, Holding, HoldingEvent } from "../model/types";
 
 function byDate(a: HoldingEvent, b: HoldingEvent): number {
   return a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
@@ -214,4 +216,95 @@ export function holdingPnl(events: HoldingEvent[]): {
   else if (closed) absoluteGain = costKnown ? income - invested : null;
   else absoluteGain = null;
   return { invested, value, income, absoluteGain };
+}
+
+export interface PortfolioReturn {
+  /** Money-weighted (XIRR) annualized return across ALL holdings combined, in the
+   *  base currency; null when it can't be computed honestly. Includes dividends and
+   *  FX moves; EXCLUDES cash/salary (only holdings contribute). */
+  xirr: number | null;
+  invested: number; // base
+  value: number; // base — current market value of open positions
+  absoluteGain: number | null; // base — incl. dividends + realized
+  included: number; // holdings that contributed to the return
+  total: number; // holdings with any events
+}
+
+/**
+ * Portfolio-level money-weighted return: concatenate every eligible holding's
+ * dated cashflows (opening/buy = outflow, sell/dividend = inflow, current value a
+ * final inflow at `asOf`), each converted to `base` at ITS date's FX, then run one
+ * XIRR. Only holdings with a computable per-holding return (real cost basis + a
+ * fresh value or fully closed) contribute — a value-only / stale holding has no
+ * honest return and is excluded (reported via `included`/`total`). A holding whose
+ * currency lacks a rate at some cashflow date is skipped rather than folded in with
+ * dropped flows (which would corrupt its contribution).
+ */
+export function portfolioReturn(
+  holdings: Holding[],
+  eventsByHolding: Map<string, HoldingEvent[]>,
+  base: CurrencyCode,
+  fxAt: (date: string) => FxTable,
+  asOf: string,
+): PortfolioReturn {
+  const flows: Cashflow[] = [];
+  const nowFx = fxAt(asOf);
+  let invested = 0;
+  let value = 0;
+  let gain = 0;
+  let gainKnown = false;
+  let included = 0;
+  let total = 0;
+
+  for (const h of holdings) {
+    const events = eventsByHolding.get(h.id) ?? [];
+    if (events.length === 0) continue;
+    total++;
+
+    // Include a holding with a real cost basis AND a known end state (a fresh current
+    // value, or fully closed). We deliberately DON'T gate on the standalone
+    // per-holding XIRR being solvable: a holding bought today at today's price has a
+    // 0-day span (its own IRR is null), yet it's valid and its money + flows belong
+    // in the portfolio — the single xirr() below solves once ANY flow in the combined
+    // series has a nonzero span. `invested > 0` excludes value-only holdings; the
+    // value-or-closed check excludes stale open positions.
+    const pnl = holdingPnl(events);
+    if (!(pnl.invested > 0 && (currentHoldingValue(events) !== null || isClosed(events)))) continue;
+
+    // Convert every flow at its own date; skip the WHOLE holding if any date lacks a
+    // rate (partial flows would corrupt the IRR).
+    const holdingFlows: Cashflow[] = [];
+    let convertible = true;
+    for (const cf of holdingCashflows(events, { asOf })) {
+      const b = tryConvert({ amount: cf.amount, currency: h.currency }, base, fxAt(String(cf.date)));
+      if (b === null || !Number.isFinite(b)) {
+        convertible = false;
+        break;
+      }
+      holdingFlows.push({ date: cf.date, amount: b });
+    }
+    if (!convertible) continue;
+
+    included++;
+    flows.push(...holdingFlows);
+    // Display aggregates cover the SAME set (in base, current rate), so
+    // "invested / value / gain" stays coherent.
+    const toBaseNow = (amt: number): number =>
+      tryConvert({ amount: amt, currency: h.currency }, base, nowFx) ?? 0;
+    invested += toBaseNow(pnl.invested);
+    if (pnl.value !== null) value += toBaseNow(pnl.value);
+    if (pnl.absoluteGain !== null) {
+      gain += toBaseNow(pnl.absoluteGain);
+      gainKnown = true;
+    }
+  }
+
+  return {
+    xirr: flows.length >= 2 ? xirr(flows) : null,
+    invested,
+    value,
+    absoluteGain: gainKnown ? gain : null,
+    included,
+    total,
+  };
 }

@@ -9,7 +9,7 @@ import { useMemo, useState } from "react";
 import { formatCompactMoney, formatMoney, formatPercent, monthKey, todayIso } from "../../../lib/util/format";
 import { tryConvert } from "../../../lib/money/currency";
 import { accountBalances, accountBalancesByPerson, netWorth } from "../domain/networth";
-import { currentHoldingValue, dataQuality, holdingXirr } from "../domain/holdings";
+import { currentHoldingValue, dataQuality, holdingXirr, portfolioReturn } from "../domain/holdings";
 import { categoryTotals, flowSummary, monthlyTotals, type CategoryTotal } from "../domain/transactions";
 import type { PortfolioState } from "../state/store";
 import { usePortfolio } from "../state/context";
@@ -102,7 +102,15 @@ function computeHeavy(state: PortfolioState) {
       pct: exposureAssets > 0 ? (e.value / exposureAssets) * 100 : 0,
     }));
 
-  return { base, nw, flow, holdings, allocation, people, exposure };
+  const ret = portfolioReturn(
+    state.holdings,
+    byHolding,
+    base,
+    makeFxAt(state.fxRates, base, fx),
+    todayIso(),
+  );
+
+  return { base, nw, flow, holdings, allocation, people, exposure, ret };
 }
 
 export function Dashboard() {
@@ -120,7 +128,8 @@ export function Dashboard() {
     });
 
   // Shared heavy scan — computed once, and ONLY when a section that needs it is open.
-  const needHeavy = isOpen("networth") || isOpen("allocation") || isOpen("exposure") || isOpen("holdings");
+  const needHeavy =
+    isOpen("networth") || isOpen("allocation") || isOpen("exposure") || isOpen("holdings") || isOpen("return");
   const heavy = useMemo(() => (needHeavy ? computeHeavy(state) : null), [state, needHeavy]);
 
   // Monthly trend is a separate scan (per-date FX), gated on its own section.
@@ -200,6 +209,43 @@ export function Dashboard() {
             )}
           </div>
         )}
+      </RevealCard>
+
+      <RevealCard
+        title="Portfolio return"
+        subtitle="How your investments are actually growing (money-weighted)"
+        open={isOpen("return")}
+        onToggle={() => toggle("return")}
+      >
+        {heavy &&
+          (heavy.ret.included === 0 ? (
+            <EmptyState>
+              Add holdings with a cost basis and a current value (via live prices or a valuation) to
+              see your return.
+            </EmptyState>
+          ) : (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+                <StatCard label="Return p.a." value={formatPercent(heavy.ret.xirr)} sub="money-weighted (XIRR)" />
+                <StatCard label={`Current value (${base})`} value={formatCompactMoney(heavy.ret.value, base)} />
+                <StatCard label="Invested" value={formatCompactMoney(heavy.ret.invested, base)} />
+                <StatCard
+                  label="Gain"
+                  value={heavy.ret.absoluteGain === null ? "—" : formatCompactMoney(heavy.ret.absoluteGain, base)}
+                  sub="incl. dividends"
+                />
+              </div>
+              <p className="text-xs text-slate-400">
+                Annualized money-weighted return since you started investing, in {base} — it includes
+                dividends and currency moves, and excludes your cash &amp; salary. Based on{" "}
+                {heavy.ret.included} of {heavy.ret.total} holdings
+                {heavy.ret.total - heavy.ret.included > 0
+                  ? ` (${heavy.ret.total - heavy.ret.included} skipped — no cost basis or no fresh value)`
+                  : ""}
+                . Compare it to your expected inflation to see your real growth.
+              </p>
+            </div>
+          ))}
       </RevealCard>
 
       <RevealCard
