@@ -330,7 +330,7 @@ function TransactionForm({
   }
 
   return (
-    <Modal title={initial ? "Edit transaction" : "Add transaction"} onClose={onClose}>
+    <Modal title={initial ? "Edit transaction" : "Add transaction"} onClose={onClose} wide>
       <div className="space-y-3">
         <Field label="Type">
           <Select

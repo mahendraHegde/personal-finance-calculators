@@ -204,19 +204,20 @@ section("[fetchPrices] unconvertible quote currency → skipped with hint");
   ok(skipped[0]?.reason.includes("convert"), "skip reason mentions conversion");
 }
 
-section("[fetchPrices] blank quote currency is SKIPPED, never guessed");
+section("[fetchPrices] blank quote currency → assume the holding's own currency (mutual funds)");
 {
-  // Google Finance sometimes returns a price with a blank currency cell.
-  // Guessing the holding's currency would silently mis-value a foreign-quoted
-  // ticker, so we skip rather than produce wrong money.
-  const h = holding({ id: "gf", currency: "INR", ticker: "VOO", priceSource: "googlefinance" });
-  const events = new Map([["gf", [buy("gf", 3, 1000)]]]);
+  // GOOGLEFINANCE returns NO currency for some instruments — notably mutual funds,
+  // whose NAV is in the fund's own currency (which the user sets as the holding
+  // currency). Assume it rather than skip; skipping left MFs permanently unpriced.
+  const h = holding({ id: "mf", currency: "INR", ticker: "MUTF_IN:X", priceSource: "googlefinance" });
+  const events = new Map([["mf", [buy("mf", 10, 50)]]]);
   const providers: PriceProviderRegistry = new Map([
-    ["googlefinance", stubProvider("googlefinance", { VOO: { price: 540, currency: "" } })],
+    ["googlefinance", stubProvider("googlefinance", { "MUTF_IN:X": { price: 54.56, currency: "" } })],
   ]);
   const { valuations, skipped } = await fetchPrices([h], events, providers, FX, "2026-06-28");
-  eq(valuations.length, 0, "not valued with a guessed currency");
-  ok(skipped[0]?.reason.includes("currency"), "skip reason mentions the currency");
+  eq(skipped.length, 0, "blank currency is NOT skipped — assumed the holding currency");
+  eq(valuations.length, 1, "priced");
+  near(valuations[0]?.amount ?? NaN, 545.6, 1e-9, "10 units × 54.56 NAV, valued in INR");
 }
 
 // ---------------------------------------------------------------------------

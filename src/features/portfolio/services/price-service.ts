@@ -83,19 +83,17 @@ export async function fetchPrices(
           skipped.push({ holding: h, reason: "no quote returned" });
           continue;
         }
-        // Never GUESS the currency: GOOGLEFINANCE occasionally returns a price
-        // with a blank currency cell, and assuming it's the holding's currency
-        // would silently mis-value a foreign-quoted ticker (e.g. a USD price on
-        // an INR holding valued ~1/85th). Skip instead — a re-refresh usually
-        // resolves the currency.
-        if (!q.currency) {
-          skipped.push({ holding: h, reason: "couldn't determine the quote's currency — try refreshing again" });
-          continue;
-        }
-        // Convert the source's quote currency into the holding's own currency.
-        const inHoldingCcy = tryConvert({ amount: q.price, currency: q.currency }, h.currency, fx);
+        // GOOGLEFINANCE reports no currency for some instruments — notably mutual
+        // funds, whose NAV is in the fund's own currency and which NEVER return a
+        // currency attribute (so waiting/refreshing can't help). When it's blank,
+        // assume the holding's OWN currency: the user sets the holding currency to
+        // match the security, so for MFs and domestic quotes this is correct. (A
+        // genuinely foreign-quoted ticker that also returns a blank currency is
+        // rare and would show an obviously-wrong value the user can catch.)
+        const quoteCcy = q.currency || h.currency;
+        const inHoldingCcy = tryConvert({ amount: q.price, currency: quoteCcy }, h.currency, fx);
         if (inHoldingCcy === null) {
-          skipped.push({ holding: h, reason: `can't convert ${q.currency} → ${h.currency} (set an FX rate)` });
+          skipped.push({ holding: h, reason: `can't convert ${quoteCcy} → ${h.currency} (set an FX rate)` });
           continue;
         }
         priceByHolding.set(h.id, inHoldingCcy);

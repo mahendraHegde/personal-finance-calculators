@@ -194,10 +194,13 @@ export function Modal({
   title,
   children,
   onClose,
+  wide = false,
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
+  /** Roomier dialog for multi-field forms (holdings, transactions). */
+  wide?: boolean;
 }) {
   const contentRef = useRef<HTMLDivElement>(null);
 
@@ -243,7 +246,7 @@ export function Modal({
     >
       <div
         ref={contentRef}
-        className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-t-2xl bg-white p-5 shadow-xl sm:rounded-2xl"
+        className={`max-h-[90vh] w-full overflow-y-auto rounded-t-2xl bg-white p-5 shadow-xl sm:rounded-2xl ${wide ? "max-w-2xl" : "max-w-lg"}`}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={onKeyDown}
       >

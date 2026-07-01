@@ -76,13 +76,15 @@ function LivePriceFields({
       <div className="mb-2 text-xs font-medium text-slate-500">
         Live price (optional) — auto-updates value from units × latest price
       </div>
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-3 gap-2">
         <Field label="Source">
           <Select value={priceSource} onChange={setPriceSource} options={PRICE_SOURCE_OPTIONS} />
         </Field>
-        <Field label="Ticker / code">
-          <TextInput value={ticker} onChange={setTicker} placeholder={priceSource ? "" : "—"} />
-        </Field>
+        <div className="col-span-2">
+          <Field label="Ticker / code">
+            <TextInput value={ticker} onChange={setTicker} placeholder={priceSource ? "e.g. NSE:INFY, VOO, MUTF_IN:…" : "—"} />
+          </Field>
+        </div>
       </div>
       {priceSource && (
         <p className="mt-1 text-xs text-slate-400">
@@ -467,7 +469,7 @@ function HoldingForm({
   };
 
   return (
-    <Modal title={initial ? "Edit holding" : "Add holding"} onClose={onClose}>
+    <Modal title={initial ? "Edit holding" : "Add holding"} onClose={onClose} wide>
       <div className="space-y-3">
         <Field label="Name">
           <TextInput value={name} onChange={setName} placeholder="e.g. Nifty 50 Index Fund" />
@@ -589,7 +591,7 @@ function HoldingDetail({
   const existingOpening = events.find((e) => e.type === "opening");
 
   return (
-    <Modal title={holding.name} onClose={onClose}>
+    <Modal title={holding.name} onClose={onClose} wide>
       <div className="space-y-4">
         <div className="grid grid-cols-3 gap-2 text-center">
           <div className="rounded-lg bg-slate-50 p-2">
@@ -795,7 +797,7 @@ function EventForm({
   };
 
   return (
-    <Modal title={initial ? "Edit transaction" : "Add transaction"} onClose={onClose}>
+    <Modal title={initial ? "Edit transaction" : "Add transaction"} onClose={onClose} wide>
       <div className="space-y-3">
         <div className="grid grid-cols-2 gap-3">
           <Field label="Type">
