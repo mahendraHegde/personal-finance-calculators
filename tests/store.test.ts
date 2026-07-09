@@ -276,4 +276,74 @@ section("[store] addValuations for a DELETED holding writes no orphan + does not
   eq(store.getState().version, v0, "version NOT bumped (nothing to persist or sync)");
 }
 
+// --- version bookkeeping used by the envelope-encryption baseline/re-key paths ---
+// A regression in any of these silently loses edits or makes a restored/re-keyed
+// baseline fail to publish, so they are unit-pinned here (pure, in-memory).
+
+section("[store] bumpVersionAbove lifts a publishable version above the floor");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.savePerson({ id: "p1", name: "A" }); // version now 1, lastSynced 0
+  await store.markSynced(1); // clean at v1
+  // A migration/reset publishes a baseline floored at the folder's max (say 7).
+  await store.bumpVersionAbove(7);
+  const s = store.getState();
+  eq(s.version, 8, "version = max(state, floor) + 1 = 8");
+  eq(s.settings.lastSyncedVersion, 7, "lastSyncedVersion set to the floor (everything up to it superseded)");
+  ok(s.dirty, "dirty so the baseline actually publishes");
+}
+
+section("[store] bumpVersionAbove uses the local version when it already exceeds the floor");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.savePerson({ id: "p1", name: "A" });
+  await store.savePerson({ id: "p2", name: "B" }); // version now 2
+  await store.bumpVersionAbove(0); // floor below local
+  eq(store.getState().version, 3, "version = max(2, 0) + 1 = 3 (local version wins)");
+  eq(store.getState().settings.lastSyncedVersion, 0, "lastSyncedVersion = floor (0)");
+}
+
+section("[store] applyDocument (pull) marks synced + clean; never regresses the version");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.savePerson({ id: "p1", name: "A" }); // local version 1, dirty
+  // Pull a HIGHER remote version → adopt it, mark synced, clean.
+  await store.applyDocument(emptyDoc(5));
+  let s = store.getState();
+  eq(s.version, 5, "version adopts the pulled doc version");
+  eq(s.settings.lastSyncedVersion, 5, "lastSyncedVersion = pulled version");
+  ok(!s.dirty, "clean after a pull (this IS what's on the remote)");
+  eq(s.people.length, 0, "pulled (empty) data replaced local");
+  // Pull an OLDER version → working version must not regress below the local one.
+  await store.savePerson({ id: "p2", name: "B" }); // version 6, dirty
+  await store.applyDocument(emptyDoc(3));
+  s = store.getState();
+  ok(s.version >= 6, "loading an older snapshot does not regress the working version");
+}
+
+section("[store] applyDocument(dirty) keeps a restore publishable (strictly above lastSynced)");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.savePerson({ id: "p1", name: "A" });
+  await store.markSynced(1); // synced at v1
+  // Restore a backup whose version (1) is NOT above lastSynced → must be lifted so
+  // "Sync now" uploads it instead of taking the "nothing to sync" path.
+  await store.applyDocument(emptyDoc(1), { dirty: true });
+  const s = store.getState();
+  ok(s.dirty, "restore stays dirty");
+  ok(s.version > s.settings.lastSyncedVersion, "version lifted strictly above lastSyncedVersion so it publishes");
+  eq(s.settings.lastSyncedVersion, 1, "lastSyncedVersion unchanged by a dirty restore (we didn't pull)");
+}
+
+section("[store] markSynced clears dirty only when nothing raced ahead");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.savePerson({ id: "p1", name: "A" }); // version 1
+  await store.markSynced(1);
+  ok(!store.getState().dirty, "clean when the synced version matches the working version");
+  await store.savePerson({ id: "p2", name: "B" }); // version 2, dirty
+  await store.markSynced(1); // an older push confirmed while v2 is pending
+  ok(store.getState().dirty, "still dirty because v2 hasn't been synced (no lost edit)");
+}
+
 done();

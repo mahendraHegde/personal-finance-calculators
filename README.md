@@ -31,14 +31,17 @@ to a Google Drive folder you choose, for backup and family sharing.
   hidden by default and computed on demand; financial figures sit behind an eye toggle for privacy.
 - **Backup & sync** — encrypted `.pfdb` file export/restore, and conflict-safe Google Drive sync
   (no auto-merge; changes are reviewed via a diff before applying). A passphrase derives a
-  non-extractable key held in the browser.
+  key that stays in the browser (envelope encryption: your passphrase wraps a per-folder data
+  key, so the password can be changed without re-encrypting or orphaning old backups — see
+  `docs/MIGRATION_HISTORY.md`).
 - **Archive, not delete** — a person/account/category still referenced by history can't be deleted
   (it would orphan records); archive it instead to hide it from menus while keeping history intact.
 
 **Enabling Drive sync (optional):** create a Google Cloud OAuth **client ID** (and API key for the
 Picker), enable the **Drive** and **Sheets** APIs in that project, then paste the client ID / API key
 in the app's **Settings** and pick a folder. No client secret is used (a static site can't hold one).
-See `docs/PLAN.md` for the full design.
+See `docs/PLAN.md` for the full design, and `docs/MIGRATION_HISTORY.md` for the encryption model
+(envelope encryption / keyring) and how data-format migrations are handled.
 
 ## Getting Started
 
@@ -99,6 +102,7 @@ npm run deploy
   `crypto/`, `google/` (Drive + Sheets)
 - `tests/` – framework-free `tsx` test suites (`npm test`)
 - `docs/PLAN.md` – design plan, decisions, and divergences
+- `docs/MIGRATION_HISTORY.md` – data-format / crypto migrations (envelope encryption + keyring) and their rationale
 
 ## Testing
 

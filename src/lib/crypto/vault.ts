@@ -1,13 +1,27 @@
 // Passphrase-derived encryption for snapshots/backups.
 //
-// PBKDF2(SHA-256) → a NON-EXTRACTABLE AES-GCM key. Non-extractable means JS can
-// use the key to encrypt/decrypt but cannot read the key bytes back out — so it
-// can be stashed in IndexedDB and reused across refreshes without ever storing
-// the passphrase, and an XSS payload can't exfiltrate the key material itself.
+// ENVELOPE ENCRYPTION (see docs/MIGRATION_HISTORY.md, 2026-07):
+//   - A random per-folder DEK (Data Encryption Key) actually encrypts files.
+//     Stable, never changes; identified by a `dekId`.
+//   - The passphrase derives a KEK (PBKDF2-SHA-256 → AES-GCM) whose ONLY job is
+//     to WRAP (AES-GCM-encrypt the raw bytes of) the DEK. Changing the passphrase
+//     re-wraps the SAME DEK, so old files stay decryptable and a shared folder
+//     never splits.
 //
-// IMPORTANT (multi-device family): all devices must derive from the SAME
-// passphrase AND the SAME salt to produce the same key. The salt is non-secret
-// and shared via the folder; only the IV is per-encryption random.
+// The KEK is NON-EXTRACTABLE (used to wrap/unwrap only, never exported). The DEK
+// is EXTRACTABLE — that is required to re-wrap it under a new passphrase for the
+// forgot-password recovery path. This is sound here because the local IndexedDB
+// is plaintext anyway (the vault only protects Drive snapshots/backups), so an
+// XSS attacker with origin script execution can already read the data directly;
+// the primary control is preventing XSS. See MIGRATION_HISTORY.md for the full
+// trade-off.
+//
+// `deriveKey` still produces the v1 direct key (used to READ legacy pfdb-v1
+// files) and doubles as the KEK — both are exactly PBKDF2 → AES-GCM-256.
+//
+// IMPORTANT (multi-device family): all devices must derive the KEK from the SAME
+// passphrase AND the SAME salt to unwrap the shared DEK. The salt is non-secret
+// and shared via the keyring; only the IV is per-encryption random.
 
 import { b64ToBytes, bytesToB64, bytesToUtf8, utf8ToBytes } from "./base64";
 
@@ -54,6 +68,34 @@ export async function deriveKey(passphrase: string, kdf: KdfParams): Promise<Cry
     false, // non-extractable
     ["encrypt", "decrypt"],
   );
+}
+
+// --- Envelope: DEK (data key) generation, wrapping, and import ---------------
+
+/** Mint a fresh random DEK — an EXTRACTABLE AES-GCM-256 key (extractable so it
+ *  can be re-wrapped under a new passphrase; see the module header). */
+export async function generateDek(): Promise<CryptoKey> {
+  return subtle().generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+}
+
+/** Import raw DEK bytes as an EXTRACTABLE AES-GCM key (after unwrapping). */
+export async function importDek(raw: Uint8Array): Promise<CryptoKey> {
+  return subtle().importKey("raw", raw, { name: "AES-GCM" }, true, ["encrypt", "decrypt"]);
+}
+
+/** Wrap the DEK for storage in the keyring: export its raw bytes and AES-GCM
+ *  them with the passphrase-derived KEK. Requires `dek` to be extractable. */
+export async function wrapDek(kek: CryptoKey, dek: CryptoKey): Promise<EncryptedBlob> {
+  const raw = new Uint8Array(await subtle().exportKey("raw", dek));
+  return encryptBytes(kek, raw);
+}
+
+/** Unwrap the DEK from a keyring blob using the passphrase-derived KEK. Throws
+ *  (AES-GCM auth failure) if the passphrase/KEK is wrong — which is exactly how
+ *  we verify the passphrase. */
+export async function unwrapDek(kek: CryptoKey, wrapped: EncryptedBlob): Promise<CryptoKey> {
+  const raw = await decryptBytes(kek, wrapped);
+  return importDek(raw);
 }
 
 export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promise<EncryptedBlob> {

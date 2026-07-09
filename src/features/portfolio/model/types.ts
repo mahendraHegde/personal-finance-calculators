@@ -3,6 +3,7 @@
 
 import type { CurrencyCode } from "../../../lib/money/currency";
 import type { Entity } from "../../../lib/storage/types";
+import type { Keyring } from "../../../lib/crypto/keyring";
 
 export type ID = string;
 
@@ -156,11 +157,19 @@ export interface AppSettings {
   author: string;
   /** Manual FX overrides (units of CCY per 1 USD). */
   fxOverrides: Record<CurrencyCode, number>;
-  /** Shared KDF salt for the vault (non-secret); lets unlock work after lock
-   *  and lets other devices derive the same key from the same passphrase. */
+  /** Cached copy of the folder's keyring (envelope encryption): the DEK wrapped
+   *  by the passphrase-derived KEK, plus its version/dekId/kdf. Non-secret, and
+   *  device-local (stripped from snapshots). Survives lock so the UI can tell
+   *  "configured but locked" from "no vault", enables offline passphrase check
+   *  (unwrap the DEK), and lets a device re-upload the keyring if Drive's copy is
+   *  deleted. See docs/MIGRATION_HISTORY.md. */
+  vaultKeyring?: Keyring;
+  /** LEGACY (pre-envelope) shared KDF salt: the passphrase-derived key encrypted
+   *  files DIRECTLY. Kept only to detect + migrate a v1 vault to the keyring, and
+   *  to read old `pfdb-v1` snapshots. New vaults set `vaultKeyring` instead. */
   vaultKdf?: { salt: string; iterations: number };
-  /** A known sentinel encrypted with the vault key, so a passphrase can be
-   *  verified offline before it's accepted. Device-local. */
+  /** LEGACY sentinel for offline v1 passphrase check. v2 verifies by unwrapping
+   *  the keyring instead. Retained for v1 devices that haven't migrated yet. */
   vaultCheck?: { iv: string; ciphertext: string };
   /** ISO timestamp rates were last refreshed. */
   fxUpdatedAt?: string;

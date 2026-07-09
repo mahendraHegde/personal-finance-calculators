@@ -131,6 +131,10 @@ export function TextInput({
   return (
     <input
       type={type}
+      // A native date picker renders in the element's locale. Force en-GB so it shows
+      // DD/MM/YYYY (not the en-US MM/DD/YYYY); the stored value stays ISO yyyy-mm-dd,
+      // so nothing else changes. (Chromium/Firefox honor this; Safari follows the OS.)
+      lang={type === "date" ? "en-GB" : undefined}
       value={value}
       placeholder={placeholder}
       onChange={(e: ChangeEvent<HTMLInputElement>) => onChange(e.target.value)}

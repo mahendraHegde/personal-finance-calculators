@@ -541,6 +541,31 @@ export class PortfolioStore {
     });
   }
 
+  /** Force a fresh, PUBLISHABLE version strictly above `floor` (the folder's max
+   *  snapshot version) WITHOUT a data change — used to publish a new-baseline
+   *  snapshot after an encryption change (v1→v2 migration, or a fresh-DEK password
+   *  reset). Also sets `lastSyncedVersion = floor` so the pull-before-push guard
+   *  treats everything up to `floor` as superseded and lets this baseline publish.
+   *
+   *  SAFETY: this deliberately marks unseen remote snapshots as superseded, so it
+   *  must ONLY be called when we are intentionally establishing a new baseline from
+   *  local data — either a current device (migration: nothing unseen is dropped) or
+   *  a deliberate forgotten-password reset (old-key snapshots are unrecoverable
+   *  anyway). It is NOT a normal sync path. */
+  async bumpVersionAbove(floor: number): Promise<void> {
+    return this.exclusive(async () => {
+      const version = Math.max(this.state.version, floor) + 1;
+      const settings: AppSettings = {
+        ...this.state.settings,
+        localVersion: version,
+        lastSyncedVersion: floor,
+        id: "app",
+      };
+      await this.adapter.collection<AppSettings>(Collections.settings).put(settings);
+      this.emit({ version, dirty: true, settings });
+    });
+  }
+
   /** Record that `pushedVersion` was uploaded. We do NOT regress the working
    *  version, and we only clear `dirty` if no edit raced ahead during the push
    *  — otherwise autosave reschedules and the latest edit still gets pushed. */

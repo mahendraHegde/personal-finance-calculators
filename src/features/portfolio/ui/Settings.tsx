@@ -132,12 +132,17 @@ export function Settings() {
       <Card>
         <SectionTitle>Backup &amp; restore</SectionTitle>
         <p className="mb-3 text-sm text-slate-500">
-          {sync.hasVault()
-            ? "Backups are encrypted with your password."
-            : "Set a password above to encrypt backups (otherwise they're saved unprotected)."}
+          {status.phase === "locked"
+            ? "Locked — unlock above to download an encrypted backup."
+            : sync.hasVault()
+              ? "Backups are encrypted with your password."
+              : "Set a password above to encrypt backups (otherwise they're saved unprotected)."}
         </p>
         <div className="flex flex-wrap gap-2">
           <Button
+            // Disabled while locked: a configured vault must be unlocked to encrypt
+            // the backup — we never emit it as plaintext (exportBackup also refuses).
+            disabled={status.phase === "locked"}
             onClick={() =>
               run("backup", async () => {
                 const bytes = await sync.exportBackup();
@@ -287,7 +292,22 @@ export function Settings() {
       {restoreBytes && (
         <RestorePassphraseModal
           onClose={() => setRestoreBytes(null)}
-          onSubmit={(p) => void doRestore(restoreBytes, p)}
+          onSubmit={async (p) => {
+            // Throws on a wrong passphrase → shown INSIDE the modal (not the page
+            // banner behind it). On success, stage the diff and unmount the modal.
+            const { doc, adopt } = await sync.previewBackup(restoreBytes, p);
+            const local = await store.exportDocument();
+            setPending({
+              doc,
+              version: doc.version,
+              diff: diffDatasets(local.data, doc.data),
+              apply: async () => {
+                await store.applyDocument(doc, { dirty: true });
+                if (adopt) await adopt();
+              },
+            });
+            setRestoreBytes(null);
+          }}
         />
       )}
     </div>
@@ -299,22 +319,120 @@ function RestorePassphraseModal({
   onSubmit,
 }: {
   onClose: () => void;
-  onSubmit: (passphrase: string) => void;
+  onSubmit: (passphrase: string) => Promise<void>;
 }) {
   const [pass, setPass] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const submit = async (): Promise<void> => {
+    if (!pass || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await onSubmit(pass); // on success the caller unmounts this modal (no need to reset busy)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  };
   return (
     <Modal title="Restore encrypted backup" onClose={onClose}>
       <div className="space-y-3">
         <p className="text-sm text-slate-500">
           This file is encrypted. Enter the passphrase it was saved with to decrypt and restore it.
         </p>
+        {err && <p className="text-sm text-red-600">{err}</p>}
         <TextInput value={pass} onChange={setPass} type="password" placeholder="Backup passphrase" />
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button disabled={!pass} onClick={() => onSubmit(pass)}>
-            Decrypt &amp; restore
+          <Button disabled={!pass || busy} onClick={() => void submit()}>
+            {busy ? "Decrypting…" : "Decrypt & restore"}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/** Set a new password. Two modes:
+ *  - "change" (unlocked): re-wraps the SAME data key, so every existing backup and
+ *    synced snapshot stays readable — nothing is re-encrypted or orphaned.
+ *  - "reset" (locked / forgotten): if this device still holds the key it's the same
+ *    non-destructive re-wrap; if not, the vault is re-created from this device's
+ *    local data and OLD-password Drive/backup files can no longer be opened. */
+function PasswordChangeModal({
+  mode,
+  onClose,
+  onSubmit,
+}: {
+  mode: "change" | "reset";
+  onClose: () => void;
+  onSubmit: (newPassphrase: string) => Promise<void>;
+}) {
+  const [pass, setPass] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const ok = pass.length > 0 && pass === confirm;
+  const submit = async (): Promise<void> => {
+    if (!ok || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await onSubmit(pass);
+      onClose();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal title={mode === "change" ? "Change password" : "Reset password"} onClose={onClose}>
+      <div className="space-y-3">
+        {mode === "change" ? (
+          <>
+            <p className="text-sm text-slate-600">
+              Choose a new password for your encrypted backups &amp; Google Drive sync. All your
+              existing backups and synced data stay readable — only the password that unlocks them
+              changes.
+            </p>
+            <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700">
+              Your other devices will need this new password the next time they unlock.
+            </p>
+          </>
+        ) : (
+          <>
+            <p className="text-sm text-slate-600">
+              Set a new password without the old one. If this device still holds the key, everything
+              stays readable. If not, the vault is re-created from this device's local data.
+            </p>
+            <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700">
+              ⚠️ If any other device still has this open, use <b>Change password</b> there instead —
+              it keeps <b>everything</b> readable. Reset only if no device has it: backups and Drive
+              snapshots made with the OLD password can then no longer be opened (your data inside this
+              app is not lost).
+            </p>
+          </>
+        )}
+        {err && <p className="text-sm text-red-600">{err}</p>}
+        <Field label="New password">
+          <TextInput value={pass} onChange={setPass} type="password" placeholder="New password" />
+        </Field>
+        <Field label="Confirm new password">
+          <TextInput value={confirm} onChange={setConfirm} type="password" placeholder="Re-enter it" />
+        </Field>
+        {confirm.length > 0 && pass !== confirm && (
+          <p className="text-xs text-red-600">Passwords don't match.</p>
+        )}
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button disabled={!ok || busy} onClick={() => void submit()}>
+            {busy ? "Setting…" : mode === "change" ? "Change password" : "Reset password"}
           </Button>
         </div>
       </div>
@@ -362,6 +480,9 @@ function VaultSection() {
   const [pass, setPass] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // "change" = re-key while unlocked (keeps everything); "reset" = forgotten-password
+  // path from the locked screen.
+  const [pwModal, setPwModal] = useState<"change" | "reset" | null>(null);
   // "Join existing" only makes sense when a shared Drive folder is connected —
   // that's the only place an already-created password could exist to unlock.
   const hasFolder = Boolean(state.settings.drive?.folderId);
@@ -380,6 +501,16 @@ function VaultSection() {
     }
   };
 
+  // "change" re-wraps the same data key (nothing orphaned); "reset" is the
+  // forgotten-password path (non-destructive if the key is still held, else fresh).
+  const pwModalEl = pwModal ? (
+    <PasswordChangeModal
+      mode={pwModal}
+      onClose={() => setPwModal(null)}
+      onSubmit={(p) => (pwModal === "change" ? sync.changePassword(p) : sync.resetPassword(p))}
+    />
+  ) : null;
+
   // Shared, plain-language explanation of what the password does.
   const lifecycle = (
     <div className="space-y-1 text-xs text-slate-500">
@@ -393,8 +524,9 @@ function VaultSection() {
         computer) — your data stays safe, and you reopen it by typing the same password.
       </p>
       <p className="text-amber-700">
-        ⚠️ There's no “forgot password”. If you lose it, those encrypted backups can't be opened, so
-        keep it somewhere safe. (Your normal data inside this app isn't affected.)
+        ⚠️ Forgot it? While it's open on this device you can change it here without the old one, and
+        everything stays readable. If it's locked on every device and no one remembers it, only the
+        encrypted Drive/backup copies can't be opened — your data inside this app stays.
       </p>
     </div>
   );
@@ -421,6 +553,13 @@ function VaultSection() {
           “Incorrect password” just means it doesn't match the one you set — there's no other way to
           check it, since the password is never stored.
         </p>
+        <button
+          onClick={() => setPwModal("reset")}
+          className="text-left text-xs text-slate-500 underline hover:text-slate-700"
+        >
+          Forgot your password? Reset it.
+        </button>
+        {pwModalEl}
       </div>
     );
   }
@@ -459,18 +598,26 @@ function VaultSection() {
   }
   return (
     <div className="space-y-3">
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <span className="text-sm text-green-700">
           Protected — your backups and Google Drive sync are encrypted.
         </span>
-        <Button variant="ghost" onClick={() => void sync.lock()}>
-          Require password again
-        </Button>
+        <div className="flex gap-2">
+          <Button variant="ghost" onClick={() => setPwModal("change")}>
+            Change password
+          </Button>
+          <Button variant="ghost" onClick={() => void sync.lock()}>
+            Require password again
+          </Button>
+        </div>
       </div>
       <p className="text-xs text-slate-400">
-        Removes the password from this device until you type it again here. Nothing is deleted.
+        “Require password again” removes the password from this device until you type it again here
+        (nothing is deleted). “Change password” sets a new one — all your existing backups and synced
+        data stay readable.
       </p>
       {lifecycle}
+      {pwModalEl}
     </div>
   );
 }

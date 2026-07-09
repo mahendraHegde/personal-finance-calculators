@@ -26,8 +26,8 @@ future calculator we add.
 | **"Latest"** | `max(appProperties.version)` — a monotonic counter, **not** wall-clock (device clocks drift) |
 | **Load flow** | List folder (metadata only) → pick highest version → download just that one → **diff vs local** → prompt **[Load] / [Keep local]** |
 | **Concurrency** | No auto-merge (last-writer-wins on *apply*), but conflict is **detected and user-mediated**: pull-before-push guard + post-push TOCTOU re-check + a diff/review modal before applying a remote snapshot. Guards are **session-scoped** (by session file, not device) so two tabs on one profile also conflict-check. Immutable files ⇒ neither side's snapshot is destroyed (recoverable). |
-| **Secrets** | Passphrase → **non-extractable `CryptoKey`** in IndexedDB (usable, not exportable). OAuth access token **persisted to `localStorage`** (the user's own ~1h Drive token) so a refresh reuses it — the GIS token flow is popup-based, so the background **never** opens a consent popup; a fresh token is fetched only on an explicit Connect/Reconnect click. |
-| **Encryption** | Drive snapshot encrypted (AES-GCM); salt/IV/KDF in cleartext header, only ciphertext is secret |
+| **Secrets** | Passphrase → **KEK** (`PBKDF2-SHA-256`); the KEK wraps a random **DEK** that actually encrypts files. DEK held in IndexedDB as an **extractable** `CryptoKey` (extractable is required to re-wrap on a password change; sound because the local DB is plaintext anyway — see *Encryption* below). OAuth access token **persisted to `localStorage`** (the user's own ~1h Drive token) so a refresh reuses it — the GIS token flow is popup-based, so the background **never** opens a consent popup; a fresh token is fetched only on an explicit Connect/Reconnect click. |
+| **Encryption** | **Envelope encryption.** A random per-folder **DEK** (AES-GCM-256) encrypts snapshots/backups (`pfdb-v2`, IV + ciphertext only). The passphrase-derived **KEK** wraps the DEK in a shared, versioned **keyring** file in the folder (`pf-keyring-v1`: `{version, dekId, kdf, wrappedDEK}`). Changing/resetting the password **re-wraps the same DEK** → old snapshots/backups stay decryptable and the shared folder never breaks. See *Vault: envelope encryption* below and `docs/MIGRATION_HISTORY.md`. |
 | **Mobile** | Responsive (Tailwind mobile-first) + installable PWA + `navigator.storage.persist()`; **file backup is the durability backbone** |
 | **Hosting** | Plain `github.io` for now (origin isolation + Public Suffix List already prevent cross-site reads); custom domain later, no code change |
 | **Security** | Primary control = no XSS (strict CSP, React escaping, no `dangerouslySetInnerHTML`, minimal deps). Key storage is secondary defense-in-depth |
@@ -41,6 +41,39 @@ future calculator we add.
 - For `payout` holdings, reconcile later via an **`adjustment`** plug or bulk import — no rework,
   because XIRR is **derived from events**, events are **append-only + back-datable**.
 - Per-holding badge: `complete` (real buys) / `cost-estimate` (opening) / `value-only`.
+
+---
+
+## Vault: envelope encryption (locked)
+
+The vault protects **Drive snapshots and exported backups** (the local IndexedDB is
+plaintext). It uses **envelope encryption** so the password can be changed/reset without
+orphaning old files, and so a **single shared password across many devices/people** never
+splits the shared folder. Full rationale, formats, migration, and the security trade-off
+live in **`docs/MIGRATION_HISTORY.md`** (2026-07 entry). Summary:
+
+- **DEK (Data Encryption Key)** — random AES-GCM-256, **one per folder, never changes**;
+  encrypts every snapshot/backup. Identified by a stable random **`dekId`**.
+- **KEK (Key Encryption Key)** — `PBKDF2(passphrase, salt)`; its only job is to **wrap**
+  (AES-GCM-encrypt the raw bytes of) the DEK.
+- **Keyring** — a shared, versioned file in the folder (`pfApp=portfolio-keyring`,
+  immutable-latest-wins like snapshots): `{format:"pf-keyring-v1", version, dekId, kdf,
+  wrappedDEK}`. Safe to be public (no passphrase → no KEK → `wrappedDEK` is noise). The
+  successful unwrap *is* the passphrase check (AES-GCM authenticates) — supersedes the old
+  `vaultCheck` sentinel.
+- **Snapshots** — `pfdb-v2` = `{format, iv, ciphertext}`, DEK-encrypted, **no per-file kdf**.
+  `pfdb-v1` (direct-keyed) is still readable for backward compat.
+- **Change / reset password** = re-wrap the **same** DEK under the new passphrase → write a
+  new keyring version. **No snapshot is rewritten**; every old file stays readable and every
+  other device keeps syncing (it just needs the new password at next unlock).
+- **Keyring sync** = same discipline as snapshots (monotonic `version`, pull-before-push,
+  TOCTOU re-check). A deleted keyring is recoverable from any device holding the DEK. The
+  invariant that keeps it safe: **the DEK never changes**, so the version guard only arbitrates
+  *which passphrase is current*, never the data. Concurrent password changes resolve
+  last-writer-wins on the *passphrase* (loser is told to re-enter), never on data.
+- **Forgot-password recovery** = if any device holds the DEK (keystore), re-wrap it under a new
+  passphrase and keep all files; if none does and all forgot, the Drive copy is unrecoverable
+  (E2E, no backdoor) but local plaintext survives → export + fresh keyring.
 
 ---
 
@@ -105,7 +138,7 @@ inflow) + current value as a final inflow at `asOf`; each converted to base at i
 2. ✅ Expenses UI (add/list/filter, categories, multi-currency; year filter + totals)
 3. ✅ Investments UI (holdings + events + XIRR + data-quality badges + opening-position onboarding)
 4. ✅ Dashboard (net worth, per-person + **family view**, allocation, trend, FX)
-5. ✅ File backup/restore (export/import) + encryption (non-extractable key)
+5. ✅ File backup/restore (export/import) + encryption (later reworked to envelope encryption — see `docs/MIGRATION_HISTORY.md`)
 6. ✅ Drive sync (auth + Picker + session snapshots + load-latest + version-compare + diff modal)
 7. ✅ PWA + persistent-storage request
 8. *(optional, not done)* feed holdings → FIRE calculator corpus buckets
@@ -124,6 +157,10 @@ inflow) + current value as a final inflow at `asOf`; each converted to base at i
 - **Dashboard is hidden-by-default & lazy** (sections compute only when opened; eye for figures,
   chevron for charts) with hover tooltips on the donut + a legend/month-labels on the bar chart.
 - **Dialog UX**: autofocus first field; Enter submits the primary action (never Delete); wider forms.
+- **Envelope encryption + change/reset password** (see `docs/MIGRATION_HISTORY.md`): password is
+  re-keyable and forgot-recoverable without orphaning old backups or splitting the shared folder.
+- **Portfolio-wide money-weighted return (XIRR)** across all holdings (nominal, income excluded) to
+  gauge whether the portfolio is beating inflation.
 
 ## Divergences from the original plan
 

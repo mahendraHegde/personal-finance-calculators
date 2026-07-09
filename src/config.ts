@@ -7,6 +7,13 @@ export const SYNC = {
    *  prune older ones (by version) beyond this, so the folder doesn't grow
    *  unbounded over many sessions. The current session file is always kept. */
   SNAPSHOT_KEEP: 1000,
+  /** Max keyring files (envelope encryption) to retain per folder. Keyrings are
+   *  tiny (~300 B) and only a password change writes a new one. We keep MANY so a
+   *  device that's been offline across several password changes and holds no DEK
+   *  can still find a keyring it can unwrap (an older keyring wraps the same
+   *  invariant DEK) — i.e. it bounds the "straggler lockout" window to this many
+   *  password changes. The latest keyring is never pruned. */
+  KEYRING_KEEP: 20,
   /** Debounce between an edit and the autosave push. */
   AUTOSAVE_DEBOUNCE_MS: 4000,
   /** Backoff before retrying a push that failed transiently. */

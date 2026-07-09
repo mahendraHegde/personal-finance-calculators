@@ -3,6 +3,7 @@
 // so listing is cheap (no bodies downloaded) and "latest" is read from there.
 
 import type { SnapshotMeta, SyncProvider } from "../sync/types";
+import { compareKeyringNewestFirst } from "../crypto/keyring";
 import type { GoogleAuth } from "./drive-auth";
 import { SignInRequiredError } from "./drive-auth";
 
@@ -13,6 +14,9 @@ const UPLOAD = "https://www.googleapis.com/upload/drive/v3/files";
 // a user/Drive-app rename of a file must not hide it from "latest" detection.
 const APP_TAG_KEY = "pfApp";
 const APP_TAG_VALUE = "portfolio";
+// The keyring files (envelope encryption) live in the SAME folder but under a
+// distinct tag so the snapshot query never returns them, and vice versa.
+const KEYRING_TAG_VALUE = "portfolio-keyring";
 
 interface DriveFile {
   id: string;
@@ -82,14 +86,15 @@ export class DriveSyncProvider implements SyncProvider {
     return res;
   }
 
-  async list(): Promise<SnapshotMeta[]> {
+  /** Page through ALL files in the folder carrying the given app tag — over years
+   *  a folder can exceed one page, and missing later pages would hide the newest
+   *  file. Shared by snapshot listing and keyring listing. */
+  private async queryFiles(tagValue: string): Promise<DriveFile[]> {
     const q = encodeURIComponent(
       `'${this.folderId}' in parents and ` +
-        `appProperties has { key='${APP_TAG_KEY}' and value='${APP_TAG_VALUE}' } and ` +
+        `appProperties has { key='${APP_TAG_KEY}' and value='${tagValue}' } and ` +
         `trashed = false`,
     );
-    // Page through ALL results — over years a folder can exceed one page, and
-    // missing later pages would hide the newest snapshot.
     const files: DriveFile[] = [];
     let pageToken: string | undefined;
     do {
@@ -101,7 +106,70 @@ export class DriveSyncProvider implements SyncProvider {
       files.push(...(body.files ?? []));
       pageToken = body.nextPageToken;
     } while (pageToken);
-    return files.map(fileToMeta);
+    return files;
+  }
+
+  async list(): Promise<SnapshotMeta[]> {
+    return (await this.queryFiles(APP_TAG_VALUE)).map(fileToMeta);
+  }
+
+  // -- keyring (envelope encryption) ---------------------------------------
+  // The folder's shared keyring is stored as its own immutable, versioned files
+  // (tag KEYRING_TAG_VALUE). Latest = max version, same as snapshots. Deterministic
+  // id tiebreak so every device agrees on the winner when two share a version.
+
+  /** Cheap listing of keyring files (id + version only). */
+  async listKeyrings(): Promise<{ id: string; version: number; dekId?: string }[]> {
+    return (await this.queryFiles(KEYRING_TAG_VALUE)).map((f) => ({
+      id: f.id,
+      version: finiteNum(f.appProperties?.version),
+      // Non-secret DEK identity mirrored into appProperties so a device can detect a
+      // concurrent DEK ROTATION (a reset) from the cheap listing, without downloading
+      // every keyring body. Untrusted metadata → used ONLY as a conservative signal
+      // (triggers a safe drop + re-unlock), never as the sole basis for adoption.
+      dekId: f.appProperties?.dekId,
+    }));
+  }
+
+  /** Create a NEW keyring file at `version` (immutable — never overwrite an
+   *  existing one; latest-wins by version like snapshots). `dekId` is mirrored into
+   *  appProperties for cheap concurrent-rotation detection (see listKeyrings). */
+  async putKeyring(
+    version: number,
+    dekId: string,
+    data: Uint8Array,
+  ): Promise<{ id: string; version: number }> {
+    const metadata = {
+      name: `pf-keyring-${version}.pfkeyring`,
+      parents: [this.folderId],
+      appProperties: { [APP_TAG_KEY]: KEYRING_TAG_VALUE, version: String(version), dekId },
+    };
+    const { body, boundary } = this.multipart(metadata, data);
+    const res = await this.req(`${UPLOAD}?uploadType=multipart&fields=id,appProperties`, {
+      method: "POST",
+      headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
+      body,
+    });
+    if (!res.ok) throw new Error(`Drive keyring create failed: ${res.status}`);
+    const f = (await res.json()) as DriveFile;
+    return { id: f.id, version: finiteNum(f.appProperties?.version) };
+  }
+
+  /** Keep the `keep` highest-version keyrings, delete the rest. Safe for ANY
+   *  device to run: an older keyring is strictly superseded (it wraps the SAME
+   *  invariant DEK under an older-or-equal passphrase), so deleting it never loses
+   *  data — unlike snapshots, which can hold unmerged foreign edits. Best effort. */
+  async pruneKeyrings(keep: number): Promise<void> {
+    const metas = await this.listKeyrings();
+    if (metas.length <= keep) return;
+    const sorted = [...metas].sort(compareKeyringNewestFirst);
+    for (const m of sorted.slice(keep)) {
+      try {
+        await this.remove(m.id);
+      } catch {
+        // transient delete failure — a later prune retries
+      }
+    }
   }
 
   async download(id: string): Promise<Uint8Array> {
