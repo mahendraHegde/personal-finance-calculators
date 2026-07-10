@@ -24,7 +24,7 @@ import type {
 import { SHARED } from "../model/types";
 import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, TextInput } from "./components";
 import {
-  brokerAccountOptions,
+  holdingAccountOptions,
   CURRENCY_CHOICES,
   eventsByHolding,
   ownerLabel,
@@ -383,11 +383,12 @@ function HoldingForm({
     return s.trim() !== "" && Number.isFinite(n) ? n : null;
   };
 
-  // Broker/crypto accounts to choose from — but ALWAYS include the holding's
-  // CURRENT account even if it falls outside that filter (e.g. one set earlier on
-  // a bank account), so the Select's value always matches an option and editing
-  // other fields can never silently blank/drop the existing account link.
-  const accountChoices = brokerAccountOptions(state);
+  // Asset accounts a holding can sit in (bank / FD / real estate / brokerage /
+  // crypto / cash) — but ALWAYS include the holding's CURRENT account even if it
+  // falls outside that filter (e.g. one set earlier on a now-archived or debt
+  // account), so the Select's value always matches an option and editing other
+  // fields can never silently blank/drop the existing account link.
+  const accountChoices = holdingAccountOptions(state);
   if (initial?.accountId && !accountChoices.some((o) => o.value === initial.accountId)) {
     const a = state.accounts.find((x) => x.id === initial.accountId);
     if (a) accountChoices.push({ value: a.id, label: `${a.name} (${a.currency})` });

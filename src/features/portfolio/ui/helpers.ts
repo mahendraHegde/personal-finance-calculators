@@ -108,15 +108,17 @@ export function accountOptions(
     .map((a) => ({ value: a.id, label: `${a.name} (${a.currency})` }));
 }
 
-/** Accounts that can HOLD investments (where you buy units) — brokerages and
- *  crypto exchanges. Used for the holding's "broker" field, so cash-flow accounts
- *  (bank/cash/credit card/liability) don't clutter it. */
-export function brokerAccountOptions(
+/** Accounts a holding can sit in — any ASSET account: brokerage, crypto, bank,
+ *  FD, real estate, cash. People hold mutual funds / bonds / fixed deposits through
+ *  a BANK (or the dedicated `fd` account), property in a real-estate account, etc.,
+ *  so restricting to brokerages/crypto is too narrow. Only DEBT accounts (credit
+ *  card, liability) are excluded, since an asset can't be custodied in a debt. */
+export function holdingAccountOptions(
   state: PortfolioState,
   keepId?: string,
 ): Array<{ value: string; label: string }> {
   return state.accounts
-    .filter((a) => (a.type === "brokerage" || a.type === "crypto") && live(a.archived, a.id, keepId))
+    .filter((a) => a.type !== "creditcard" && a.type !== "liability" && live(a.archived, a.id, keepId))
     .map((a) => ({ value: a.id, label: `${a.name} (${a.currency})` }));
 }
 
