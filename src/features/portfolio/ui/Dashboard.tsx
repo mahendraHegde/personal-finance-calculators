@@ -9,7 +9,7 @@ import { useMemo, useState } from "react";
 import { formatCompactMoney, formatMoney, formatPercent, monthKey, todayIso } from "../../../lib/util/format";
 import { tryConvert } from "../../../lib/money/currency";
 import { accountBalances, accountBalancesByPerson, netWorth } from "../domain/networth";
-import { currentHoldingValue, dataQuality, holdingXirr, portfolioReturn } from "../domain/holdings";
+import { currentHoldingValue, dataQuality, holdingXirr, portfolioReturn, withFdAccrual } from "../domain/holdings";
 import { categoryTotals, flowSummary, monthlyTotals, type CategoryTotal } from "../domain/transactions";
 import type { PortfolioState } from "../state/store";
 import { usePortfolio } from "../state/context";
@@ -32,8 +32,9 @@ function computeHeavy(state: PortfolioState) {
   const balances = accountBalances(state.accounts, state.transactions, fx);
   const balancesByPerson = accountBalancesByPerson(state.accounts, state.transactions, fx);
   const byHolding = eventsByHolding(state);
+  const today = todayIso(); // FDs accrue their computed value up to today
   const holdingValues = new Map(
-    state.holdings.map((h) => [h.id, currentHoldingValue(byHolding.get(h.id) ?? [])]),
+    state.holdings.map((h) => [h.id, currentHoldingValue(withFdAccrual(h, byHolding.get(h.id) ?? [], today))]),
   );
   const nw = netWorth({
     accounts: state.accounts,
@@ -50,7 +51,7 @@ function computeHeavy(state: PortfolioState) {
 
   const holdings = state.holdings
     .map((h) => {
-      const events = byHolding.get(h.id) ?? [];
+      const events = withFdAccrual(h, byHolding.get(h.id) ?? [], today);
       const native = currentHoldingValue(events);
       return {
         holding: h,

@@ -9,12 +9,15 @@ import {
   dataQuality,
   holdingPnl,
   holdingXirr,
+  withFdAccrual,
 } from "../domain/holdings";
 import { usePortfolio, useSyncStatus } from "../state/context";
 import { useNavigate } from "./navigation";
 import { createPriceProviders, fetchPrices } from "../services/price-service";
 import type {
   AssetClass,
+  FdCompounding,
+  FdTerms,
   Holding,
   HoldingEvent,
   HoldingEventType,
@@ -129,16 +132,18 @@ export function Investments() {
   // the card grid doesn't recompute it for every holding on every render —
   // matching the Dashboard's memoized approach.
   const metrics = useMemo(
-    () =>
-      new Map(
+    () => {
+      const today = todayIso(); // FDs accrue their computed value up to today
+      return new Map(
         state.holdings.map((h) => {
-          const events = byHolding.get(h.id) ?? [];
+          const events = withFdAccrual(h, byHolding.get(h.id) ?? [], today);
           return [
             h.id,
             { value: currentHoldingValue(events), xirr: holdingXirr(events), quality: dataQuality(events) },
           ] as const;
         }),
-      ),
+      );
+    },
     [state.holdings, byHolding],
   );
   const detail = state.holdings.find((h) => h.id === detailId) ?? null;
@@ -370,6 +375,13 @@ function HoldingForm({
   const [invested, setInvested] = useState("");
   const [startDate, setStartDate] = useState("");
   const [currentValue, setCurrentValue] = useState("");
+  // Fixed-deposit auto-accrual (opt-in). Offered for a debt holding or an FD-type
+  // account; the value is then computed from the deposit principal by compound
+  // interest, and a manual valuation re-bases (overrides) it.
+  const [fdEnabled, setFdEnabled] = useState(Boolean(initial?.fd));
+  const [fdRate, setFdRate] = useState(initial?.fd ? String(initial.fd.ratePct) : "");
+  const [fdCompounding, setFdCompounding] = useState<FdCompounding>(initial?.fd?.compounding ?? "quarterly");
+  const [fdMaturity, setFdMaturity] = useState(initial?.fd?.maturityDate ?? "");
 
   // Default the price source to match the asset class until the user touches it.
   const pickAssetClass = (v: AssetClass): void => {
@@ -393,9 +405,19 @@ function HoldingForm({
     const a = state.accounts.find((x) => x.id === initial.accountId);
     if (a) accountChoices.push({ value: a.id, label: `${a.name} (${a.currency})` });
   }
+  // Offer the fixed-deposit auto-accrual when this looks like an FD: a debt-class
+  // holding, or one sitting in an FD-type account.
+  const showFd = assetClass === "debt" || state.accounts.find((a) => a.id === accountId)?.type === "fd";
 
   const save = async (): Promise<void> => {
     if (!name.trim()) return;
+    // FD terms only when the section is shown, enabled, and the rate is valid;
+    // otherwise undefined (also clears it if the user turned FD off).
+    const rate = num(fdRate);
+    const fd: FdTerms | undefined =
+      showFd && fdEnabled && rate !== null && rate > 0
+        ? { ratePct: rate, compounding: fdCompounding, maturityDate: fdMaturity || undefined }
+        : undefined;
     const holding: Holding = {
       ...initial, // preserve fields not edited here (e.g. archived)
       id: initial?.id ?? newId(),
@@ -407,6 +429,7 @@ function HoldingForm({
       incomeMode,
       ticker: ticker.trim() || undefined,
       priceSource: priceSource ? (priceSource as PriceSource) : undefined,
+      fd,
     };
     await store.saveHolding(holding);
 
@@ -555,6 +578,52 @@ function HoldingForm({
           </div>
         )}
 
+        {showFd && (
+          <div className="rounded-lg bg-slate-50 p-3">
+            <label className="flex items-center gap-2 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                checked={fdEnabled}
+                onChange={(e) => setFdEnabled(e.target.checked)}
+              />
+              Fixed deposit — auto-calculate its value from interest
+            </label>
+            {fdEnabled && (
+              <>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <Field label="Interest rate (% p.a.)">
+                    <NumberInput value={fdRate} onChange={setFdRate} placeholder="e.g. 7.1" />
+                  </Field>
+                  <Field label="Compounding">
+                    <Select
+                      value={fdCompounding}
+                      onChange={(v) => setFdCompounding(v as FdCompounding)}
+                      options={[
+                        { value: "quarterly", label: "Quarterly" },
+                        { value: "monthly", label: "Monthly" },
+                        { value: "halfyearly", label: "Half-yearly" },
+                        { value: "annually", label: "Annually" },
+                        { value: "simple", label: "Simple (no compounding)" },
+                      ]}
+                    />
+                  </Field>
+                  <Field label="Maturity date (optional)">
+                    <TextInput value={fdMaturity} onChange={setFdMaturity} type="date" />
+                  </Field>
+                </div>
+                <p className="mt-1 text-xs text-slate-400">
+                  {initial
+                    ? "Value accrues from your deposit (or latest manual valuation) to today."
+                    : "Enter your deposit as “Total cost” and its date as “Since” above; the value then accrues to today."}{" "}
+                  It's an estimate (banks round / deduct TDS) — enter a current value any time to reconcile.
+                  Assumes interest is reinvested (cumulative FD); a payout FD (Dividends = “Paid out”) isn't
+                  auto-valued — log each payout instead.
+                </p>
+              </>
+            )}
+          </div>
+        )}
+
         <div className="flex justify-end gap-2 pt-2">
           <Button variant="ghost" onClick={onClose}>
             Cancel
@@ -586,8 +655,11 @@ function HoldingDetail({
   const [editEvent, setEditEvent] = useState<HoldingEvent | null>(null);
   const [showQuantity, setShowQuantity] = useState(false);
   const [editing, setEditing] = useState(false); // edit holding PROPERTIES via the form
-  const pnl = holdingPnl(events);
-  const xirr = holdingXirr(events);
+  // Accrue an FD to today for value/return; the event LIST still shows raw events
+  // (the synthetic FD valuation is a read-time estimate, not a real ledger entry).
+  const accrued = withFdAccrual(holding, events, todayIso());
+  const pnl = holdingPnl(accrued);
+  const xirr = holdingXirr(accrued);
   const sorted = [...events].sort((a, b) => (a.date < b.date ? 1 : -1));
   const existingOpening = events.find((e) => e.type === "opening");
 

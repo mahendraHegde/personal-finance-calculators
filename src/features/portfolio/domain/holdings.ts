@@ -8,7 +8,7 @@ import type { Cashflow } from "../../../lib/money/xirr";
 import { xirr } from "../../../lib/money/xirr";
 import { tryConvert } from "../../../lib/money/currency";
 import type { CurrencyCode, FxTable } from "../../../lib/money/currency";
-import type { DataQuality, Holding, HoldingEvent } from "../model/types";
+import type { DataQuality, FdTerms, Holding, HoldingEvent } from "../model/types";
 
 function byDate(a: HoldingEvent, b: HoldingEvent): number {
   return a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
@@ -108,6 +108,105 @@ export function netUnits(events: HoldingEvent[]): number | null {
  *  its return is knowable from realized cashflows without a current value. */
 function isClosed(events: HoldingEvent[]): boolean {
   return netUnits(events) === 0 && events.some((e) => e.type === "sell");
+}
+
+// --- Fixed-deposit auto-accrual -------------------------------------------
+// An FD's value is DETERMINISTIC (principal + rate + compounding + time), so
+// instead of manual valuations we compute it. Modelled as a synthetic `valuation`
+// event at `asOf` injected via withFdAccrual(), so the whole value/pnl/xirr
+// pipeline (which keys off valuation events) works unchanged. A manual valuation
+// RE-BASES the accrual (compounding continues from the reconciled amount/date), so
+// it naturally overrides the estimate.
+
+const FD_PERIODS: Record<Exclude<FdTerms["compounding"], "simple">, number> = {
+  monthly: 12,
+  quarterly: 4,
+  halfyearly: 2,
+  annually: 1,
+};
+
+const MS_PER_YEAR = 365 * 86_400_000; // actual/365, matching xirr's day count
+
+/** Accrued value of a fixed deposit: `principal` grown from `startDate` to `asOf`
+ *  (capped at `maturityDate`) at annual `ratePct`, with the given compounding.
+ *  Never accrues before the start (t ≤ 0 → principal). Both dates are ISO
+ *  `YYYY-MM-DD`, parsed as UTC so the day-diff is timezone-independent. */
+export function fdValue(principal: number, terms: FdTerms, startDate: string, asOf: string): number {
+  const startMs = Date.parse(startDate);
+  let endMs = Date.parse(asOf);
+  if (terms.maturityDate) {
+    const matMs = Date.parse(terms.maturityDate);
+    if (Number.isFinite(matMs)) endMs = Math.min(endMs, matMs);
+  }
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return principal;
+  const years = (endMs - startMs) / MS_PER_YEAR;
+  if (years <= 0 || !(terms.ratePct > 0)) return principal;
+  const r = terms.ratePct / 100;
+  const n = FD_PERIODS[terms.compounding === "simple" ? "annually" : terms.compounding];
+  const v = terms.compounding === "simple" ? principal * (1 + r * years) : principal * Math.pow(1 + r / n, n * years);
+  // A pathological rate (e.g. a typo of 1e6 %) can overflow to Infinity; never let a
+  // non-finite value flow into net worth — fall back to the principal.
+  return Number.isFinite(v) ? v : principal;
+}
+
+/** For an FD holding, a synthetic `valuation` at `asOf` equal to its accrued value.
+ *  Base = the latest MANUAL valuation `{date, amount}` if one exists (so a
+ *  reconcile re-bases the accrual), else the opening principal `{date, amount}`.
+ *  Null when the holding isn't an FD or has no known principal to accrue from. */
+export function fdAccrualValuation(
+  holding: Holding,
+  events: HoldingEvent[],
+  asOf: string,
+): HoldingEvent | null {
+  if (!holding.fd) return null;
+  // Auto-accrual models a CUMULATIVE FD: interest reinvested (compounding), principal
+  // untouched. A PAYOUT FD (interest paid out) doesn't compound, and any
+  // withdrawal/payout would be double-counted — accrued on the gross principal AND
+  // counted as income — overstating value/gain/XIRR. So don't auto-accrue when the
+  // holding pays income out, or has any sell/dividend event; the value then falls back
+  // to a manual valuation (or "needs valuation"), which is honest rather than silently
+  // wrong. (Payout FDs are a deferred feature; a clean cumulative FD has none of these.)
+  if (holding.incomeMode !== "accumulating") return null;
+  if (events.some((e) => e.type === "sell" || e.type === "dividend")) return null;
+  const manual = latestValuation(events);
+  let amount: number;
+  if (manual && manual.amount !== undefined) {
+    // Re-base from the reconciled figure (this is how a manual valuation overrides).
+    amount = fdValue(manual.amount, holding.fd, manual.date, asOf);
+  } else {
+    // Accrue each deposit from ITS OWN date, then sum — correct for a laddered /
+    // topped-up FD (a single lump sum is just one term).
+    let sum = 0;
+    let any = false;
+    for (const e of events) {
+      if (e.type === "opening" || e.type === "buy") {
+        sum += fdValue(grossAmount(e), holding.fd, e.date, asOf);
+        any = true;
+      }
+    }
+    if (!any) return null; // no principal to accrue from
+    amount = sum;
+  }
+  if (!Number.isFinite(amount)) return null; // absurd principal(s) summed to Infinity → fall back
+  return {
+    id: `fd-accrual:${holding.id}`,
+    holdingId: holding.id,
+    date: asOf,
+    type: "valuation",
+    amount,
+    // Late-in-day createdAt so this (freshest, computed-now) value wins the same-day
+    // tiebreak and a same-date deposit doesn't flag it stale — otherwise a
+    // just-created FD (deposit dated today) would read as "—" until the next day.
+    createdAt: `${asOf}T23:59:59.999Z`,
+  };
+}
+
+/** Events augmented with the FD's accrued valuation at `asOf` (a no-op for a
+ *  non-FD holding). Pass the result to currentHoldingValue / holdingPnl /
+ *  holdingXirr so an FD auto-accrues at read time. */
+export function withFdAccrual(holding: Holding, events: HoldingEvent[], asOf: string): HoldingEvent[] {
+  const synth = fdAccrualValuation(holding, events, asOf);
+  return synth ? [...events, synth] : events;
 }
 
 export function dataQuality(events: HoldingEvent[]): DataQuality {
@@ -257,8 +356,10 @@ export function portfolioReturn(
   let total = 0;
 
   for (const h of holdings) {
-    const events = eventsByHolding.get(h.id) ?? [];
-    if (events.length === 0) continue;
+    const raw = eventsByHolding.get(h.id) ?? [];
+    if (raw.length === 0) continue;
+    // Accrue an FD to `asOf` so it contributes its computed value + return.
+    const events = withFdAccrual(h, raw, asOf);
     total++;
 
     // Include a holding with a real cost basis AND a known end state (a fresh current

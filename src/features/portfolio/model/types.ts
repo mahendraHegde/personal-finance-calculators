@@ -94,6 +94,23 @@ export type IncomeMode = "accumulating" | "payout";
  *  - mfapi: Indian mutual-fund NAV via mfapi.in (INR) */
 export type PriceSource = "googlefinance" | "coingecko" | "mfapi";
 
+/** Compounding of a fixed deposit. `simple` = no compounding (P·(1+r·t)); the
+ *  rest compound n times/yr (12/4/2/1). `quarterly` is the common bank default. */
+export type FdCompounding = "simple" | "monthly" | "quarterly" | "halfyearly" | "annually";
+
+/** Fixed-deposit auto-accrual terms. When set on a holding, its value is COMPUTED
+ *  by compound interest from the opening principal (or the latest manual valuation,
+ *  which re-bases and thus overrides it) up to the current date, capped at maturity.
+ *  The result is an ESTIMATE — banks round / use exact day-counts / deduct TDS — so
+ *  a manual `valuation` event still wins for exact reconciliation. */
+export interface FdTerms {
+  /** Annual interest rate, percent (e.g. 7.1 for 7.1%). */
+  ratePct: number;
+  compounding: FdCompounding;
+  /** ISO date; accrual stops here (value freezes at the matured amount). */
+  maturityDate?: string;
+}
+
 export interface Holding {
   id: ID;
   name: string;
@@ -107,6 +124,8 @@ export interface Holding {
    *  only applies to unit-tracked holdings priced in `currency`. */
   ticker?: string;
   priceSource?: PriceSource;
+  /** Fixed-deposit terms — when present, the value auto-accrues (see FdTerms). */
+  fd?: FdTerms;
   archived?: boolean;
 }
 

@@ -4,10 +4,13 @@
 import {
   currentHoldingValue,
   dataQuality,
+  fdAccrualValuation,
+  fdValue,
   holdingPnl,
   holdingXirr,
   netUnits,
   portfolioReturn,
+  withFdAccrual,
 } from "../src/features/portfolio/domain/holdings";
 import { accountBalances, accountBalancesByPerson, netWorth } from "../src/features/portfolio/domain/networth";
 import type { Account, Holding, HoldingEvent, Transaction } from "../src/features/portfolio/model/types";
@@ -450,6 +453,145 @@ section("[portfolio] same-day holding + a 1-year holding → both counted, retur
   near(r.invested, 200, 1e-9, "invested = 100 + 100");
   near(r.value, 260, 1e-9, "value = 110 + 150");
   ok(r.xirr !== null && r.xirr > 0, "combined return solvable + positive (the 1yr holding gives a nonzero span)");
+}
+
+// --- Fixed-deposit auto-accrual -------------------------------------------
+// (1-year spans use a NON-leap base year so actual/365 gives t = 1 exactly.)
+const fdHolding = (fd: Holding["fd"], incomeMode: Holding["incomeMode"] = "accumulating"): Holding => ({
+  id: "h1",
+  name: "FD",
+  personId: "shared",
+  assetClass: "debt",
+  currency: "USD",
+  incomeMode,
+  fd,
+});
+
+section("[fd] fdValue: compounding formulas over one year");
+{
+  const y = (c: "annually" | "quarterly" | "monthly" | "halfyearly" | "simple", rate: number) =>
+    fdValue(1000, { ratePct: rate, compounding: c }, "2023-01-01", "2024-01-01");
+  near(y("annually", 10), 1100, 1e-6, "annual: 1000·1.10");
+  near(y("simple", 10), 1100, 1e-6, "simple: 1000·(1+0.10)");
+  near(y("quarterly", 8), 1000 * Math.pow(1.02, 4), 1e-6, "quarterly: 1000·(1+0.08/4)^4");
+  near(y("monthly", 12), 1000 * Math.pow(1.01, 12), 1e-6, "monthly: 1000·(1+0.12/12)^12");
+  near(y("halfyearly", 6), 1000 * Math.pow(1.03, 2), 1e-6, "half-yearly: 1000·(1+0.06/2)^2");
+}
+
+section("[fd] fdValue: before start, zero rate, and maturity cap");
+{
+  const t = { ratePct: 10, compounding: "annually" as const };
+  eq(fdValue(1000, t, "2024-01-01", "2023-06-01"), 1000, "asOf before start → principal (no negative accrual)");
+  eq(fdValue(1000, { ratePct: 0, compounding: "annually" }, "2023-01-01", "2024-01-01"), 1000, "0% → principal");
+  // Matures after 1 year; asking 3 years later still only accrues to maturity.
+  near(
+    fdValue(1000, { ratePct: 10, compounding: "annually", maturityDate: "2024-01-01" }, "2023-01-01", "2026-01-01"),
+    1100,
+    1e-6,
+    "accrual stops at maturity (1 year), not 3",
+  );
+}
+
+section("[fd] accrues from the opening principal at read time");
+{
+  const h = fdHolding({ ratePct: 10, compounding: "annually" });
+  const events = [ev({ type: "opening", date: "2023-01-01", amount: 1000 })];
+  const augmented = withFdAccrual(h, events, "2024-01-01");
+  eq(augmented.length, 2, "a synthetic valuation is injected");
+  near(currentHoldingValue(augmented)!, 1100, 1e-6, "value = accrued 1-year FD");
+  // The estimate feeds pnl: gain = accrued value − principal.
+  const pnl = holdingPnl(augmented);
+  near(pnl.value!, 1100, 1e-6, "pnl.value = accrued");
+  near(pnl.absoluteGain!, 100, 1e-6, "gain = 1100 − 1000");
+  ok(holdingXirr(augmented) !== null, "XIRR solvable (accrued value is the closing inflow)");
+}
+
+section("[fd] a manual valuation RE-BASES (overrides) the accrual");
+{
+  const h = fdHolding({ ratePct: 10, compounding: "annually" });
+  const events = [
+    ev({ type: "opening", date: "2022-06-01", amount: 1000 }),
+    ev({ type: "valuation", date: "2023-01-01", amount: 1200 }), // user reconciled to 1200
+  ];
+  // Accrues from the MANUAL 1200 @2023-01-01, NOT the 1000 opening → 1200·1.10.
+  near(currentHoldingValue(withFdAccrual(h, events, "2024-01-01"))!, 1320, 1e-6, "re-based: 1200·1.10 = 1320");
+}
+
+section("[fd] non-FD holding is a no-op; FD without principal is null");
+{
+  const plain = fdHolding(undefined);
+  const events = [ev({ type: "opening", date: "2023-01-01", amount: 1000 })];
+  eq(withFdAccrual(plain, events, "2024-01-01"), events, "no fd terms → events unchanged (same reference)");
+  const fd = fdHolding({ ratePct: 10, compounding: "annually" });
+  eq(fdAccrualValuation(fd, [], "2024-01-01"), null, "FD with no principal/valuation → null (needs a deposit)");
+}
+
+section("[fd] a deposit dated TODAY still shows its value (not '—')");
+{
+  const h = fdHolding({ ratePct: 10, compounding: "annually" });
+  // The deposit is dated the SAME day we're valuing (the create-FD-today path).
+  const events = [ev({ type: "opening", date: "2024-01-01", amount: 1000, createdAt: "2024-01-01T10:00:00.000Z" })];
+  near(
+    currentHoldingValue(withFdAccrual(h, events, "2024-01-01"))!,
+    1000,
+    1e-6,
+    "same-day deposit → principal (synthetic valuation isn't flagged stale by the same-date opening)",
+  );
+}
+
+section("[fd] a withdrawal (sell) disables auto-accrual (no silent overstatement)");
+{
+  const h = fdHolding({ ratePct: 10, compounding: "annually" });
+  const events = [
+    ev({ type: "opening", date: "2023-01-01", amount: 1000 }),
+    ev({ type: "sell", date: "2023-06-01", amount: 500 }),
+  ];
+  eq(fdAccrualValuation(h, events, "2024-01-01"), null, "FD with a withdrawal → no accrual (fall back to manual)");
+  // Falls back to the raw events; with no manual valuation that's needs-valuation.
+  eq(currentHoldingValue(withFdAccrual(h, events, "2024-01-01")), null, "value falls back to null, not an inflated figure");
+}
+
+section("[fd] multi-tranche accrues each deposit from its OWN date");
+{
+  const terms = { ratePct: 10, compounding: "annually" as const };
+  const h = fdHolding(terms);
+  const events = [
+    ev({ type: "opening", date: "2023-01-01", amount: 1000 }),
+    ev({ type: "buy", date: "2023-07-01", amount: 1000 }),
+  ];
+  const expected =
+    fdValue(1000, terms, "2023-01-01", "2024-01-01") + fdValue(1000, terms, "2023-07-01", "2024-01-01");
+  near(currentHoldingValue(withFdAccrual(h, events, "2024-01-01"))!, expected, 1e-6, "sum of per-tranche accruals");
+  ok(expected < 2200, "less than the naive 'all principal from the earliest date' (2200) — no over-accrual");
+}
+
+section("[fd] a pathological rate can't poison net worth with Infinity");
+{
+  const v = fdValue(1000, { ratePct: 1e9, compounding: "monthly" }, "2000-01-01", "2030-01-01");
+  eq(v, 1000, "non-finite result → principal (guarded)");
+  ok(Number.isFinite(v), "value is always finite");
+}
+
+section("[fd] a PAYOUT FD does not auto-accrue (interest paid out, not compounded)");
+{
+  const terms = { ratePct: 10, compounding: "annually" as const };
+  // Payout mode: interest is paid out (as dividends), principal doesn't compound —
+  // auto-accruing would double-count (accrue on 1000 AND count the 50 payout).
+  const payout = fdHolding(terms, "payout");
+  const events = [
+    ev({ type: "opening", date: "2023-01-01", amount: 1000 }),
+    ev({ type: "dividend", date: "2023-06-01", amount: 50 }),
+  ];
+  eq(fdAccrualValuation(payout, events, "2024-01-01"), null, "payout FD → no synthetic accrual");
+  // A dividend on an (accumulating) FD also disables accrual — it's not purely cumulative.
+  const acc = fdHolding(terms, "accumulating");
+  eq(fdAccrualValuation(acc, events, "2024-01-01"), null, "any dividend event → no accrual either");
+  // A clean cumulative FD (no payouts) still accrues normally.
+  eq(
+    fdAccrualValuation(acc, [ev({ type: "opening", date: "2023-01-01", amount: 1000 })], "2024-01-01") !== null,
+    true,
+    "clean cumulative FD still accrues",
+  );
 }
 
 done();
