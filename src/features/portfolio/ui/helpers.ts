@@ -5,7 +5,15 @@ import type { CurrencyCode, FxTable } from "../../../lib/money/currency";
 import { rebase } from "../../../lib/money/currency";
 import type { PortfolioState } from "../state/store";
 import { SHARED } from "../model/types";
-import type { DataQuality, FxRateSnapshot, HoldingEvent, Owner } from "../model/types";
+import type {
+  Account,
+  AutopayTerms,
+  DataQuality,
+  FxRateSnapshot,
+  HoldingEvent,
+  InterestFrequency,
+  Owner,
+} from "../model/types";
 
 /** Badge styling + label for a holding's data-quality classification. */
 export const QUALITY_TONE: Record<DataQuality, string> = {
@@ -20,6 +28,65 @@ export const QUALITY_LABEL: Record<DataQuality, string> = {
   "value-only": "value-only",
   "needs-valuation": "needs value",
 };
+
+/** Interest / statement crediting frequencies, in menu order. Shared by the
+ *  savings-interest and FD forms (the FD form appends a "simple" option). */
+export const INTEREST_FREQUENCY_OPTIONS: Array<{ value: InterestFrequency; label: string }> = [
+  { value: "quarterly", label: "Quarterly" },
+  { value: "monthly", label: "Monthly" },
+  { value: "halfyearly", label: "Half-yearly" },
+  { value: "annually", label: "Annually" },
+];
+
+/**
+ * Maps the AccountForm's raw string state into the persisted Account fields. It
+ * exists to make the three fiddly rules that are easy to break in a refactor pure
+ * and unit-testable:
+ *  - opening-balance parsing: blank/NaN/±Infinity → undefined (never reaches store);
+ *  - drop a stray opening-DATE when there's neither a balance nor interest to anchor;
+ *  - PRESERVE the auto-pay `since` anchor across edits (via `existingSince`) so
+ *    tweaking the cycle doesn't silently re-backfill past statements.
+ * Callers pass the already-evaluated section gates (they depend on live state, e.g.
+ * a same-currency payer), so this stays a pure function of its inputs.
+ */
+export function composeAccountExtras(input: {
+  openingBalance: string;
+  openingDate: string;
+  interestEnabled: boolean;
+  interestRate: string;
+  interestFreq: InterestFrequency;
+  autopayEnabled: boolean;
+  fromAccountId: string;
+  statementDay: string;
+  dueDay: string;
+  dueNextMonth: boolean;
+  existingSince: string | undefined;
+  today: string;
+}): Pick<Account, "openingBalance" | "openingBalanceDate" | "interest" | "autopay"> {
+  const obNum = input.openingBalance.trim() === "" ? undefined : Number(input.openingBalance);
+  const openingBalance = obNum !== undefined && Number.isFinite(obNum) ? obNum : undefined;
+
+  const rate = Number(input.interestRate);
+  const interest =
+    input.interestEnabled && Number.isFinite(rate) && rate > 0
+      ? { ratePct: rate, frequency: input.interestFreq }
+      : undefined;
+
+  const autopay: AutopayTerms | undefined = input.autopayEnabled
+    ? {
+        fromAccountId: input.fromAccountId,
+        statementDay: Math.trunc(Number(input.statementDay)),
+        dueDay: Math.trunc(Number(input.dueDay)),
+        dueNextMonth: input.dueNextMonth,
+        since: input.existingSince ?? input.today,
+      }
+    : undefined;
+
+  const openingBalanceDate =
+    input.openingDate && (openingBalance !== undefined || interest) ? input.openingDate : undefined;
+
+  return { openingBalance, openingBalanceDate, interest, autopay };
+}
 
 /** FX table re-expressed in the user's chosen display currency (falls back). */
 export function displayFx(state: PortfolioState): { fx: FxTable; base: CurrencyCode } {

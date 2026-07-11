@@ -4,11 +4,20 @@
 
 import { useState } from "react";
 import { newId } from "../../../lib/util/id";
+import { todayIso } from "../../../lib/util/format";
 import { usePortfolio } from "../state/context";
-import type { Account, AccountType, Category, CategoryKind, Person } from "../model/types";
+import type { Account, AccountType, Category, CategoryKind, InterestFrequency, Person } from "../model/types";
 import { SHARED } from "../model/types";
-import { Badge, Button, Card, EmptyState, Field, Modal, Select, SectionTitle, TextInput } from "./components";
-import { CURRENCY_CHOICES, ownerLabel, personOptions, referenceSummary } from "./helpers";
+import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, SectionTitle, TextInput } from "./components";
+import {
+  composeAccountExtras,
+  CURRENCY_CHOICES,
+  holdingAccountOptions,
+  INTEREST_FREQUENCY_OPTIONS,
+  ownerLabel,
+  personOptions,
+  referenceSummary,
+} from "./helpers";
 
 type EntityKind = "person" | "account" | "category";
 type Entity = Person | Account | Category;
@@ -156,7 +165,9 @@ export function Accounts() {
       </Card>
 
       {form?.kind === "person" && <PersonForm initial={form.rec} onClose={() => setForm(null)} />}
-      {form?.kind === "account" && <AccountForm initial={form.rec} onClose={() => setForm(null)} />}
+      {form?.kind === "account" && (
+        <AccountForm key={form.rec?.id ?? "new"} initial={form.rec} onClose={() => setForm(null)} />
+      )}
       {form?.kind === "category" && <CategoryForm initial={form.rec} onClose={() => setForm(null)} />}
       {del && <DeleteDialog kind={del.kind} rec={del.rec} onClose={() => setDel(null)} />}
     </div>
@@ -282,6 +293,22 @@ function AccountForm({ initial, onClose }: { initial?: Account; onClose: () => v
   const [type, setType] = useState<AccountType>(initial?.type ?? "bank");
   const [currency, setCurrency] = useState(initial?.currency ?? state.settings.displayCurrency);
   const [personId, setPersonId] = useState(initial?.personId ?? state.people[0]?.id ?? SHARED);
+  const [openingBalance, setOpeningBalance] = useState(
+    initial?.openingBalance !== undefined ? String(initial.openingBalance) : "",
+  );
+  const [openingDate, setOpeningDate] = useState(initial?.openingBalanceDate ?? "");
+  const [earnsInterest, setEarnsInterest] = useState(!!initial?.interest);
+  const [interestRate, setInterestRate] = useState(
+    initial?.interest ? String(initial.interest.ratePct) : "",
+  );
+  const [interestFreq, setInterestFreq] = useState<InterestFrequency>(
+    initial?.interest?.frequency ?? "quarterly",
+  );
+  const [autopayOn, setAutopayOn] = useState(!!initial?.autopay);
+  const [payFrom, setPayFrom] = useState(initial?.autopay?.fromAccountId ?? "");
+  const [statementDay, setStatementDay] = useState(initial?.autopay ? String(initial.autopay.statementDay) : "");
+  const [dueDay, setDueDay] = useState(initial?.autopay ? String(initial.autopay.dueDay) : "");
+  const [dueNextMonth, setDueNextMonth] = useState(initial?.autopay?.dueNextMonth ?? false);
   // Transactions/holdings post amounts in the account's currency (we don't store a
   // bank-converted amount). Changing the currency of an account that already has
   // history would silently REINTERPRET every past amount in the new currency and
@@ -291,6 +318,24 @@ function AccountForm({ initial, onClose }: { initial?: Account; onClose: () => v
     ? state.transactions.some((t) => t.accountId === initial.id || t.transferToAccountId === initial.id) ||
       state.holdings.some((h) => h.accountId === initial.id)
     : false;
+  // Interest auto-accrual only makes sense for a cash-holding account (a savings
+  // bank account, or an FD modelled as an account). Holdings-backed / debt accounts
+  // don't earn account-level interest.
+  const showInterest = type === "bank" || type === "fd";
+  // Statement auto-pay is a credit-card-only, opt-in convenience. The payer must be
+  // a same-currency asset account (reuse the holding-account picker: it already
+  // excludes credit cards / liabilities).
+  const showAutopay = type === "creditcard";
+  const payerOptions = holdingAccountOptions(state, payFrom).filter(
+    (o) => state.accounts.find((a) => a.id === o.value)?.currency === currency,
+  );
+  // The payer must be a CURRENT, same-currency option — not just any non-empty id.
+  // Otherwise changing the card's currency (or a since-deleted payer) could leave a
+  // stranded `fromAccountId` that saves "enabled" but silently never pays.
+  const payerValid = payerOptions.some((o) => o.value === payFrom);
+  const autopayReady =
+    payerValid && Number(statementDay) >= 1 && Number(statementDay) <= 31 && Number(dueDay) >= 1 && Number(dueDay) <= 31;
+  const interestReady = Number(interestRate) > 0;
   return (
     <Modal title={initial ? "Edit account" : "Add account"} onClose={onClose}>
       <div className="space-y-3">
@@ -323,6 +368,117 @@ function AccountForm({ initial, onClose }: { initial?: Account; onClose: () => v
         <Field label="Owner">
           <Select value={personId} onChange={setPersonId} options={personOptions(state, true, personId)} />
         </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Opening balance (optional)">
+            <NumberInput value={openingBalance} onChange={setOpeningBalance} placeholder="e.g. 50000" />
+          </Field>
+          <Field label="As of (optional)">
+            <TextInput value={openingDate} onChange={setOpeningDate} type="date" />
+          </Field>
+        </div>
+        <p className="-mt-1 text-xs text-slate-400">
+          Money already in the account before your first tracked entry. It counts toward the balance and
+          net worth, but isn't recorded as income.
+        </p>
+
+        {showInterest && (
+          <div className="rounded-lg bg-slate-50 p-3">
+            <label className="flex items-center gap-2 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                checked={earnsInterest}
+                onChange={(e) => setEarnsInterest(e.target.checked)}
+              />
+              Earns interest — auto-accrue it on the balance
+            </label>
+            {earnsInterest && (
+              <>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <Field label="Interest rate (% p.a.)">
+                    <NumberInput value={interestRate} onChange={setInterestRate} placeholder="e.g. 3.5" />
+                  </Field>
+                  <Field label="Credited">
+                    <Select
+                      value={interestFreq}
+                      onChange={(v) => setInterestFreq(v as InterestFrequency)}
+                      options={INTEREST_FREQUENCY_OPTIONS}
+                    />
+                  </Field>
+                </div>
+                <p className="mt-1 text-xs text-slate-400">
+                  Interest is computed on your daily balance up to today and added to this account — it's
+                  an estimate (banks round / deduct TDS). For exact figures, leave this off and record
+                  interest credits as income instead.
+                </p>
+                {!interestReady && (
+                  <p className="mt-1 text-xs text-amber-700">
+                    Enter a rate above 0% — otherwise this saves with no interest.
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {showAutopay && (
+          <div className="rounded-lg bg-slate-50 p-3">
+            <label className="flex items-center gap-2 text-sm text-slate-700">
+              <input type="checkbox" checked={autopayOn} onChange={(e) => setAutopayOn(e.target.checked)} />
+              Auto-pay the statement from another account
+            </label>
+            {autopayOn && (
+              <>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <Field label="Pay from">
+                    <Select
+                      value={payFrom}
+                      onChange={setPayFrom}
+                      options={[{ value: "", label: "— select account —" }, ...payerOptions]}
+                    />
+                  </Field>
+                  <Field label="Statement day">
+                    <NumberInput value={statementDay} onChange={setStatementDay} placeholder="e.g. 10" />
+                  </Field>
+                  <Field label="Due day">
+                    <NumberInput value={dueDay} onChange={setDueDay} placeholder="e.g. 5" />
+                  </Field>
+                  {/* A plain caption + standalone checkbox label — NOT wrapped in
+                      Field, which renders its own <label> (nested labels are invalid). */}
+                  <div>
+                    <span className="mb-1 block text-xs font-medium text-slate-500">Due month</span>
+                    <label className="flex items-center gap-2 py-1.5 text-sm text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={dueNextMonth}
+                        onChange={(e) => setDueNextMonth(e.target.checked)}
+                      />
+                      Next month
+                    </label>
+                  </div>
+                </div>
+                <p className="mt-1 text-xs text-slate-400">
+                  On each due date, a transfer pays the statement balance (as of the statement day) from
+                  the chosen account — so your cash keeps earning interest until then. Tick "Next month"
+                  when the due date falls the month after the statement closes (e.g. statement 10th, pay
+                  15th next month). These payments are managed automatically — change these settings or
+                  turn this off to edit them.
+                </p>
+                {payerOptions.length === 0 ? (
+                  <p className="mt-1 text-xs text-amber-700">
+                    Add a {currency} bank or cash account to pay from — auto-pay needs a same-currency payer.
+                  </p>
+                ) : (
+                  !autopayReady && (
+                    <p className="mt-1 text-xs text-amber-700">
+                      Pick a payer and enter statement/due days (1–31) — otherwise this saves with auto-pay off.
+                    </p>
+                  )
+                )}
+              </>
+            )}
+          </div>
+        )}
+
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
             Cancel
@@ -330,6 +486,22 @@ function AccountForm({ initial, onClose }: { initial?: Account; onClose: () => v
           <Button
             disabled={!name.trim()}
             onClick={() => {
+              // All the fiddly form→record mapping (number parsing, drop-stray-date,
+              // `since` preservation) lives in this pure, unit-tested helper.
+              const extras = composeAccountExtras({
+                openingBalance,
+                openingDate,
+                interestEnabled: showInterest && earnsInterest,
+                interestRate,
+                interestFreq,
+                autopayEnabled: showAutopay && autopayOn && autopayReady,
+                fromAccountId: payFrom,
+                statementDay,
+                dueDay,
+                dueNextMonth,
+                existingSince: initial?.autopay?.since,
+                today: todayIso(),
+              });
               void store.saveAccount({
                 ...initial,
                 id: initial?.id ?? newId(),
@@ -337,6 +509,7 @@ function AccountForm({ initial, onClose }: { initial?: Account; onClose: () => v
                 type,
                 currency,
                 personId,
+                ...extras,
               });
               onClose();
             }}

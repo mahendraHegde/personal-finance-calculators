@@ -8,6 +8,7 @@ import type { Cashflow } from "../../../lib/money/xirr";
 import { xirr } from "../../../lib/money/xirr";
 import { tryConvert } from "../../../lib/money/currency";
 import type { CurrencyCode, FxTable } from "../../../lib/money/currency";
+import { compoundValue } from "../../../lib/money/interest";
 import type { DataQuality, FdTerms, Holding, HoldingEvent } from "../model/types";
 
 function byDate(a: HoldingEvent, b: HoldingEvent): number {
@@ -118,35 +119,12 @@ function isClosed(events: HoldingEvent[]): boolean {
 // RE-BASES the accrual (compounding continues from the reconciled amount/date), so
 // it naturally overrides the estimate.
 
-const FD_PERIODS: Record<Exclude<FdTerms["compounding"], "simple">, number> = {
-  monthly: 12,
-  quarterly: 4,
-  halfyearly: 2,
-  annually: 1,
-};
-
-const MS_PER_YEAR = 365 * 86_400_000; // actual/365, matching xirr's day count
-
 /** Accrued value of a fixed deposit: `principal` grown from `startDate` to `asOf`
- *  (capped at `maturityDate`) at annual `ratePct`, with the given compounding.
- *  Never accrues before the start (t ≤ 0 → principal). Both dates are ISO
- *  `YYYY-MM-DD`, parsed as UTC so the day-diff is timezone-independent. */
+ *  (capped at `maturityDate`) at annual `terms.ratePct`, with the given
+ *  compounding. Thin wrapper over the shared `compoundValue` — the same closed-form
+ *  math that also backs savings-account interest (see lib/money/interest). */
 export function fdValue(principal: number, terms: FdTerms, startDate: string, asOf: string): number {
-  const startMs = Date.parse(startDate);
-  let endMs = Date.parse(asOf);
-  if (terms.maturityDate) {
-    const matMs = Date.parse(terms.maturityDate);
-    if (Number.isFinite(matMs)) endMs = Math.min(endMs, matMs);
-  }
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return principal;
-  const years = (endMs - startMs) / MS_PER_YEAR;
-  if (years <= 0 || !(terms.ratePct > 0)) return principal;
-  const r = terms.ratePct / 100;
-  const n = FD_PERIODS[terms.compounding === "simple" ? "annually" : terms.compounding];
-  const v = terms.compounding === "simple" ? principal * (1 + r * years) : principal * Math.pow(1 + r / n, n * years);
-  // A pathological rate (e.g. a typo of 1e6 %) can overflow to Infinity; never let a
-  // non-finite value flow into net worth — fall back to the principal.
-  return Number.isFinite(v) ? v : principal;
+  return compoundValue(principal, terms.ratePct, terms.compounding, startDate, asOf, terms.maturityDate);
 }
 
 /** For an FD holding, a synthetic `valuation` at `asOf` equal to its accrued value.

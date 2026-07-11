@@ -5,6 +5,7 @@ import { formatDate, formatMoney, todayIso } from "../../../lib/util/format";
 import { tryConvert } from "../../../lib/money/currency";
 import { newId } from "../../../lib/util/id";
 import { filterTransactions, flowSummary, sortByDateDesc, type TxnFilter } from "../domain/transactions";
+import { isAutopayTransaction } from "../domain/autopay";
 import { usePortfolio } from "../state/context";
 import type { Transaction, TxnType } from "../model/types";
 import { SHARED } from "../model/types";
@@ -173,15 +174,24 @@ export function Expenses() {
             {visible.map((t) => {
               const account = state.accounts.find((a) => a.id === t.accountId);
               const catPath = categoryPath(state, t.categoryId);
+              // Managed auto-pay transfers are derived from the card's settings —
+              // editing/deleting one here would just be reverted/recreated by the
+              // reconciler, so they're read-only and badged. Change them via the
+              // card's auto-pay settings.
+              const managed = isAutopayTransaction(t);
               return (
                 <li
                   key={t.id}
-                  onClick={() => openEdit(t)}
-                  className="flex cursor-pointer items-center justify-between gap-3 px-4 py-3 hover:bg-slate-50"
+                  onClick={managed ? undefined : () => openEdit(t)}
+                  title={managed ? "Managed by the card's auto-pay — change it in the account's settings" : undefined}
+                  className={`flex items-center justify-between gap-3 px-4 py-3 ${
+                    managed ? "" : "cursor-pointer hover:bg-slate-50"
+                  }`}
                 >
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <Badge tone={TYPE_TONE[t.type]}>{t.type}</Badge>
+                      {managed && <Badge>auto-pay</Badge>}
                       <span className="truncate text-sm font-medium text-slate-700">
                         {t.note || catPath || account?.name || "—"}
                       </span>

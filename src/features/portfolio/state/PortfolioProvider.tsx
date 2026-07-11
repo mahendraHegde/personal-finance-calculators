@@ -3,20 +3,25 @@
 // Drive from saved settings, and starts autosave. Components read reactive
 // state via useSyncExternalStore.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { openIndexedDB } from "../../../lib/storage/indexeddb-adapter";
+import { todayIso } from "../../../lib/util/format";
 import { DB_NAME, SCHEMA } from "../model/schema";
 import { createPortfolioStore } from "./store";
 import { SyncController } from "./sync-controller";
+import { isAutopayTransaction } from "../domain/autopay";
 import { fetchUsdRates } from "../../../lib/fx/fx-service";
 import { FX } from "../../../config";
-import { PortfolioContext, type PortfolioContextValue } from "./context";
+import { PortfolioContext, usePortfolio, type PortfolioContextValue } from "./context";
 
 /** Refresh FX at most once per interval. The throttle key is `settings.fxUpdatedAt`,
  *  which is PERSISTED — so the window also holds across reloads, not just within
  *  a session. */
 const FX_MAX_AGE_MS = FX.REFRESH_INTERVAL_MS;
+
+/** Collapse a burst of edits into a single auto-pay reconcile (see AutopayReconciler). */
+const RECONCILE_DEBOUNCE_MS = 300;
 
 function fxIsStale(updatedAt: string | undefined): boolean {
   if (!updatedAt) return true; // never fetched
@@ -94,5 +99,33 @@ export function PortfolioProvider({ children }: { children: ReactNode }) {
   if (!ctx) {
     return <div className="p-6 text-center text-slate-500">Loading…</div>;
   }
-  return <PortfolioContext.Provider value={ctx}>{children}</PortfolioContext.Provider>;
+  return (
+    <PortfolioContext.Provider value={ctx}>
+      <AutopayReconciler />
+      {children}
+    </PortfolioContext.Provider>
+  );
+}
+
+/** Keeps the managed credit-card auto-pay transfers in sync: reconciles on load
+ *  (catching up any statements that came due while the app was closed) and after
+ *  any transaction/account/config change. Reconcile is idempotent — when nothing
+ *  changed it writes nothing, so this settles after one pass and never loops.
+ *
+ *  Two cheap guards keep it off the hot path as the ledger grows: it does nothing
+ *  when the feature is unused (no auto-pay config AND no managed rows to clean up),
+ *  and a short debounce collapses a burst of edits into a single reconcile. */
+function AutopayReconciler(): null {
+  const { state, store } = usePortfolio();
+  const ready = state.ready;
+  const active = useMemo(
+    () => state.accounts.some((a) => a.autopay) || state.transactions.some(isAutopayTransaction),
+    [state.accounts, state.transactions],
+  );
+  useEffect(() => {
+    if (!ready || !active) return;
+    const id = setTimeout(() => void store.reconcileAutopay(todayIso()), RECONCILE_DEBOUNCE_MS);
+    return () => clearTimeout(id);
+  }, [ready, active, state.transactions, state.accounts, state.fx, store]);
+  return null;
 }

@@ -8,7 +8,7 @@
 import { useMemo, useState } from "react";
 import { formatCompactMoney, formatMoney, formatPercent, monthKey, todayIso } from "../../../lib/util/format";
 import { tryConvert } from "../../../lib/money/currency";
-import { accountBalances, accountBalancesByPerson, netWorth } from "../domain/networth";
+import { accountBalancesByPerson, netWorth, sumAccountBalances } from "../domain/networth";
 import { currentHoldingValue, dataQuality, holdingXirr, portfolioReturn, withFdAccrual } from "../domain/holdings";
 import { categoryTotals, flowSummary, monthlyTotals, type CategoryTotal } from "../domain/transactions";
 import type { PortfolioState } from "../state/store";
@@ -29,10 +29,12 @@ import {
  *  only when at least one of those sections is open. */
 function computeHeavy(state: PortfolioState) {
   const { fx, base } = displayFx(state);
-  const balances = accountBalances(state.accounts, state.transactions, fx);
-  const balancesByPerson = accountBalancesByPerson(state.accounts, state.transactions, fx);
+  const today = todayIso(); // FDs + savings interest accrue their value up to today
+  // One transaction scan (+ interest pass): derive the totals by summing the
+  // per-person breakdown rather than scanning twice.
+  const balancesByPerson = accountBalancesByPerson(state.accounts, state.transactions, fx, today);
+  const balances = sumAccountBalances(balancesByPerson);
   const byHolding = eventsByHolding(state);
-  const today = todayIso(); // FDs accrue their computed value up to today
   const holdingValues = new Map(
     state.holdings.map((h) => [h.id, currentHoldingValue(withFdAccrual(h, byHolding.get(h.id) ?? [], today))]),
   );
@@ -251,7 +253,7 @@ export function Dashboard() {
 
       <RevealCard
         title="Allocation"
-        subtitle="Investments by asset class"
+        subtitle="All assets by class — holdings plus cash & deposits"
         open={isOpen("allocation")}
         onToggle={() => toggle("allocation")}
       >

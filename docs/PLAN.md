@@ -15,7 +15,7 @@ future calculator we add.
 | Area | Decision |
 |---|---|
 | **Home** | New module in `financial-calculators`; reuses Vite/Tailwind/React + GitHub Pages auto-deploy |
-| **Storage** | IndexedDB. The adapter supports keyset pagination, but the app currently **loads each collection fully into memory** and filters/sorts/aggregates there — a family's data is tiny (even decades is a few thousand rows). On-disk pagination + secondary indexes are a **deferred** optimization (see *Divergences* below). No SQLite. |
+| **Storage** | IndexedDB. The adapter supports keyset pagination, but the app currently **loads each collection fully into memory** and filters/sorts/aggregates there — a family's data is tiny (even decades is a few thousand rows). On-disk pagination + secondary indexes are a **deferred** optimization (see *Indexes* below). No SQLite. |
 | **Pluggable** | Domain depends only on a generic `StorageAdapter` interface → swap IndexedDB for SQLite/etc. later with zero domain changes |
 | **IDs** | UUIDs on every record (stable across devices/merges) |
 | **Sync** | Google Drive API, OAuth **client ID only — never a secret** (PKCE/token flow), scope **`drive.file` + Picker** (pick the shared folder once; avoids restricted-scope verification) |
@@ -107,10 +107,10 @@ src/
 ## Data model (UUID-keyed)
 
 - **Person** `{ id, name, color?, archived? }`
-- **Account** `{ id, name, type(bank|cash|creditcard|brokerage|crypto|fd|realestate|liability), currency, personId|"shared", archived? }`
+- **Account** `{ id, name, type(bank|cash|creditcard|brokerage|crypto|fd|realestate|liability), currency, personId|"shared", openingBalance?, openingBalanceDate?, interest?{ratePct,frequency}, autopay?(see below), archived? }` — `openingBalance` = money already in the account before the first tracked transaction (seeded to the owner, not a transaction, so it stays out of income reports); `interest` = read-time savings-interest auto-accrual; `autopay` = credit-card statement auto-pay (see the subsystem note below)
 - **Category** `{ id, name, kind(expense|income), parentId?, archived? }` (two levels: parent + sub)
 - **Transaction** `{ id, date, type(expense|income|transfer), accountId, personId|"shared", amount, currency, categoryId?, note?, transferToAccountId?, excludeFromBalance?, updatedAt, author? }` — `excludeFromBalance` = reporting-only (historical import; counts in reports, not in balances)
-- **Holding** `{ id, name, personId|"shared", accountId?, assetClass, currency, incomeMode(accumulating|payout), ticker?, priceSource?(googlefinance|coingecko|mfapi), archived? }`
+- **Holding** `{ id, name, personId|"shared", accountId?, assetClass, currency, incomeMode(accumulating|payout), ticker?, priceSource?(googlefinance|coingecko|mfapi), fd?{ratePct,compounding,maturityDate?}, archived? }` — `fd` = fixed-deposit auto-accrual (value computed by compound interest instead of manual valuations)
 - **HoldingEvent** `{ id, holdingId, date, type(opening|buy|sell|dividend|valuation|adjustment), units?, price?, amount?, fee?, note?, createdAt? }`
 - **FxRateSnapshot** `{ id, date, base, rates }` (cached; historical figures use period-appropriate rates)
 
@@ -124,7 +124,10 @@ currency (e.g. mutual funds) is assumed to be in the holding's own currency.
 collection fully into memory and filters/sorts/aggregates there, so they were pure write-overhead.
 The adapter's index + keyset-pagination machinery remains, ready to re-introduce (with the specific
 indexes: `transactions[date]`/`[personId,date]`/`[accountId,date]`/`[categoryId,date]`,
-`holdingEvents[holdingId,date]`, etc.) if the dataset ever outgrows memory.
+`holdingEvents[holdingId,date]`, etc.) if the dataset ever outgrows memory (tens of thousands of rows
+over decades). The intended approach at that scale: materialized aggregates (running per-account /
+-person / -month totals) with a reconcile-from-scratch check, keyset-paginated ledger reads, and
+per-year-partitioned sync snapshots.
 
 **XIRR rule**: cashflows are derived from events (opening/buy = outflow, sell/dividend/adjustment =
 inflow) + current value as a final inflow at `asOf`; each converted to base at its own date's FX.
@@ -161,18 +164,36 @@ inflow) + current value as a final inflow at `asOf`; each converted to base at i
   re-keyable and forgot-recoverable without orphaning old backups or splitting the shared folder.
 - **Portfolio-wide money-weighted return (XIRR)** across all holdings (nominal, income excluded) to
   gauge whether the portfolio is beating inflation.
+- **Read-time interest & opening balances** (`src/lib/money/interest.ts`): a savings account
+  (`Account.interest`) or fixed deposit (`Holding.fd`) auto-accrues its value by the daily-balance /
+  compound-interest math — computed on read, never persisted, always an ESTIMATE a manual figure
+  overrides. `Account.openingBalance` seeds a starting balance without a fake income transaction.
+- **Credit-card statement auto-pay** (`Account.autopay`) — see the subsystem note below.
 
-## Divergences from the original plan
+## Credit-card statement auto-pay (read before editing `domain/autopay.ts`)
 
-- **Load-all-in-memory, no indexes.** The plan assumed on-disk cursor pagination + secondary
-  indexes from day one. In practice a family's dataset is tiny, so the store loads everything and
-  computes in memory; indexes were removed (schema v2) as pure write-overhead. Pagination + indexes
-  are a **deferred** optimization (the adapter still supports them). If the dataset ever outgrows
-  memory (tens of thousands of rows over decades), the intended approach is materialized aggregates
-  (running per-account/-person/-month totals) + a reconcile-from-scratch check, keyset-paginated
-  ledger reads, and per-year-partitioned sync snapshots.
-- **OAuth token is persisted** (localStorage), not memory-only + silently re-acquired. The GIS token
-  flow is popup-based, so silent background re-acquisition popped a consent dialog on every refresh /
-  sync cycle (and failed under Cross-Origin-Opener-Policy on Windows Chrome). Now the background
-  reuses the stored token or fails gracefully; popups happen only on an explicit Connect/Reconnect.
-- **Concurrency is guarded, not just deferred** (see the Concurrency decision above).
+Opt-in per card (`Account.autopay = { fromAccountId, statementDay, dueDay, dueNextMonth?, since }`).
+A card's statement payment is modelled as an ordinary **`transfer`** (payer → card), NOT a new record
+type — so the ledger, reports, and the savings-interest engine treat it like any hand-entered payment.
+
+How it works, and the invariants a future maintainer must not break:
+
+- **Derive-then-reconcile.** `desiredAutopayTransfers()` (pure) computes the set of payoff transfers
+  that *should* exist from each card's config + its real transactions. `PortfolioStore.reconcileAutopay()`
+  makes the stored transfers match, using the pure `planAutopayReconcile()` for the create/update/delete
+  decision. The `AutopayReconciler` effect (in `PortfolioProvider`) runs it on load and after changes.
+- **Deterministic ids** `autopay:{cardId}:{closeDate}` — a **persisted schema contract**. Changing the
+  format orphans every existing payoff across all synced devices (see the warning in `autopay.ts`).
+- **Idempotency is load-bearing.** Reconcile must produce zero ops when nothing changed, or the
+  reconciler effect (which fires on the `transactions` it writes) would loop. `commit` no-ops on empty
+  ops; `planAutopayReconcile` skips matching rows (ignoring `updatedAt`/`author`).
+- **Amount = statement balance as of the CLOSE date** (not the live balance), netted across cycles via
+  a running `priorPaid` total (never by payoff dates — that caused a double-pay bug). Nothing owed → no
+  transfer.
+- **`since` = no retroactive backfill** (cycles closing before it aren't generated), preserved across
+  config edits.
+- **Create by the clock, delete by desire.** A payoff is *created* only once its due date passes
+  (`date <= asOf`), but *deleted* only when structurally undesired — never merely because this device's
+  clock is behind. This asymmetry prevents multi-device (timezone) ping-pong.
+- Managed transfers are **read-only in the UI** (badged "auto-pay"); deleting the payer cascade-cleans
+  them and clears the card's now-dangling config.

@@ -13,6 +13,15 @@ import {
   withFdAccrual,
 } from "../src/features/portfolio/domain/holdings";
 import { accountBalances, accountBalancesByPerson, netWorth } from "../src/features/portfolio/domain/networth";
+import {
+  autopayId,
+  desiredAutopayTransfers,
+  isAutopayTransaction,
+  planAutopayReconcile,
+} from "../src/features/portfolio/domain/autopay";
+import { composeAccountExtras } from "../src/features/portfolio/ui/helpers";
+import { accruedInterest, compoundValue } from "../src/lib/money/interest";
+import { addMonthsIso, daysInMonth, isoFromParts } from "../src/lib/util/date";
 import type { Account, Holding, HoldingEvent, Transaction } from "../src/features/portfolio/model/types";
 import type { FxTable } from "../src/lib/money/currency";
 import { done, eq, near, ok, section } from "./_harness";
@@ -340,6 +349,17 @@ section("[networth] multi-currency rollup: total / assets / liabilities / per-pe
   near(result.byAssetClass.equity ?? NaN, 200, 1e-9, "equity allocation = 200 USD");
 }
 
+section("[networth] a self-transfer (same account both legs) nets to zero");
+{
+  const accounts: Account[] = [{ id: "A1", name: "Bank", type: "bank", currency: "USD", personId: "shared" }];
+  const txns: Transaction[] = [
+    { id: "i1", date: "2025-01-01", type: "income", accountId: "A1", personId: "shared", amount: 1000, currency: "USD", updatedAt: "" },
+    // Both legs land on A1 — must net out, not double-apply (per-leg, not total-effect).
+    { id: "t1", date: "2025-02-01", type: "transfer", accountId: "A1", personId: "shared", amount: 100, currency: "USD", transferToAccountId: "A1", updatedAt: "" },
+  ];
+  near(accountBalances(accounts, txns).get("A1") ?? NaN, 1000, 1e-9, "self-transfer leaves the balance unchanged");
+}
+
 section("[networth] transfer to a MISSING account is skipped whole (no money LOST)");
 {
   const accounts: Account[] = [
@@ -592,6 +612,530 @@ section("[fd] a PAYOUT FD does not auto-accrue (interest paid out, not compounde
     true,
     "clean cumulative FD still accrues",
   );
+}
+
+// ---------------------------------------------------------------------------
+// Savings-account interest (read-time, daily-balance) + opening balance.
+// ---------------------------------------------------------------------------
+
+section("[interest] compoundValue is the shared core behind fdValue");
+{
+  near(compoundValue(1000, 10, "annually", "2023-01-01", "2024-01-01"), 1100, 1e-6, "annual: 1000·1.10");
+  near(compoundValue(1000, 8, "quarterly", "2023-01-01", "2024-01-01"), 1000 * Math.pow(1.02, 4), 1e-6, "quarterly");
+  eq(compoundValue(1000, 0, "annually", "2023-01-01", "2024-01-01"), 1000, "0% → principal");
+  eq(compoundValue(1000, 10, "annually", "2024-01-01", "2023-06-01"), 1000, "asOf before start → principal");
+  near(
+    compoundValue(1000, 10, "annually", "2023-01-01", "2026-01-01", "2024-01-01"),
+    1100,
+    1e-6,
+    "capped at maturity (1 year, not 3)",
+  );
+  eq(compoundValue(1000, 1e9, "monthly", "2000-01-01", "2030-01-01"), 1000, "non-finite → principal (guarded)");
+  // fdValue is a thin wrapper over compoundValue — identical results.
+  eq(
+    fdValue(1000, { ratePct: 8, compounding: "quarterly" }, "2023-01-01", "2024-01-01"),
+    compoundValue(1000, 8, "quarterly", "2023-01-01", "2024-01-01"),
+    "fdValue delegates to compoundValue (identical)",
+  );
+}
+
+section("[interest] constant balance: more-frequent crediting earns more (compounding)");
+{
+  // Same balance/rate over 18 months — the only difference is how often interest is
+  // credited (and thus compounds). More frequent ⇒ strictly more interest.
+  const at = (f: "monthly" | "quarterly" | "halfyearly" | "annually") =>
+    accruedInterest(1000, "2025-01-01", [], 12, f, "2026-06-30");
+  // Over 18 months each has ≥1 more crediting boundary than the next, so more
+  // frequent is STRICTLY greater (a >= here would pass even if compounding did
+  // nothing — the point is to prove it does).
+  ok(at("annually") > 0, "some interest accrues");
+  ok(at("monthly") > at("quarterly"), "monthly > quarterly");
+  ok(at("quarterly") > at("halfyearly"), "quarterly > half-yearly");
+  ok(at("halfyearly") > at("annually"), "half-yearly > annually");
+}
+
+section("[interest] exactly one year, no crediting boundary → simple over the year");
+{
+  // Annually-credited, exactly 365 days: the only crediting date is asOf itself
+  // (excluded), so it's plain balance·rate·1yr.
+  near(accruedInterest(1000, "2025-01-01", [], 12, "annually", "2026-01-01"), 120, 1e-9, "1000·12%·1yr = 120");
+  eq(accruedInterest(1000, "2025-01-01", [], 0, "annually", "2026-01-01"), 0, "0% rate → no interest");
+  eq(accruedInterest(1000, "2026-01-01", [], 12, "annually", "2025-06-01"), 0, "asOf before opening → 0");
+  eq(accruedInterest(0, undefined, [], 12, "annually", "2026-01-01"), 0, "no opening date + no activity → 0");
+}
+
+section("[interest] a withdrawal reduces the balance AND its future interest");
+{
+  // Same-day withdrawal halves the earning balance for the whole year.
+  near(
+    accruedInterest(1000, "2025-01-01", [{ date: "2025-01-01", amount: -500 }], 12, "annually", "2026-01-01"),
+    60,
+    1e-9,
+    "500 earning for a year = 60 (not 120)",
+  );
+  // Mid-year withdrawal: full balance until the withdrawal, then nothing.
+  const wDate = "2025-07-02";
+  const days = (Date.parse(wDate) - Date.parse("2025-01-01")) / 86_400_000;
+  near(
+    accruedInterest(1000, "2025-01-01", [{ date: wDate, amount: -1000 }], 12, "annually", "2026-01-01"),
+    (1000 * 0.12 * days) / 365,
+    1e-9,
+    "interest only for the days the money was there",
+  );
+}
+
+section("[interest] opening date falls back to earliest activity when unset");
+{
+  near(
+    accruedInterest(0, undefined, [{ date: "2025-01-01", amount: 1000 }], 12, "annually", "2026-01-01"),
+    120,
+    1e-9,
+    "deposit dated 2025-01-01 earns a full year to 2026-01-01",
+  );
+}
+
+section("[networth] opening balance seeds balance + net worth, not income");
+{
+  const accounts: Account[] = [
+    { id: "A1", name: "HDFC", type: "bank", currency: "USD", personId: "p1", openingBalance: 5000 },
+  ];
+  const fx: FxTable = { base: "USD", rates: { USD: 1 } };
+  eq(accountBalances(accounts, []).get("A1"), 5000, "opening balance seeds the balance");
+  // An expense draws it down.
+  const txns: Transaction[] = [
+    { id: "t1", date: "2025-02-01", type: "expense", accountId: "A1", personId: "p1", amount: 1000, currency: "USD", updatedAt: "" },
+  ];
+  eq(accountBalances(accounts, txns).get("A1"), 4000, "expense reduces the seeded balance");
+  const nw = netWorth({
+    accounts,
+    balances: accountBalances(accounts, txns),
+    balancesByPerson: accountBalancesByPerson(accounts, txns),
+    holdings: [],
+    holdingValues: new Map(),
+    fx,
+  });
+  near(nw.total, 4000, 1e-9, "opening balance is real money in net worth");
+  near(nw.byPerson["p1"] ?? NaN, 4000, 1e-9, "attributed to the account owner");
+}
+
+section("[networth] savings interest shows in balance/net worth only when asOf is given");
+{
+  const accounts: Account[] = [
+    {
+      id: "S1",
+      name: "Savings",
+      type: "bank",
+      currency: "USD",
+      personId: "p1",
+      openingBalance: 1000,
+      openingBalanceDate: "2025-01-01",
+      interest: { ratePct: 12, frequency: "annually" },
+    },
+  ];
+  eq(accountBalances(accounts, []).get("S1"), 1000, "no asOf → plain balance, no interest");
+  near(
+    accountBalances(accounts, [], undefined, "2026-01-01").get("S1") ?? NaN,
+    1120,
+    1e-9,
+    "with asOf → balance + one year of interest (1000 + 120)",
+  );
+  // A same-day expense reduces both the balance and the interest it earns.
+  const txns: Transaction[] = [
+    { id: "t1", date: "2025-01-01", type: "expense", accountId: "S1", personId: "p1", amount: 500, currency: "USD", updatedAt: "" },
+  ];
+  near(
+    accountBalances(accounts, txns, undefined, "2026-01-01").get("S1") ?? NaN,
+    560,
+    1e-9,
+    "500 balance + 60 interest = 560",
+  );
+  // Net worth (with asOf-derived balances) includes the interest, attributed to the owner.
+  const bal = accountBalances(accounts, [], undefined, "2026-01-01");
+  const byP = accountBalancesByPerson(accounts, [], undefined, "2026-01-01");
+  const nw = netWorth({ accounts, balances: bal, balancesByPerson: byP, holdings: [], holdingValues: new Map(), fx: { base: "USD", rates: { USD: 1 } } });
+  near(nw.total, 1120, 1e-9, "interest is real money in net worth");
+  near(nw.byPerson["p1"] ?? NaN, 1120, 1e-9, "interest attributed to the account owner");
+}
+
+section("[networth] an account WITHOUT interest config never accrues (even with asOf)");
+{
+  const accounts: Account[] = [
+    { id: "A1", name: "Cash", type: "bank", currency: "USD", personId: "p1", openingBalance: 1000, openingBalanceDate: "2025-01-01" },
+  ];
+  eq(accountBalances(accounts, [], undefined, "2026-01-01").get("A1"), 1000, "no interest config → balance unchanged by asOf");
+}
+
+section("[networth] allocation folds account cash by type; keeps equity; excludes liabilities");
+{
+  const fx: FxTable = { base: "USD", rates: { USD: 1 } };
+  const accounts: Account[] = [
+    { id: "SAV", name: "Savings", type: "bank", currency: "USD", personId: "shared", openingBalance: 10000 },
+    { id: "FD", name: "FD", type: "fd", currency: "USD", personId: "shared", openingBalance: 5000 },
+    { id: "CC", name: "Card", type: "creditcard", currency: "USD", personId: "shared", openingBalance: -2000 },
+  ];
+  const holdings: Holding[] = [
+    { id: "h1", name: "Stock", personId: "shared", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+  ];
+  const holdingValues = new Map<string, number | null>([["h1", 8000]]);
+  const nw = netWorth({
+    accounts,
+    balances: accountBalances(accounts, []),
+    balancesByPerson: accountBalancesByPerson(accounts, []),
+    holdings,
+    holdingValues,
+    fx,
+  });
+  near(nw.byAssetClass.cash ?? NaN, 10000, 1e-9, "bank balance → cash slice");
+  near(nw.byAssetClass.debt ?? NaN, 5000, 1e-9, "fd account → debt slice");
+  near(nw.byAssetClass.equity ?? NaN, 8000, 1e-9, "equity holding STILL counted (not removed)");
+  eq(Object.keys(nw.byAssetClass).sort().join(","), "cash,debt,equity", "only those three classes — no credit-card slice");
+  near(nw.liabilities, 2000, 1e-9, "the −2000 card is a liability, not an asset slice");
+  near(nw.assets, 23000, 1e-9, "assets = 10000 cash + 5000 debt + 8000 equity");
+}
+
+section("[networth] brokerage cash and its holdings are separate slices (no double-count)");
+{
+  const fx: FxTable = { base: "USD", rates: { USD: 1 } };
+  const accounts: Account[] = [
+    { id: "BRK", name: "Broker", type: "brokerage", currency: "USD", personId: "shared", openingBalance: 3000 },
+  ];
+  const holdings: Holding[] = [
+    { id: "h1", name: "ETF", personId: "shared", accountId: "BRK", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+  ];
+  const holdingValues = new Map<string, number | null>([["h1", 7000]]);
+  const nw = netWorth({
+    accounts,
+    balances: accountBalances(accounts, []),
+    balancesByPerson: accountBalancesByPerson(accounts, []),
+    holdings,
+    holdingValues,
+    fx,
+  });
+  near(nw.byAssetClass.cash ?? NaN, 3000, 1e-9, "uninvested brokerage cash → cash");
+  near(nw.byAssetClass.equity ?? NaN, 7000, 1e-9, "the ETF holding → equity (distinct money)");
+  near(nw.assets, 10000, 1e-9, "3000 cash + 7000 equity, no double-count");
+}
+
+section("[interest] an over-drawn balance earns no (negative) interest");
+{
+  // 100 opening, a same-day 500 withdrawal drives it to −400: no negative interest.
+  eq(
+    accruedInterest(100, "2025-01-01", [{ date: "2025-01-01", amount: -500 }], 12, "annually", "2026-01-01"),
+    0,
+    "negative balance → 0 interest, never charged",
+  );
+  // A later deposit restores a positive balance → interest resumes for the rest.
+  const dep = "2025-07-02";
+  const days = (Date.parse("2026-01-01") - Date.parse(dep)) / 86_400_000;
+  near(
+    accruedInterest(0, "2025-01-01", [{ date: dep, amount: 1000 }], 12, "annually", "2026-01-01"),
+    (1000 * 0.12 * days) / 365,
+    1e-9,
+    "interest only accrues once the balance is positive",
+  );
+}
+
+section("[interest] credit-card payoff via a dated transfer keeps savings interest honest");
+{
+  // Savings earns interest; expenses ride a credit card during the month and are
+  // paid off by a month-end transfer FROM savings. Because the cash stays in
+  // savings until the dated transfer, interest accrues on the FULL balance until
+  // then, and on the reduced balance after — the daily-balance method, matching
+  // reality (and NOT the understated figure you'd get booking each expense to
+  // savings on its own date).
+  const accounts: Account[] = [
+    {
+      id: "SAV",
+      name: "Savings",
+      type: "bank",
+      currency: "USD",
+      personId: "shared",
+      openingBalance: 1000,
+      openingBalanceDate: "2025-01-01",
+      interest: { ratePct: 12, frequency: "annually" },
+    },
+    { id: "CC", name: "Card", type: "creditcard", currency: "USD", personId: "shared" },
+  ];
+  const payoff = "2025-07-02";
+  const txns: Transaction[] = [
+    { id: "t1", date: payoff, type: "transfer", accountId: "SAV", personId: "shared", amount: 400, currency: "USD", transferToAccountId: "CC", updatedAt: "" },
+  ];
+  const before = (Date.parse(payoff) - Date.parse("2025-01-01")) / 86_400_000;
+  const after = (Date.parse("2026-01-01") - Date.parse(payoff)) / 86_400_000;
+  const expectedInterest = (1000 * 0.12 * before) / 365 + (600 * 0.12 * after) / 365;
+  const bal = accountBalances(accounts, txns, undefined, "2026-01-01");
+  near(
+    bal.get("SAV") ?? NaN,
+    600 + expectedInterest,
+    1e-9,
+    "600 remaining + interest (1000 until payoff, 600 after)",
+  );
+  eq(bal.get("CC"), 400, "the payoff lands on the card (no interest — not an interest account)");
+}
+
+// ---------------------------------------------------------------------------
+// Shared date utils + credit-card statement auto-pay.
+// ---------------------------------------------------------------------------
+
+section("[date] isoFromParts clamps day to the month; daysInMonth handles Feb");
+{
+  eq(daysInMonth(2025, 2), 28, "Feb 2025 = 28 days");
+  eq(daysInMonth(2024, 2), 29, "Feb 2024 (leap) = 29 days");
+  eq(isoFromParts(2025, 2, 31), "2025-02-28", "day 31 in Feb clamps to the 28th (no rollover)");
+  eq(isoFromParts(2025, 4, 31), "2025-04-30", "day 31 in April clamps to the 30th");
+  eq(isoFromParts(2025, 5, 10), "2025-05-10", "a normal day is unchanged");
+  eq(addMonthsIso("2025-05-10", 1), "2025-06-10", "addMonthsIso rolls the month");
+}
+
+// Builders for the auto-pay scenarios (all USD unless noted).
+const ccAcct = (id: string, autopay?: Account["autopay"], currency = "USD"): Account => ({
+  id,
+  name: id,
+  type: "creditcard",
+  currency,
+  personId: "shared",
+  autopay,
+});
+const bankAcct = (id: string, currency = "USD"): Account => ({
+  id,
+  name: id,
+  type: "bank",
+  currency,
+  personId: "shared",
+});
+const charge = (id: string, cardId: string, date: string, amount: number): Transaction => ({
+  id,
+  date,
+  type: "expense",
+  accountId: cardId,
+  personId: "shared",
+  amount,
+  currency: "USD",
+  updatedAt: "",
+});
+const manualPay = (id: string, from: string, to: string, date: string, amount: number): Transaction => ({
+  id,
+  date,
+  type: "transfer",
+  accountId: from,
+  transferToAccountId: to,
+  personId: "shared",
+  amount,
+  currency: "USD",
+  updatedAt: "",
+});
+
+section("[autopay] one payoff per due cycle: statement balance as of close, dated at due");
+{
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 5, since: "2025-01-01" };
+  const accounts = [ccAcct("CC", terms), bankAcct("BANK")];
+  // Both charges fall in the cycle closing 2025-05-10 (after 04-10, on/before 05-10).
+  const txns = [charge("c1", "CC", "2025-04-15", 1000), charge("c2", "CC", "2025-05-05", 500)];
+  const got = desiredAutopayTransfers(accounts, txns, "2025-06-30");
+  eq(got.length, 1, "exactly one payoff (only the 05-10 cycle has charges and is due)");
+  const p = got[0];
+  eq(p.id, autopayId("CC", "2025-05-10"), "deterministic id keyed to the closing date");
+  eq(p.amount, 1500, "pays the statement balance as of the closing date");
+  // dueDay 5 ≤ statementDay 10 → the same-month 5th precedes the close, so it rolls
+  // to the next month: 2025-06-05.
+  eq(p.date, "2025-06-05", "due date rolled to next month (5th ≤ statement 10th)");
+  eq(p.accountId, "BANK", "paid from the configured account");
+  eq(p.transferToAccountId, "CC", "into the card");
+  ok(isAutopayTransaction(p), "flagged as an autopay-managed transfer");
+}
+
+section("[autopay] real-world long gap: statement 10th, due 15th of NEXT month");
+{
+  // The user's example — statement closes 10 May, payment due 15 June.
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 15, dueNextMonth: true, since: "2025-01-01" };
+  const accounts = [ccAcct("CC", terms), bankAcct("BANK")];
+  const got = desiredAutopayTransfers(accounts, [charge("c1", "CC", "2025-05-01", 800)], "2025-06-30");
+  eq(got.length, 1, "one payoff for the 05-10 cycle");
+  eq(got[0].date, "2025-06-15", "due 15th of the month AFTER the statement closes");
+  eq(got[0].amount, 800, "statement balance");
+}
+
+section("[autopay] no backfill: cycles closing before `since` get no payoff, carried debt sweeps into the first live cycle");
+{
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 5, since: "2025-05-01" };
+  const accounts = [ccAcct("CC", terms), bankAcct("BANK")];
+  // A charge from March (its cycle closed 2025-04-10, before `since`).
+  const got = desiredAutopayTransfers(accounts, [charge("c1", "CC", "2025-03-15", 1000)], "2025-06-30");
+  eq(got.length, 1, "no past-dated payoff for the pre-`since` cycle");
+  eq(got[0].id, autopayId("CC", "2025-05-10"), "carried balance is paid in the first cycle closing on/after `since`");
+  ok(
+    got.every((t) => t.date >= "2025-05-01"),
+    "no payoff is dated before auto-pay was enabled",
+  );
+}
+
+section("[autopay] a recorded manual payment nets out → nothing owed → no auto-payoff");
+{
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 5, since: "2025-01-01" };
+  const accounts = [ccAcct("CC", terms), bankAcct("BANK")];
+  const txns = [
+    charge("c1", "CC", "2025-05-03", 1000),
+    manualPay("m1", "BANK", "CC", "2025-05-08", 1000), // paid it yourself before the close
+  ];
+  eq(desiredAutopayTransfers(accounts, txns, "2025-06-30").length, 0, "zero owed at close → no payoff (no double-pay)");
+}
+
+section("[autopay] multi-cycle: each payoff covers only that cycle's net new charges");
+{
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 5, since: "2025-01-01" };
+  const accounts = [ccAcct("CC", terms), bankAcct("BANK")];
+  const txns = [
+    charge("c1", "CC", "2025-04-15", 1000), // cycle closing 2025-05-10
+    charge("c2", "CC", "2025-05-15", 500), //  cycle closing 2025-06-10
+  ];
+  const got = desiredAutopayTransfers(accounts, txns, "2025-08-01").sort((a, b) => (a.date < b.date ? -1 : 1));
+  eq(got.length, 2, "two payoffs");
+  eq(got[0].amount, 1000, "first cycle pays 1000");
+  eq(got[0].date, "2025-06-05", "first due");
+  eq(got[1].amount, 500, "second cycle pays only its OWN 500 (prior payoff netted)");
+  eq(got[1].date, "2025-07-05", "second due");
+}
+
+section("[autopay] a statement that hasn't CLOSED yet is not considered");
+{
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 5, since: "2025-01-01" };
+  const accounts = [ccAcct("CC", terms), bankAcct("BANK")];
+  // Charge lands in the cycle closing 2025-07-10 — after asOf, so it hasn't closed.
+  const got = desiredAutopayTransfers(accounts, [charge("c1", "CC", "2025-06-15", 900)], "2025-07-01");
+  eq(got.length, 0, "no closed statement covering the charge → nothing");
+}
+
+section("[autopay] a CLOSED-but-not-yet-due statement is returned (dated at its future due)");
+{
+  // Statement closes 2025-05-10, payment due 2025-06-15 (next month). As of 05-20
+  // the statement HAS closed but isn't due — the desired set still includes it
+  // (dated at the future due), so its membership doesn't depend on the clock; the
+  // STORE decides not to materialise it early.
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 15, dueNextMonth: true, since: "2025-01-01" };
+  const accounts = [ccAcct("CC", terms), bankAcct("BANK")];
+  const got = desiredAutopayTransfers(accounts, [charge("c1", "CC", "2025-05-01", 800)], "2025-05-20");
+  eq(got.length, 1, "the closed statement is desired");
+  eq(got[0].date, "2025-06-15", "dated at the due date, which is after asOf");
+  ok(got[0].date > "2025-05-20", "due is in the future relative to asOf");
+}
+
+section("[autopay] REGRESSION: due-next-month doesn't double-pay across cycles");
+{
+  // statement 10th, due 15th of the NEXT month (dueDay 15 > statementDay 10) — the
+  // documented config. Cycle 1's payoff is due 06-15, AFTER cycle 2 closes (06-10),
+  // so date-based netting would miss it and re-pay cycle 1's charges in cycle 2.
+  // The running-total netting pays each cycle's OWN charges only.
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 15, dueNextMonth: true, since: "2025-01-01" };
+  const accounts = [ccAcct("CC", terms), bankAcct("BANK")];
+  const txns = [charge("c1", "CC", "2025-05-01", 800), charge("c2", "CC", "2025-06-01", 300)];
+  const got = desiredAutopayTransfers(accounts, txns, "2025-08-01").sort((a, b) => (a.date < b.date ? -1 : 1));
+  eq(got.length, 2, "two payoffs");
+  eq(got[0].amount, 800, "cycle 1 pays its 800");
+  eq(got[0].date, "2025-06-15", "due next month");
+  eq(got[1].amount, 300, "cycle 2 pays only its OWN 300 (NOT 1100) — no double-pay");
+  eq(got[1].date, "2025-07-15", "due next month");
+}
+
+section("[autopay] cross-currency payer is skipped (can't mis-scale a transfer)");
+{
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 5, since: "2025-01-01" };
+  const accounts = [ccAcct("CC", terms, "USD"), bankAcct("BANK", "INR")];
+  eq(desiredAutopayTransfers(accounts, [charge("c1", "CC", "2025-05-01", 1000)], "2025-06-30").length, 0, "payer currency ≠ card → no payoff");
+}
+
+section("[autopay] disabled / archived cards generate nothing");
+{
+  const noConfig = [ccAcct("CC", undefined), bankAcct("BANK")];
+  eq(desiredAutopayTransfers(noConfig, [charge("c1", "CC", "2025-05-01", 1000)], "2025-06-30").length, 0, "no autopay config → nothing");
+  const terms = { fromAccountId: "BANK", statementDay: 10, dueDay: 5, since: "2025-01-01" };
+  const archived = [{ ...ccAcct("CC", terms), archived: true }, bankAcct("BANK")];
+  eq(desiredAutopayTransfers(archived, [charge("c1", "CC", "2025-05-01", 1000)], "2025-06-30").length, 0, "archived card → nothing");
+}
+
+section("[autopay] planAutopayReconcile: create-gate, update-on-change, delete-by-desire");
+{
+  const dueSoon = manualPay("autopay:CC:2025-05-10", "BANK", "CC", "2025-06-05", 800); // desired, due <= asOf
+  const notDue = manualPay("autopay:CC:2025-06-10", "BANK", "CC", "2025-07-05", 300); // desired, due > asOf
+  const asOf = "2025-06-20";
+
+  // Nothing stored yet: create only the due one; the closed-but-not-due one waits.
+  const p1 = planAutopayReconcile([], [dueSoon, notDue], asOf);
+  eq(p1.toPut.length, 1, "only the due payoff is created");
+  eq(p1.toPut[0].id, "autopay:CC:2025-05-10", "the due one");
+  eq(p1.toDeleteIds.length, 0, "nothing to delete");
+
+  // Idempotent: an already-matching stored row (differing only in updatedAt) → no put.
+  const stored = { ...dueSoon, updatedAt: "2025-06-05T10:00:00Z", author: "me" };
+  const p2 = planAutopayReconcile([stored], [dueSoon, notDue], asOf);
+  eq(p2.toPut.length, 0, "matching row is left alone (ignores updatedAt/author)");
+  eq(p2.toDeleteIds.length, 0, "and not deleted");
+
+  // Changed amount → update.
+  const p3 = planAutopayReconcile([{ ...dueSoon, amount: 999 }], [dueSoon], asOf);
+  eq(p3.toPut.length, 1, "amount change → update");
+  eq(p3.toPut[0].amount, 800, "to the desired amount");
+
+  // A peer-created payoff whose due is still in THIS clock's future is KEPT (in
+  // desired → not deleted), not ping-ponged.
+  const p4 = planAutopayReconcile([notDue], [dueSoon, notDue], asOf);
+  eq(p4.toDeleteIds.length, 0, "peer-created future-due payoff is kept");
+
+  // No longer desired (auto-pay off / cycle credited) → delete.
+  const p5 = planAutopayReconcile([dueSoon], [], asOf);
+  eq(p5.toDeleteIds.length, 1, "one undesired payoff");
+  eq(p5.toDeleteIds[0], "autopay:CC:2025-05-10", "undesired stored payoff is deleted");
+  eq(p5.toPut.length, 0, "nothing to put");
+}
+
+section("[autopay] composeAccountExtras: parsing, drop-stray-date, since preservation");
+{
+  const base = {
+    openingBalance: "",
+    openingDate: "",
+    interestEnabled: false,
+    interestRate: "",
+    interestFreq: "quarterly" as const,
+    autopayEnabled: false,
+    fromAccountId: "",
+    statementDay: "",
+    dueDay: "",
+    dueNextMonth: false,
+    existingSince: undefined,
+    today: "2026-07-11",
+  };
+  // Opening-balance parsing.
+  eq(composeAccountExtras({ ...base, openingBalance: "" }).openingBalance, undefined, "blank → undefined");
+  eq(composeAccountExtras({ ...base, openingBalance: "abc" }).openingBalance, undefined, "NaN → undefined");
+  eq(composeAccountExtras({ ...base, openingBalance: "1e999" }).openingBalance, undefined, "Infinity → undefined");
+  eq(composeAccountExtras({ ...base, openingBalance: "-100" }).openingBalance, -100, "negative kept (liability/overdraft)");
+  // Drop-stray-date: a date with neither balance nor interest is dropped.
+  eq(composeAccountExtras({ ...base, openingDate: "2026-01-01" }).openingBalanceDate, undefined, "stray date dropped");
+  eq(
+    composeAccountExtras({ ...base, openingDate: "2026-01-01", openingBalance: "500" }).openingBalanceDate,
+    "2026-01-01",
+    "kept when there's a balance",
+  );
+  eq(
+    composeAccountExtras({ ...base, openingDate: "2026-01-01", interestEnabled: true, interestRate: "3" }).openingBalanceDate,
+    "2026-01-01",
+    "kept when interest anchors it",
+  );
+  // Interest gate.
+  eq(composeAccountExtras({ ...base, interestEnabled: true, interestRate: "0" }).interest, undefined, "0% → no interest");
+  eq(composeAccountExtras({ ...base, interestEnabled: false, interestRate: "3" }).interest, undefined, "disabled → no interest");
+  const withInterest = composeAccountExtras({ ...base, interestEnabled: true, interestRate: "3.5", interestFreq: "monthly" });
+  eq(withInterest.interest?.ratePct, 3.5, "rate parsed");
+  eq(withInterest.interest?.frequency, "monthly", "frequency carried");
+  // Autopay `since` preservation vs default.
+  const apBase = { ...base, autopayEnabled: true, fromAccountId: "BANK", statementDay: "10", dueDay: "5" };
+  eq(composeAccountExtras(apBase).autopay?.since, "2026-07-11", "no prior since → defaults to today");
+  eq(
+    composeAccountExtras({ ...apBase, existingSince: "2025-01-01" }).autopay?.since,
+    "2025-01-01",
+    "prior since PRESERVED across edits (no re-backfill)",
+  );
+  eq(composeAccountExtras({ ...apBase, statementDay: "10.7" }).autopay?.statementDay, 10, "day truncated to integer");
+  eq(composeAccountExtras({ ...base, autopayEnabled: false }).autopay, undefined, "disabled → no autopay");
 }
 
 done();

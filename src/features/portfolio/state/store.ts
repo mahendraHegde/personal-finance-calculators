@@ -23,6 +23,7 @@ import type {
 } from "../model/types";
 import { createPortfolioRepo, type PortfolioRepo } from "../repo/portfolio-repo";
 import { netUnits } from "../domain/holdings";
+import { desiredAutopayTransfers, isAutopayTransaction, planAutopayReconcile } from "../domain/autopay";
 
 export interface PortfolioState {
   ready: boolean;
@@ -233,17 +234,40 @@ export class PortfolioStore {
     // Refuse to orphan history: deleting an account with transactions/holdings
     // would drop its balance from net worth while the rows linger as "—". Checked
     // inside the commit thunk so a concurrently-added referencing row is seen.
+    // MANAGED auto-pay transfers are exempt: they're derived, not hand-entered, so
+    // they don't block deletion — instead they're cascade-deleted in the SAME
+    // commit (otherwise a card/payer could never be deleted while auto-pay was on,
+    // and "remove them first" would be a dead end since reconcile recreates them).
     await this.commit(() => {
-      const usedByTxn = this.state.transactions.some(
-        (t) => t.accountId === id || t.transferToAccountId === id,
-      );
+      const references = (t: Transaction): boolean => t.accountId === id || t.transferToAccountId === id;
+      const usedByTxn = this.state.transactions.some((t) => references(t) && !isAutopayTransaction(t));
       const usedByHolding = this.state.holdings.some((h) => h.accountId === id);
       if (usedByTxn || usedByHolding) {
         throw new Error("This account has transactions or holdings — remove or reassign them first.");
       }
+      const managed = this.state.transactions.filter((t) => references(t) && isAutopayTransaction(t));
+      const managedIds = new Set(managed.map((t) => t.id));
+      // Any card that paid FROM this account now has a dangling payer — clear its
+      // auto-pay config so it doesn't silently reference a deleted account.
+      const orphanedCards = this.state.accounts.filter((a) => a.id !== id && a.autopay?.fromAccountId === id);
+      const clearAutopay = (a: Account): Account => {
+        const copy = { ...a };
+        delete copy.autopay;
+        return copy;
+      };
+      const orphanedIds = new Set(orphanedCards.map((a) => a.id));
       return {
-        ops: [{ collection: Collections.accounts, op: "delete", id }],
-        patch: { accounts: this.state.accounts.filter((x) => x.id !== id) },
+        ops: [
+          { collection: Collections.accounts, op: "delete", id },
+          ...managed.map((t): BatchOp => ({ collection: Collections.transactions, op: "delete", id: t.id })),
+          ...orphanedCards.map((a): BatchOp => ({ collection: Collections.accounts, op: "put", value: clearAutopay(a) })),
+        ],
+        patch: {
+          accounts: this.state.accounts
+            .filter((x) => x.id !== id)
+            .map((a) => (orphanedIds.has(a.id) ? clearAutopay(a) : a)),
+          transactions: this.state.transactions.filter((t) => !managedIds.has(t.id)),
+        },
       };
     });
   }
@@ -290,6 +314,53 @@ export class PortfolioStore {
       ops: [{ collection: Collections.transactions, op: "delete", id }],
       patch: { transactions: this.state.transactions.filter((x) => x.id !== id) },
     }));
+  }
+
+  /** Bring the managed credit-card auto-pay transfers in line with each card's
+   *  config as of `asOf`: create newly-due payoffs, update ones whose statement
+   *  amount changed, and delete any no longer wanted (auto-pay turned off, a cycle
+   *  now fully credited, config narrowed). Deterministic ids make this idempotent —
+   *  when nothing differs it produces ZERO ops, so `commit` is a true no-op (no
+   *  version bump, no dirty flag, no sync churn). Safe to call on every state
+   *  change; NOT called from inside another commit (that would deadlock the lock).
+   */
+  async reconcileAutopay(asOf: string): Promise<void> {
+    await this.commit(() => {
+      // The DECISION (create-gate, update-if-changed, delete-by-desire) is a pure
+      // domain function so it's testable without the store; here we just stamp and
+      // persist it.
+      const desired = desiredAutopayTransfers(this.state.accounts, this.state.transactions, asOf, this.state.fx);
+      const existing = this.state.transactions.filter(isAutopayTransaction);
+      const { toPut, toDeleteIds } = planAutopayReconcile(existing, desired, asOf);
+      // Nothing changed → true no-op (commit skips the version bump on empty ops).
+      if (toPut.length === 0 && toDeleteIds.length === 0) return { ops: [], patch: {} };
+
+      const now = new Date().toISOString();
+      const author = this.state.settings.author;
+      const puts = new Map<string, Transaction>(toPut.map((d) => [d.id, { ...d, updatedAt: now, author }]));
+      const deletes = new Set(toDeleteIds);
+      const ops: BatchOp[] = [
+        ...[...puts.values()].map(
+          (rec): BatchOp => ({ collection: Collections.transactions, op: "put", value: rec }),
+        ),
+        ...toDeleteIds.map((id): BatchOp => ({ collection: Collections.transactions, op: "delete", id })),
+      ];
+      // Rebuild the transactions list in ONE pass (O(T + changes)) rather than a
+      // replace/filter per change (O(changes × T)) — matters on first-load catch-up.
+      const next: Transaction[] = [];
+      for (const t of this.state.transactions) {
+        if (deletes.has(t.id)) continue;
+        const updated = puts.get(t.id);
+        if (updated) {
+          next.push(updated);
+          puts.delete(t.id); // consumed → the leftover puts are brand-new payoffs
+        } else {
+          next.push(t);
+        }
+      }
+      for (const rec of puts.values()) next.push(rec);
+      return { ops, patch: { transactions: next } };
+    });
   }
 
   // -- holdings & events ---------------------------------------------------

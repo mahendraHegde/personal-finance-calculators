@@ -28,12 +28,54 @@ export type AccountType =
   | "realestate"
   | "liability";
 
+/** How often savings-account interest is credited (and thus compounds). */
+export type InterestFrequency = "monthly" | "quarterly" | "halfyearly" | "annually";
+
+/** OPT-IN auto-pay of a credit card's statement from another account. When set on
+ *  a credit-card account, the app maintains one `transfer` (payer → card) per
+ *  closed billing cycle whose due date has passed — paying the statement balance
+ *  as of the closing date. These transfers are MANAGED (deterministic ids, kept in
+ *  sync with this config); to change them, edit this config or turn it off. */
+export interface AutopayTerms {
+  /** Account the statement is paid FROM (must share the card's currency). */
+  fromAccountId: ID;
+  /** Day of the month the statement closes (1-31; clamped to the month's length). */
+  statementDay: number;
+  /** Day of the month payment is due (1-31; clamped). */
+  dueDay: number;
+  /** True when the due date falls in the month AFTER the statement closes (e.g.
+   *  statement 10th, pay the 15th of the next month). When false but the due day
+   *  would land on/before the close, it's pushed to the next month automatically. */
+  dueNextMonth?: boolean;
+  /** ISO date auto-pay was enabled. Cycles that closed BEFORE this aren't generated
+   *  (no retroactive backfill over payments you already recorded by hand). */
+  since: string;
+}
+
 export interface Account {
   id: ID;
   name: string;
   type: AccountType;
   currency: CurrencyCode;
   personId: Owner;
+  /** Balance already in the account before your first tracked transaction (what it
+   *  held when you started). Seeded into the account's balance — NOT a transaction,
+   *  so it never shows up as income in reports. */
+  openingBalance?: number;
+  /** ISO date the opening balance applies from — and where interest accrual starts.
+   *  When absent, accrual anchors to the earliest transaction; with neither a date
+   *  nor any activity there's nothing to anchor to, so no interest accrues (the
+   *  opening balance is still counted, it just earns nothing until anchored). */
+  openingBalanceDate?: string;
+  /** Optional interest auto-accrual for a savings/FD account. Computed READ-TIME by
+   *  the daily-balance method (interest on each day's balance, compounded at
+   *  `frequency`) and added to this account's value — an ESTIMATE (banks round /
+   *  deduct TDS). For exact figures, leave this off and record interest credits as
+   *  income transactions instead. */
+  interest?: { ratePct: number; frequency: InterestFrequency };
+  /** Opt-in auto-pay of this card's statement from another account (credit cards
+   *  only). Materialised as managed `transfer` transactions — see AutopayTerms. */
+  autopay?: AutopayTerms;
   archived?: boolean;
 }
 

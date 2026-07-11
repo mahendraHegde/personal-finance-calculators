@@ -346,4 +346,120 @@ section("[store] markSynced clears dirty only when nothing raced ahead");
   ok(store.getState().dirty, "still dirty because v2 hasn't been synced (no lost edit)");
 }
 
+section("[store] reconcileAutopay materialises a payoff, is idempotent, and cleans up when disabled");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveAccount({ id: "BANK", name: "Bank", type: "bank", currency: "USD", personId: "shared" });
+  await store.saveAccount({
+    id: "CC",
+    name: "Card",
+    type: "creditcard",
+    currency: "USD",
+    personId: "shared",
+    autopay: { fromAccountId: "BANK", statementDay: 10, dueDay: 5, since: "2025-01-01" },
+  });
+  await store.saveTransaction({
+    id: "c1",
+    date: "2025-05-05",
+    type: "expense",
+    accountId: "CC",
+    personId: "shared",
+    amount: 1500,
+    currency: "USD",
+    updatedAt: "",
+  });
+
+  await store.reconcileAutopay("2025-06-30");
+  const autopayTxns = () => store.getState().transactions.filter((t) => t.id.startsWith("autopay:"));
+  eq(autopayTxns().length, 1, "a managed payoff transfer is created");
+  eq(autopayTxns()[0].amount, 1500, "for the statement balance");
+  const afterFirst = store.getState().version;
+
+  await store.reconcileAutopay("2025-06-30");
+  eq(store.getState().version, afterFirst, "second reconcile is a no-op (no version bump)");
+  eq(autopayTxns().length, 1, "still exactly one payoff (idempotent, no duplicate)");
+
+  // Turning auto-pay off removes the managed transfer on the next reconcile.
+  await store.saveAccount({ id: "CC", name: "Card", type: "creditcard", currency: "USD", personId: "shared" });
+  await store.reconcileAutopay("2025-06-30");
+  eq(autopayTxns().length, 0, "disabling auto-pay deletes the managed payoff");
+}
+
+section("[store] reconcileAutopay doesn't materialise a closed-but-not-yet-due statement early");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveAccount({ id: "BANK", name: "Bank", type: "bank", currency: "USD", personId: "shared" });
+  await store.saveAccount({
+    id: "CC",
+    name: "Card",
+    type: "creditcard",
+    currency: "USD",
+    personId: "shared",
+    autopay: { fromAccountId: "BANK", statementDay: 10, dueDay: 15, dueNextMonth: true, since: "2025-01-01" },
+  });
+  await store.saveTransaction({
+    id: "c1", date: "2025-05-01", type: "expense", accountId: "CC", personId: "shared", amount: 800, currency: "USD", updatedAt: "",
+  });
+  const autopayTxns = () => store.getState().transactions.filter((t) => t.id.startsWith("autopay:"));
+  // Statement closed 05-10, due 06-15. As of 05-20 it's closed but NOT due.
+  await store.reconcileAutopay("2025-05-20");
+  eq(autopayTxns().length, 0, "closed but not due → not created yet");
+  // Once the due date passes, it's created.
+  await store.reconcileAutopay("2025-06-20");
+  eq(autopayTxns().length, 1, "created once due");
+  eq(autopayTxns()[0].amount, 800, "for the statement balance");
+}
+
+section("[store] reconcileAutopay keeps a payoff a peer created, even when THIS clock is before its due date");
+{
+  // Simulates a multi-device timezone skew: device A generated the payoff (due
+  // passed there); device B pulls it and reconciles with an earlier `asOf`. B must
+  // NOT delete it (deletion is by structural desire, not the local clock) — that's
+  // what prevents cross-device ping-pong.
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveAccount({ id: "BANK", name: "Bank", type: "bank", currency: "USD", personId: "shared" });
+  await store.saveAccount({
+    id: "CC", name: "Card", type: "creditcard", currency: "USD", personId: "shared",
+    autopay: { fromAccountId: "BANK", statementDay: 10, dueDay: 15, dueNextMonth: true, since: "2025-01-01" },
+  });
+  await store.saveTransaction({
+    id: "c1", date: "2025-05-01", type: "expense", accountId: "CC", personId: "shared", amount: 800, currency: "USD", updatedAt: "",
+  });
+  const autopayTxns = () => store.getState().transactions.filter((t) => t.id.startsWith("autopay:"));
+  await store.reconcileAutopay("2025-06-20"); // "device A": due has passed → created
+  eq(autopayTxns().length, 1, "created when due");
+  await store.reconcileAutopay("2025-05-20"); // "device B": clock before the due date
+  eq(autopayTxns().length, 1, "NOT deleted despite the earlier clock (no ping-pong)");
+}
+
+section("[store] deleting a payer cascade-removes managed auto-pay transfers + clears the dangling config");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveAccount({ id: "BANK", name: "Bank", type: "bank", currency: "USD", personId: "shared" });
+  await store.saveAccount({
+    id: "CC", name: "Card", type: "creditcard", currency: "USD", personId: "shared",
+    autopay: { fromAccountId: "BANK", statementDay: 10, dueDay: 5, since: "2025-01-01" },
+  });
+  await store.saveTransaction({
+    id: "c1", date: "2025-05-05", type: "expense", accountId: "CC", personId: "shared", amount: 500, currency: "USD", updatedAt: "",
+  });
+  await store.reconcileAutopay("2025-06-30");
+  ok(store.getState().transactions.some((t) => t.id.startsWith("autopay:")), "a managed payoff exists (BANK → CC)");
+  // A card with real charges can't be deleted (its history blocks it) — that's
+  // correct, not a trap. But the PAYER's only reference is the managed transfer, so
+  // deleting it should succeed, cascade-delete the transfer, and clear CC's now-
+  // dangling auto-pay config (rather than throw the dead-end error).
+  let threw = false;
+  try {
+    await store.deleteAccount("CC");
+  } catch {
+    threw = true;
+  }
+  ok(threw, "card with real charges is still protected (blocked by its charge history)");
+  await store.deleteAccount("BANK");
+  eq(store.getState().accounts.some((a) => a.id === "BANK"), false, "payer deleted");
+  eq(store.getState().transactions.filter((t) => t.id.startsWith("autopay:")).length, 0, "managed transfers cascade-deleted");
+  eq(store.getState().accounts.find((a) => a.id === "CC")?.autopay, undefined, "CC's dangling auto-pay config cleared");
+}
+
 done();

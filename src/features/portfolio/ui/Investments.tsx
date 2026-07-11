@@ -30,6 +30,7 @@ import {
   holdingAccountOptions,
   CURRENCY_CHOICES,
   eventsByHolding,
+  INTEREST_FREQUENCY_OPTIONS,
   ownerLabel,
   personOptions,
   QUALITY_TONE,
@@ -598,13 +599,8 @@ function HoldingForm({
                     <Select
                       value={fdCompounding}
                       onChange={(v) => setFdCompounding(v as FdCompounding)}
-                      options={[
-                        { value: "quarterly", label: "Quarterly" },
-                        { value: "monthly", label: "Monthly" },
-                        { value: "halfyearly", label: "Half-yearly" },
-                        { value: "annually", label: "Annually" },
-                        { value: "simple", label: "Simple (no compounding)" },
-                      ]}
+                      // Same crediting frequencies as savings interest, plus an FD-only "simple".
+                      options={[...INTEREST_FREQUENCY_OPTIONS, { value: "simple", label: "Simple (no compounding)" }]}
                     />
                   </Field>
                   <Field label="Maturity date (optional)">
