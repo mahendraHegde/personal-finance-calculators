@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent, ReactNode } from "react";
 import { ChevronDown, ChevronUp, Eye, EyeOff } from "lucide-react";
+import { ddmmyyyyToIso, formatDdmmyyyy, isoToDdmmyyyy } from "../../../lib/util/date";
 
 export function Button({
   children,
@@ -128,16 +129,79 @@ export function TextInput({
   placeholder?: string;
   type?: string;
 }) {
+  // A native <input type="date"> renders its display format from the BROWSER's
+  // locale (Chrome ignores the element `lang`), so DD/MM can't be forced there.
+  // Use an explicit DD/MM/YYYY text field instead — storage stays ISO yyyy-mm-dd.
+  if (type === "date") return <DateInput value={value} onChange={onChange} placeholder={placeholder} />;
   return (
     <input
       type={type}
-      // A native date picker renders in the element's locale. Force en-GB so it shows
-      // DD/MM/YYYY (not the en-US MM/DD/YYYY); the stored value stays ISO yyyy-mm-dd,
-      // so nothing else changes. (Chromium/Firefox honor this; Safari follows the OS.)
-      lang={type === "date" ? "en-GB" : undefined}
       value={value}
       placeholder={placeholder}
       onChange={(e: ChangeEvent<HTMLInputElement>) => onChange(e.target.value)}
+      className={inputCls}
+    />
+  );
+}
+
+// --- Date field (DD/MM/YYYY display, ISO storage) --------------------------
+/** DD/MM/YYYY date field. Emits an ISO `yyyy-mm-dd` string (or `""` when cleared)
+ *  via `onChange` once the input parses to a real date; holds partial/invalid input
+ *  locally so keystrokes aren't lost. Parents store/compare the ISO value exactly as
+ *  before (this only changes what the user sees and types). */
+function DateInput({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  const [text, setText] = useState(() => isoToDdmmyyyy(value));
+  const emitted = useRef(value);
+  useEffect(() => {
+    // Resync the display only when `value` changes from OUTSIDE (e.g. an edit form
+    // opens) — not from our own emit, which would clobber the user mid-typing.
+    if (value !== emitted.current) {
+      setText(isoToDdmmyyyy(value));
+      emitted.current = value;
+    }
+  }, [value]);
+  const handle = (raw: string): void => {
+    const formatted = formatDdmmyyyy(raw);
+    setText(formatted);
+    const iso = ddmmyyyyToIso(formatted);
+    if (iso !== null && iso !== emitted.current) {
+      emitted.current = iso;
+      onChange(iso);
+    }
+  };
+  const dirty = ddmmyyyyToIso(text) === null; // non-empty but not yet a real date
+  const commit = (): void => {
+    // A partial/invalid entry that never emitted (held) snaps the DISPLAY back to the
+    // committed value (or "" if cleared) — so the field always shows exactly what a
+    // Save would read, never a stray half-typed date.
+    if (dirty) setText(isoToDdmmyyyy(emitted.current));
+  };
+  const onKeyDown = (e: KeyboardEvent<HTMLInputElement>): void => {
+    // Enter with a held partial would let the Modal submit the last committed value
+    // while the field shows the half-typed one. Reconcile the display and swallow the
+    // Enter so a submit can only happen once the shown date is real (or cleared).
+    if (e.key === "Enter" && dirty) {
+      commit();
+      e.stopPropagation();
+    }
+  };
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      placeholder={placeholder ?? "dd/mm/yyyy"}
+      value={text}
+      onChange={(e: ChangeEvent<HTMLInputElement>) => handle(e.target.value)}
+      onBlur={commit}
+      onKeyDown={onKeyDown}
       className={inputCls}
     />
   );

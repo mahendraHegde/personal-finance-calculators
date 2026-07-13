@@ -305,6 +305,7 @@ function TransactionForm({
   const amountNum = Number(amount);
   const canSave =
     accountId !== "" &&
+    date !== "" && // a transaction must be dated (the date field holds a partial silently)
     amount.trim() !== "" &&
     Number.isFinite(amountNum) && // rejects "", Infinity, NaN ("1e999", "1.2.3")
     amountNum > 0 &&

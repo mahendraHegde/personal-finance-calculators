@@ -132,6 +132,11 @@ export function makeFxAt(
     // approximate. USD-base (or single-currency) data is unaffected.
     const snap = idx >= 0 ? sorted[idx] : sorted[0];
     if (!snap) return current;
+    // The newest snapshot period (today / future) uses `current`, which carries the
+    // user's manual FX OVERRIDES — so a date-accurate conversion for "now" matches
+    // net worth. Older dates use their historical snapshot: overrides are present-day
+    // corrections and must NOT be applied retroactively.
+    if (idx === sorted.length - 1) return current;
     try {
       return rebase({ base: snap.base, rates: snap.rates }, base);
     } catch {

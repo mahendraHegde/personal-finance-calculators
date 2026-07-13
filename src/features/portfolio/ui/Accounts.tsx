@@ -318,10 +318,15 @@ function AccountForm({ initial, onClose }: { initial?: Account; onClose: () => v
     ? state.transactions.some((t) => t.accountId === initial.id || t.transferToAccountId === initial.id) ||
       state.holdings.some((h) => h.accountId === initial.id)
     : false;
-  // Interest auto-accrual only makes sense for a cash-holding account (a savings
-  // bank account, or an FD modelled as an account). Holdings-backed / debt accounts
-  // don't earn account-level interest.
-  const showInterest = type === "bank" || type === "fd";
+  // Interest auto-accrual is for a SAVINGS (bank) account — a fluctuating balance
+  // earning daily interest. A fixed deposit is modelled as a HOLDING instead
+  // (Holding.fd: locked principal, maturity, counts in the portfolio return), so
+  // there's ONE FD path and no double-count. Other account types don't earn
+  // account-level interest — EXCEPT we keep the section visible for an account that
+  // already HAS interest (e.g. a legacy FD-type account from before this rule), so
+  // editing it (say, a rename) doesn't silently strip its config; the user can see
+  // it and turn it off to migrate.
+  const showInterest = type === "bank" || Boolean(initial?.interest);
   // Statement auto-pay is a credit-card-only, opt-in convenience. The payer must be
   // a same-currency asset account (reuse the holding-account picker: it already
   // excludes credit cards / liabilities).

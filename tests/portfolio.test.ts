@@ -12,7 +12,7 @@ import {
   portfolioReturn,
   withFdAccrual,
 } from "../src/features/portfolio/domain/holdings";
-import { accountBalances, accountBalancesByPerson, netWorth } from "../src/features/portfolio/domain/networth";
+import { accountBalances, accountBalancesByPerson, netWorth, totalReturn } from "../src/features/portfolio/domain/networth";
 import {
   autopayId,
   desiredAutopayTransfers,
@@ -21,7 +21,8 @@ import {
 } from "../src/features/portfolio/domain/autopay";
 import { composeAccountExtras } from "../src/features/portfolio/ui/helpers";
 import { accruedInterest, compoundValue } from "../src/lib/money/interest";
-import { addMonthsIso, daysInMonth, isoFromParts } from "../src/lib/util/date";
+import { xirr, type Cashflow } from "../src/lib/money/xirr";
+import { addMonthsIso, daysInMonth, ddmmyyyyToIso, formatDdmmyyyy, isoFromParts, isoToDdmmyyyy } from "../src/lib/util/date";
 import type { Account, Holding, HoldingEvent, Transaction } from "../src/features/portfolio/model/types";
 import type { FxTable } from "../src/lib/money/currency";
 import { done, eq, near, ok, section } from "./_harness";
@@ -358,6 +359,26 @@ section("[networth] a self-transfer (same account both legs) nets to zero");
     { id: "t1", date: "2025-02-01", type: "transfer", accountId: "A1", personId: "shared", amount: 100, currency: "USD", transferToAccountId: "A1", updatedAt: "" },
   ];
   near(accountBalances(accounts, txns).get("A1") ?? NaN, 1000, 1e-9, "self-transfer leaves the balance unchanged");
+}
+
+section("[networth] a cross-currency transfer is credited at the TRANSFER-date rate, not today's");
+{
+  const accounts: Account[] = [
+    { id: "USD", name: "US", type: "bank", currency: "USD", personId: "shared" },
+    { id: "INR", name: "IN", type: "bank", currency: "INR", personId: "shared" },
+  ];
+  const txns: Transaction[] = [
+    { id: "t1", date: "2024-01-01", type: "transfer", accountId: "USD", personId: "shared", amount: 100, currency: "USD", transferToAccountId: "INR", updatedAt: "" },
+  ];
+  const atTransfer: FxTable = { base: "USD", rates: { USD: 1, INR: 80 } }; // rate on the transfer day
+  const atToday: FxTable = { base: "USD", rates: { USD: 1, INR: 100 } }; // INR has since depreciated
+  const fxAt = (date: string): FxTable => (date <= "2024-06-01" ? atTransfer : atToday);
+  // Per-date resolver → the credit is LOCKED at the transfer-date rate (100·80 = 8000 INR),
+  // so the INR balance doesn't drift as today's rate changes.
+  near(accountBalances(accounts, txns, fxAt).get("INR") ?? NaN, 8000, 1e-9, "credited 8000 INR (transfer-date rate)");
+  near(accountBalances(accounts, txns, fxAt).get("USD") ?? NaN, -100, 1e-9, "source debited 100 USD");
+  // A plain table still converts at that table — unchanged behaviour for existing callers.
+  near(accountBalances(accounts, txns, atToday).get("INR") ?? NaN, 10000, 1e-9, "single table → that table's rate (10000)");
 }
 
 section("[networth] transfer to a MISSING account is skipped whole (no money LOST)");
@@ -816,6 +837,115 @@ section("[networth] brokerage cash and its holdings are separate slices (no doub
   near(nw.assets, 10000, 1e-9, "3000 cash + 7000 equity, no double-count");
 }
 
+section("[totalReturn] a savings account's interest IS its money-weighted return");
+{
+  const fxAt = (): FxTable => ({ base: "USD", rates: { USD: 1 } });
+  // Non-leap span (2023 = 365 days) so actual/365 accrues an exact 100.
+  const accounts: Account[] = [
+    { id: "SAV", name: "Savings", type: "bank", currency: "USD", personId: "p1", openingBalance: 1000, openingBalanceDate: "2023-01-01", interest: { ratePct: 10, frequency: "annually" } },
+  ];
+  const r = totalReturn([], new Map(), accounts, [], "USD", fxAt, "2024-01-01");
+  near(r.xirr ?? NaN, 0.1, 0.005, "1000 → 1100 over a year = ~10% p.a.");
+  near(r.value, 1100, 1e-9, "value = balance incl. accrued interest");
+  eq(r.included, 1, "the account contributed");
+}
+
+section("[totalReturn] holdings-only matches portfolioReturn (no accounts)");
+{
+  const fxAt = (): FxTable => ({ base: "USD", rates: { USD: 1 } });
+  const holdings: Holding[] = [
+    { id: "H1", name: "ETF", personId: "p1", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+  ];
+  const events = new Map<string, HoldingEvent[]>([
+    ["H1", [ev({ type: "buy", date: "2024-01-01", units: 100, price: 1 }), ev({ type: "valuation", date: "2025-01-01", amount: 150 })]],
+  ]);
+  const pr = portfolioReturn(holdings, events, "USD", fxAt, "2025-01-01");
+  const tr = totalReturn(holdings, events, [], [], "USD", fxAt, "2025-01-01");
+  near(tr.xirr ?? NaN, pr.xirr ?? NaN, 1e-9, "no accounts → identical to the investment return");
+  near(tr.value, pr.value, 1e-9, "same asset value");
+}
+
+section("[totalReturn] idle cash drags the blended return below investments-only");
+{
+  const fxAt = (): FxTable => ({ base: "USD", rates: { USD: 1 } });
+  const holdings: Holding[] = [
+    { id: "H1", name: "ETF", personId: "p1", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+  ];
+  const events = new Map<string, HoldingEvent[]>([
+    ["H1", [ev({ type: "buy", date: "2024-01-01", units: 100, price: 1 }), ev({ type: "valuation", date: "2025-01-01", amount: 150 })]],
+  ]);
+  // A large 0%-interest cash pile alongside the +50% holding.
+  const accounts: Account[] = [
+    { id: "CASH", name: "Cash", type: "bank", currency: "USD", personId: "p1", openingBalance: 10000, openingBalanceDate: "2024-01-01" },
+  ];
+  const pr = portfolioReturn(holdings, events, "USD", fxAt, "2025-01-01");
+  const tr = totalReturn(holdings, events, accounts, [], "USD", fxAt, "2025-01-01");
+  ok((tr.xirr ?? 0) > 0, "still positive (the holding gained)");
+  ok((tr.xirr ?? 0) < (pr.xirr ?? 0), "but well below the 50% investment return — idle cash drags it");
+}
+
+section("[totalReturn] credit-card / liabilities are excluded (assets-only)");
+{
+  const fxAt = (): FxTable => ({ base: "USD", rates: { USD: 1 } });
+  const accounts: Account[] = [
+    { id: "BANK", name: "Bank", type: "bank", currency: "USD", personId: "p1", openingBalance: 1000, openingBalanceDate: "2024-01-01" },
+    { id: "CC", name: "Card", type: "creditcard", currency: "USD", personId: "p1", openingBalance: -500, openingBalanceDate: "2024-01-01" },
+  ];
+  const r = totalReturn([], new Map(), accounts, [], "USD", fxAt, "2025-01-01");
+  near(r.value, 1000, 1e-9, "value = assets only (the −500 card is excluded, not netted)");
+  eq(r.included, 1, "only the bank contributed; the card is a liability");
+}
+
+section("[totalReturn] a cross-currency transfer surfaces the FX gain/loss (date-locked credit)");
+{
+  // 100 USD moved into INR when USD/INR = 80 (so 8000 INR credited, locked). By asOf
+  // INR has depreciated to 100/USD → that 8000 INR is worth only 80 USD. So you put
+  // in 100 and hold 80 → a real base-currency loss the return should show.
+  const atTransfer: FxTable = { base: "USD", rates: { USD: 1, INR: 80 } };
+  const atToday: FxTable = { base: "USD", rates: { USD: 1, INR: 100 } };
+  const fxAt = (date: string): FxTable => (date < "2024-09-01" ? atTransfer : atToday);
+  const accounts: Account[] = [
+    { id: "USD", name: "US", type: "bank", currency: "USD", personId: "p1", openingBalance: 100, openingBalanceDate: "2024-01-01" },
+    { id: "INR", name: "IN", type: "bank", currency: "INR", personId: "p1" },
+  ];
+  const txns: Transaction[] = [
+    { id: "t1", date: "2024-06-01", type: "transfer", accountId: "USD", personId: "p1", amount: 100, currency: "USD", transferToAccountId: "INR", updatedAt: "" },
+  ];
+  const r = totalReturn([], new Map(), accounts, txns, "USD", fxAt, "2025-01-01");
+  near(r.value, 80, 1e-6, "assets = 8000 INR at today's rate = 80 USD");
+  ok((r.xirr ?? 0) < 0, "negative return — the INR depreciation is captured, not hidden");
+}
+
+section("[totalReturn] a transfer to a MISSING account can't create a phantom flow");
+{
+  const fxAt = (): FxTable => ({ base: "USD", rates: { USD: 1 } });
+  const accounts: Account[] = [
+    { id: "BANK", name: "Bank", type: "bank", currency: "USD", personId: "p1", openingBalance: 1000, openingBalanceDate: "2024-01-01" },
+  ];
+  // Transfer OUT to an account NOT in `accounts` (incomplete import). The balance
+  // engine skips the whole transfer, so the return series must too — otherwise a
+  // phantom +400 inflow would fabricate a ~49% return.
+  const txns: Transaction[] = [
+    { id: "t1", date: "2024-07-01", type: "transfer", accountId: "BANK", personId: "p1", amount: 400, currency: "USD", transferToAccountId: "GONE", updatedAt: "" },
+  ];
+  const r = totalReturn([], new Map(), accounts, txns, "USD", fxAt, "2025-01-01");
+  near(r.value, 1000, 1e-9, "terminal = 1000 (missing-endpoint transfer skipped)");
+  ok(r.xirr === null || Math.abs(r.xirr) < 0.01, "≈0% — no phantom inflow inflating the return");
+}
+
+section("[xirr] a decades-long, many-flow series returns a sane rate or null — never a ~100 artefact");
+{
+  // A long span overflows the bisection domain floor to a non-finite NPV; the guard
+  // must reject rather than return ~hi (= 10000%).
+  const flows: Cashflow[] = [];
+  for (let y = 1960; y <= 2021; y++) {
+    flows.push({ date: `${y}-01-01`, amount: -1000 });
+    flows.push({ date: `${y}-07-01`, amount: 1001 });
+  }
+  const r = xirr(flows);
+  ok(r === null || Math.abs(r) < 5, "sane or null, never a ~100 (10000%) artefact");
+}
+
 section("[interest] an over-drawn balance earns no (negative) interest");
 {
   // 100 opening, a same-day 500 withdrawal drives it to −400: no negative interest.
@@ -885,6 +1015,26 @@ section("[date] isoFromParts clamps day to the month; daysInMonth handles Feb");
   eq(isoFromParts(2025, 4, 31), "2025-04-30", "day 31 in April clamps to the 30th");
   eq(isoFromParts(2025, 5, 10), "2025-05-10", "a normal day is unchanged");
   eq(addMonthsIso("2025-05-10", 1), "2025-06-10", "addMonthsIso rolls the month");
+}
+
+section("[date] dd/mm/yyyy <-> ISO (the date field's parsing)");
+{
+  eq(isoToDdmmyyyy("2025-01-30"), "30/01/2025", "ISO → dd/mm/yyyy for display");
+  eq(isoToDdmmyyyy(""), "", "empty → empty");
+  eq(ddmmyyyyToIso("30/01/2025"), "2025-01-30", "dd/mm/yyyy → ISO for storage");
+  eq(ddmmyyyyToIso(""), "", "cleared → empty (emits a clear)");
+  eq(ddmmyyyyToIso("30/01"), null, "partial → null (held, not emitted)");
+  eq(ddmmyyyyToIso("31/02/2025"), null, "31 Feb rejected (not a real date)");
+  eq(ddmmyyyyToIso("00/01/2025"), null, "day 0 rejected");
+  eq(ddmmyyyyToIso("01/13/2025"), null, "month 13 rejected");
+  eq(ddmmyyyyToIso("29/02/2024"), "2024-02-29", "leap day accepted");
+  eq(ddmmyyyyToIso("29/02/2025"), null, "29 Feb in a non-leap year rejected");
+  eq(ddmmyyyyToIso("01/01/0130"), null, "an implausibly-ancient typo year (<1900) is rejected");
+  // Auto-format: typed digits group into dd/mm/yyyy.
+  eq(formatDdmmyyyy("30012025"), "30/01/2025", "8 digits grouped with slashes");
+  eq(formatDdmmyyyy("3001"), "30/01", "partial grouping mid-type");
+  eq(formatDdmmyyyy("30/01/2025"), "30/01/2025", "already-slashed input normalised");
+  eq(ddmmyyyyToIso(formatDdmmyyyy("30012025")), "2025-01-30", "type-digits round-trips to ISO");
 }
 
 // Builders for the auto-pay scenarios (all USD unless noted).

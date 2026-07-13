@@ -67,11 +67,13 @@ export interface Account {
    *  nor any activity there's nothing to anchor to, so no interest accrues (the
    *  opening balance is still counted, it just earns nothing until anchored). */
   openingBalanceDate?: string;
-  /** Optional interest auto-accrual for a savings/FD account. Computed READ-TIME by
-   *  the daily-balance method (interest on each day's balance, compounded at
-   *  `frequency`) and added to this account's value — an ESTIMATE (banks round /
-   *  deduct TDS). For exact figures, leave this off and record interest credits as
-   *  income transactions instead. */
+  /** Optional interest auto-accrual for a SAVINGS (bank) account — a fluctuating
+   *  balance earning daily interest. Computed READ-TIME by the daily-balance method
+   *  (interest on each day's balance, compounded at `frequency`) and added to this
+   *  account's value — an ESTIMATE (banks round / deduct TDS). For exact figures,
+   *  leave this off and record interest credits as income transactions instead.
+   *  A FIXED DEPOSIT is NOT modelled this way — use a holding with `Holding.fd`
+   *  (locked principal + maturity, and it counts in the portfolio return). */
   interest?: { ratePct: number; frequency: InterestFrequency };
   /** Opt-in auto-pay of this card's statement from another account (credit cards
    *  only). Materialised as managed `transfer` transactions — see AutopayTerms. */

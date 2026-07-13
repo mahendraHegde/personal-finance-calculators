@@ -140,6 +140,10 @@ export function accruedInterest(
   }
   const creditSet = new Set(credits);
   const points = [...new Set([...future.map((f) => f.ms), ...credits, endMs])].sort((a, b) => a - b);
+  // Sum the dated changes by timestamp once, so applying them per point is O(1)
+  // instead of scanning `future` at every point (O(points × deltas)).
+  const futureByMs = new Map<number, number>();
+  for (const f of future) futureByMs.set(f.ms, (futureByMs.get(f.ms) ?? 0) + f.amount);
 
   let total = 0;
   let periodAccrued = 0;
@@ -160,7 +164,7 @@ export function accruedInterest(
       periodAccrued = 0;
     }
     // Apply balance changes dated exactly here, AFTER crediting the closing period.
-    for (const f of future) if (f.ms === p) balance += f.amount;
+    balance += futureByMs.get(p) ?? 0;
     prev = p;
   }
   return Number.isFinite(total) ? total : 0;

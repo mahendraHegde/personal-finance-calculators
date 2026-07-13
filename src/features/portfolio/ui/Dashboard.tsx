@@ -8,7 +8,7 @@
 import { useMemo, useState } from "react";
 import { formatCompactMoney, formatMoney, formatPercent, monthKey, todayIso } from "../../../lib/util/format";
 import { tryConvert } from "../../../lib/money/currency";
-import { accountBalancesByPerson, netWorth, sumAccountBalances } from "../domain/networth";
+import { accountBalancesByPerson, netWorth, sumAccountBalances, totalReturn } from "../domain/networth";
 import { currentHoldingValue, dataQuality, holdingXirr, portfolioReturn, withFdAccrual } from "../domain/holdings";
 import { categoryTotals, flowSummary, monthlyTotals, type CategoryTotal } from "../domain/transactions";
 import type { PortfolioState } from "../state/store";
@@ -30,9 +30,12 @@ import {
 function computeHeavy(state: PortfolioState) {
   const { fx, base } = displayFx(state);
   const today = todayIso(); // FDs + savings interest accrue their value up to today
+  const fxAt = makeFxAt(state.fxRates, base, fx);
   // One transaction scan (+ interest pass): derive the totals by summing the
-  // per-person breakdown rather than scanning twice.
-  const balancesByPerson = accountBalancesByPerson(state.accounts, state.transactions, fx, today);
+  // per-person breakdown rather than scanning twice. Pass the per-date FX resolver
+  // so a cross-currency transfer is credited at its own date's rate (fixed) instead
+  // of drifting with today's rate.
+  const balancesByPerson = accountBalancesByPerson(state.accounts, state.transactions, fxAt, today);
   const balances = sumAccountBalances(balancesByPerson);
   const byHolding = eventsByHolding(state);
   const holdingValues = new Map(
@@ -105,15 +108,14 @@ function computeHeavy(state: PortfolioState) {
       pct: exposureAssets > 0 ? (e.value / exposureAssets) * 100 : 0,
     }));
 
-  const ret = portfolioReturn(
-    state.holdings,
-    byHolding,
-    base,
-    makeFxAt(state.fxRates, base, fx),
-    todayIso(),
-  );
+  const ret = portfolioReturn(state.holdings, byHolding, base, fxAt, today);
+  // Personal rate of return on ALL assets ex-liabilities (holdings + accounts,
+  // incl. cash & savings interest) — the blended figure, idle cash counts as drag.
+  // Reuse the `balances` already scanned above (same fxAt + today) so totalReturn
+  // doesn't repeat the full transaction scan + interest pass.
+  const totalRet = totalReturn(state.holdings, byHolding, state.accounts, state.transactions, base, fxAt, today, balances);
 
-  return { base, nw, flow, holdings, allocation, people, exposure, ret };
+  return { base, nw, flow, holdings, allocation, people, exposure, ret, totalRet };
 }
 
 export function Dashboard() {
@@ -132,7 +134,12 @@ export function Dashboard() {
 
   // Shared heavy scan — computed once, and ONLY when a section that needs it is open.
   const needHeavy =
-    isOpen("networth") || isOpen("allocation") || isOpen("exposure") || isOpen("holdings") || isOpen("return");
+    isOpen("networth") ||
+    isOpen("allocation") ||
+    isOpen("exposure") ||
+    isOpen("holdings") ||
+    isOpen("return") ||
+    isOpen("totalreturn");
   const heavy = useMemo(() => (needHeavy ? computeHeavy(state) : null), [state, needHeavy]);
 
   // Monthly trend is a separate scan (per-date FX), gated on its own section.
@@ -246,6 +253,37 @@ export function Dashboard() {
                   ? ` (${heavy.ret.total - heavy.ret.included} skipped — no cost basis or no fresh value)`
                   : ""}
                 . Compare it to your expected inflation to see your real growth.
+              </p>
+            </div>
+          ))}
+      </RevealCard>
+
+      <RevealCard
+        title="Total return"
+        subtitle="Return on ALL your assets — investments plus cash & savings interest"
+        open={isOpen("totalreturn")}
+        onToggle={() => toggle("totalreturn")}
+      >
+        {heavy &&
+          (heavy.totalRet.xirr === null ? (
+            <EmptyState>
+              Add assets with some history (holdings, or accounts with an opening balance / transactions)
+              to see your overall return.
+            </EmptyState>
+          ) : (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <StatCard label="Return p.a." value={formatPercent(heavy.totalRet.xirr)} sub="money-weighted (XIRR)" />
+                <StatCard
+                  label={`Assets (${base})`}
+                  value={formatCompactMoney(heavy.totalRet.value, base)}
+                  sub="excludes debt"
+                />
+              </div>
+              <p className="text-xs text-slate-400">
+                Your money-weighted return across everything you own except debt — investments plus cash,
+                savings interest and deposits, in {base}. Idle cash drags this down, so it usually reads
+                lower than the investments-only figure above; that gap is the cost of uninvested cash.
               </p>
             </div>
           ))}

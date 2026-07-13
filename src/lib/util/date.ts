@@ -26,3 +26,34 @@ export function addMonthsIso(iso: string, months: number): string {
   const [y, m, d] = iso.slice(0, 10).split("-").map(Number);
   return new Date(Date.UTC(y, m - 1 + months, d)).toISOString().slice(0, 10);
 }
+
+// --- DD/MM/YYYY <-> ISO (for the date input; storage stays ISO yyyy-mm-dd) -----
+
+/** Group up to 8 typed digits as `dd/mm/yyyy`, auto-inserting the slashes (so a
+ *  mobile numeric keypad without "/" still works, and pasted/native separators are
+ *  normalised). */
+export function formatDdmmyyyy(raw: string): string {
+  const digits = raw.replace(/\D/g, "").slice(0, 8);
+  return [digits.slice(0, 2), digits.slice(2, 4), digits.slice(4, 8)].filter(Boolean).join("/");
+}
+
+/** `dd/mm/yyyy` → ISO `yyyy-mm-dd`; `""` when cleared; `null` when partial/invalid.
+ *  Requires a REAL calendar date (rejects 31/02, month 0/13, etc.). */
+export function ddmmyyyyToIso(text: string): string | null {
+  if (text === "") return "";
+  const [d, mo, y] = text.split("/");
+  if (!d || !mo || !y || y.length !== 4) return null;
+  const dd = Number(d);
+  const mm = Number(mo);
+  const yyyy = Number(y);
+  if (![dd, mm, yyyy].every(Number.isInteger)) return null;
+  if (yyyy < 1900 || yyyy > 9999) return null; // reject typos like 0130 → year 130
+  if (mm < 1 || mm > 12 || dd < 1 || dd > daysInMonth(yyyy, mm)) return null;
+  return `${String(yyyy).padStart(4, "0")}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+}
+
+/** ISO `yyyy-mm-dd` → `dd/mm/yyyy` for display; `""` for a non-ISO/empty value. */
+export function isoToDdmmyyyy(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : "";
+}

@@ -37,6 +37,15 @@ import {
 } from "./helpers";
 
 const ASSET_CLASSES: AssetClass[] = ["equity", "debt", "cash", "crypto", "gold", "realestate", "other"];
+const ASSET_CLASS_LABELS: Record<AssetClass, string> = {
+  equity: "Equity / ETF",
+  debt: "Debt / bonds / FD",
+  cash: "Cash",
+  crypto: "Crypto",
+  gold: "Gold",
+  realestate: "Real estate",
+  other: "Other",
+};
 
 // Live-price sources. CoinGecko + mfapi.in are keyless/browser-direct; Google
 // Finance needs Drive connected (it drives the user's own Sheet) but covers
@@ -352,7 +361,12 @@ function HoldingForm({
   const [name, setName] = useState(initial?.name ?? "");
   const [personId, setPersonId] = useState(initial?.personId ?? state.people[0]?.id ?? SHARED);
   const [accountId, setAccountId] = useState(initial?.accountId ?? ""); // broker/account this lot sits in
-  const [assetClass, setAssetClass] = useState<AssetClass>(initial?.assetClass ?? "equity");
+  // An existing FD must be debt (the "fd ⇒ debt" invariant). A legacy holding with
+  // fd terms on a non-debt class (from the old fd-account trigger) opens AS debt, so
+  // the checked FD box matches what Save will keep — instead of silently dropping fd.
+  const [assetClass, setAssetClass] = useState<AssetClass>(
+    initial?.fd && initial.assetClass !== "debt" ? "debt" : (initial?.assetClass ?? "equity"),
+  );
   const [currency, setCurrency] = useState(initial?.currency ?? state.settings.displayCurrency);
 
   // Picking the broker account defaults the currency + owner to it (a holding
@@ -388,9 +402,11 @@ function HoldingForm({
   const pickAssetClass = (v: AssetClass): void => {
     setPriceSource((cur) => (cur === defaultSource(assetClass) ? defaultSource(v) : cur));
     setAssetClass(v);
+    // Leaving the debt class means it's no longer an FD — drop the FD toggle so it
+    // can't linger (stale "Deposit amount" label, or FD terms saved on, say, gold).
+    if (v !== "debt") setFdEnabled(false);
   };
 
-  const livePriced = Boolean(priceSource && ticker.trim());
   const num = (s: string): number | null => {
     const n = Number(s);
     return s.trim() !== "" && Number.isFinite(n) ? n : null;
@@ -406,17 +422,33 @@ function HoldingForm({
     const a = state.accounts.find((x) => x.id === initial.accountId);
     if (a) accountChoices.push({ value: a.id, label: `${a.name} (${a.currency})` });
   }
-  // Offer the fixed-deposit auto-accrual when this looks like an FD: a debt-class
-  // holding, or one sitting in an FD-type account.
-  const showFd = assetClass === "debt" || state.accounts.find((a) => a.id === accountId)?.type === "fd";
+  // Field visibility follows the asset class, so each kind of holding shows only
+  // what applies to it:
+  //  - FD auto-accrual: a debt holding (or an existing FD being edited).
+  //  - Live pricing (ticker + price source) AND a unit quantity: only classes that
+  //    are valued by units × price — equity, crypto, and debt mutual funds — and
+  //    NOT an FD (its value accrues, it has no ticker). Gold / real estate / cash /
+  //    other are amount-based: no ticker, no units, just cost + current value.
+  const showFd = assetClass === "debt" || Boolean(initial?.fd);
+  const showLivePricing =
+    (assetClass === "equity" || assetClass === "crypto" || assetClass === "debt") && !fdEnabled;
+  const livePriced = showLivePricing && Boolean(priceSource && ticker.trim());
+  // Enabling FD means it's a debt instrument — auto-select the class so the user
+  // doesn't have to set it separately (answers "when I pick FD, choose debt").
+  const toggleFd = (on: boolean): void => {
+    setFdEnabled(on);
+    if (on && assetClass !== "debt") setAssetClass("debt");
+  };
 
   const save = async (): Promise<void> => {
     if (!name.trim()) return;
-    // FD terms only when the section is shown, enabled, and the rate is valid;
-    // otherwise undefined (also clears it if the user turned FD off).
+    // FD terms only for a DEBT holding with FD enabled and a valid rate — the
+    // `assetClass === "debt"` gate enforces the "fd ⇒ debt" invariant, so
+    // reclassifying off debt (even for an existing FD) drops the FD instead of
+    // leaving e.g. a gold holding that auto-accrues interest.
     const rate = num(fdRate);
     const fd: FdTerms | undefined =
-      showFd && fdEnabled && rate !== null && rate > 0
+      assetClass === "debt" && fdEnabled && rate !== null && rate > 0
         ? { ratePct: rate, compounding: fdCompounding, maturityDate: fdMaturity || undefined }
         : undefined;
     const holding: Holding = {
@@ -428,8 +460,10 @@ function HoldingForm({
       assetClass,
       currency,
       incomeMode,
-      ticker: ticker.trim() || undefined,
-      priceSource: priceSource ? (priceSource as PriceSource) : undefined,
+      // Only store live-pricing on a priceable holding — an FD / gold / cash etc.
+      // carries no ticker (and clearing it means changing the class drops a stale one).
+      ticker: showLivePricing ? ticker.trim() || undefined : undefined,
+      priceSource: showLivePricing && priceSource ? (priceSource as PriceSource) : undefined,
       fd,
     };
     await store.saveHolding(holding);
@@ -441,7 +475,10 @@ function HoldingForm({
       return;
     }
 
-    const qty = num(quantity);
+    // Only honour a unit quantity when the Quantity field was actually shown
+    // (live-priceable class). Otherwise a value typed for equity then reclassified
+    // to FD/gold/cash would leak in as phantom units on an amount-based holding.
+    const qty = showLivePricing ? num(quantity) : null;
     const cost = num(invested);
     const date = startDate || todayIso();
     if (qty !== null && qty > 0 && cost !== null && cost > 0) {
@@ -521,7 +558,7 @@ function HoldingForm({
             <Select
               value={assetClass}
               onChange={(v) => pickAssetClass(v as AssetClass)}
-              options={ASSET_CLASSES.map((c) => ({ value: c, label: c }))}
+              options={ASSET_CLASSES.map((c) => ({ value: c, label: ASSET_CLASS_LABELS[c] }))}
             />
           </Field>
           <Field label="Dividends">
@@ -541,12 +578,14 @@ function HoldingForm({
             : "Income funds pay cash dividends — you'll log each payout, and it counts toward returns."}
         </p>
 
-        <LivePriceFields
-          priceSource={priceSource}
-          setPriceSource={setPriceSource}
-          ticker={ticker}
-          setTicker={setTicker}
-        />
+        {showLivePricing && (
+          <LivePriceFields
+            priceSource={priceSource}
+            setPriceSource={setPriceSource}
+            ticker={ticker}
+            setTicker={setTicker}
+          />
+        )}
 
         {/* Onboarding (NEW holdings only) — for an existing one, lots are edited
             in its transaction history. */}
@@ -556,10 +595,12 @@ function HoldingForm({
               Already hold this? Enter your quantity and what you paid (optional).
             </div>
             <div className="grid grid-cols-2 gap-2">
-              <Field label="Quantity (units held)">
-                <NumberInput value={quantity} onChange={setQuantity} placeholder="e.g. 0.085" />
-              </Field>
-              <Field label="Total cost (what you paid)">
+              {showLivePricing && (
+                <Field label="Quantity (units held)">
+                  <NumberInput value={quantity} onChange={setQuantity} placeholder="e.g. 0.085" />
+                </Field>
+              )}
+              <Field label={fdEnabled ? "Deposit amount (principal)" : "Total cost (what you paid)"}>
                 <NumberInput value={invested} onChange={setInvested} placeholder="cost basis" />
               </Field>
               <Field label="Since">
@@ -574,7 +615,9 @@ function HoldingForm({
             <p className="mt-1 text-xs text-slate-400">
               {livePriced
                 ? "Current value is fetched automatically (quantity × latest price) — enter your quantity so it can be valued."
-                : "Enter quantity to track units (needed for live prices), or just a cost + current value."}
+                : showLivePricing
+                  ? "Enter quantity to track units (needed for live prices), or just a cost + current value."
+                  : "Enter what you paid and its current value."}
             </p>
           </div>
         )}
@@ -585,7 +628,7 @@ function HoldingForm({
               <input
                 type="checkbox"
                 checked={fdEnabled}
-                onChange={(e) => setFdEnabled(e.target.checked)}
+                onChange={(e) => toggleFd(e.target.checked)}
               />
               Fixed deposit — auto-calculate its value from interest
             </label>
@@ -610,7 +653,7 @@ function HoldingForm({
                 <p className="mt-1 text-xs text-slate-400">
                   {initial
                     ? "Value accrues from your deposit (or latest manual valuation) to today."
-                    : "Enter your deposit as “Total cost” and its date as “Since” above; the value then accrues to today."}{" "}
+                    : "Enter your principal as “Deposit amount” and its date as “Since” above; the value then accrues to today."}{" "}
                   It's an estimate (banks round / deduct TDS) — enter a current value any time to reconcile.
                   Assumes interest is reinvested (cumulative FD); a payout FD (Dividends = “Paid out”) isn't
                   auto-valued — log each payout instead.
@@ -846,6 +889,7 @@ function EventForm({
   else if (type === "adjustment") canSave = fin(amount) && Number(amount) !== 0;
   else if (type === "dividend") canSave = fin(amount) && Number(amount) > 0;
   else canSave = fin(amount) && Number(amount) >= 0; // valuation / opening
+  if (date === "") canSave = false; // an event must be dated (the date field can hold a partial)
   const okFee = fee.trim() === "" || (Number.isFinite(Number(fee)) && Number(fee) >= 0);
 
   const save = (): void => {
@@ -962,7 +1006,7 @@ function QuantityForm({
 
   const qty = Number(quantity);
   const costNum = Number(cost);
-  const canSave = quantity.trim() !== "" && Number.isFinite(qty) && qty > 0;
+  const canSave = quantity.trim() !== "" && Number.isFinite(qty) && qty > 0 && date !== "";
   const save = async (): Promise<void> => {
     if (!canSave) return;
     await store.setOpeningPosition(holding.id, {

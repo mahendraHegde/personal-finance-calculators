@@ -317,13 +317,27 @@ export interface PortfolioReturn {
  * currency lacks a rate at some cashflow date is skipped rather than folded in with
  * dropped flows (which would corrupt its contribution).
  */
-export function portfolioReturn(
+/** The combined holding cashflows + base-currency aggregates that back
+ *  `portfolioReturn` — extracted so the blended `totalReturn` (holdings + accounts)
+ *  can reuse the exact same holding logic instead of duplicating it. `flows` are
+ *  every eligible holding's dated cashflows converted to `base`. */
+export interface HoldingReturnFlows {
+  flows: Cashflow[];
+  invested: number;
+  value: number;
+  gain: number;
+  gainKnown: boolean;
+  included: number;
+  total: number;
+}
+
+export function holdingReturnFlows(
   holdings: Holding[],
   eventsByHolding: Map<string, HoldingEvent[]>,
   base: CurrencyCode,
   fxAt: (date: string) => FxTable,
   asOf: string,
-): PortfolioReturn {
+): HoldingReturnFlows {
   const flows: Cashflow[] = [];
   const nowFx = fxAt(asOf);
   let invested = 0;
@@ -378,12 +392,23 @@ export function portfolioReturn(
     }
   }
 
+  return { flows, invested, value, gain, gainKnown, included, total };
+}
+
+export function portfolioReturn(
+  holdings: Holding[],
+  eventsByHolding: Map<string, HoldingEvent[]>,
+  base: CurrencyCode,
+  fxAt: (date: string) => FxTable,
+  asOf: string,
+): PortfolioReturn {
+  const r = holdingReturnFlows(holdings, eventsByHolding, base, fxAt, asOf);
   return {
-    xirr: flows.length >= 2 ? xirr(flows) : null,
-    invested,
-    value,
-    absoluteGain: gainKnown ? gain : null,
-    included,
-    total,
+    xirr: r.flows.length >= 2 ? xirr(r.flows) : null,
+    invested: r.invested,
+    value: r.value,
+    absoluteGain: r.gainKnown ? r.gain : null,
+    included: r.included,
+    total: r.total,
   };
 }

@@ -7,7 +7,9 @@
 import type { CurrencyCode, FxTable } from "../../../lib/money/currency";
 import { tryConvert } from "../../../lib/money/currency";
 import { accruedInterest, type BalanceDelta } from "../../../lib/money/interest";
-import type { Account, AccountType, AssetClass, Holding, ID, Owner, Transaction } from "../model/types";
+import { xirr, type Cashflow } from "../../../lib/money/xirr";
+import { holdingReturnFlows } from "./holdings";
+import type { Account, AccountType, AssetClass, Holding, HoldingEvent, ID, Owner, Transaction } from "../model/types";
 
 /** How a cash ACCOUNT's positive balance maps into the asset-class allocation
  *  (holdings bring their own `assetClass`). `bank`/`cash`/`brokerage` are liquid
@@ -55,13 +57,24 @@ export function accountTxnDelta(t: Transaction, account: Account, fx?: FxTable):
   return d;
 }
 
+/** FX for cross-currency transfer credits: either a fixed table, or a per-date
+ *  resolver `(date) => FxTable`. Pass the resolver to credit a cross-currency
+ *  transfer at ITS OWN date's rate (a stable historical figure) instead of
+ *  re-deriving it from the source amount at today's rate on every read (which makes
+ *  a transfer-funded foreign balance "breathe" with the current rate). A fixed
+ *  table keeps the old behaviour and is fine for same-currency data. */
+export type FxSource = FxTable | ((date: string) => FxTable);
+
+const fxFor = (fx: FxSource | undefined, date: string): FxTable | undefined =>
+  typeof fx === "function" ? fx(date) : fx;
+
 /** Running balance per account, in that account's own currency (opening balance +
  *  transactions, plus read-time interest when `asOf` is given). A convenience over
  *  `accountBalancesByPerson`; see it for the transfer/currency/attribution rules. */
 export function accountBalances(
   accounts: Account[],
   transactions: Transaction[],
-  fx?: FxTable,
+  fx?: FxSource,
   asOf?: string,
 ): Map<ID, number> {
   // Derive the per-account total by summing the per-person breakdown, so the two
@@ -98,7 +111,7 @@ export function sumAccountBalances(byPerson: Map<ID, Map<Owner, number>>): Map<I
 export function accountBalancesByPerson(
   accounts: Account[],
   transactions: Transaction[],
-  fx?: FxTable,
+  fx?: FxSource,
   asOf?: string,
 ): Map<ID, Map<Owner, number>> {
   const byId = new Map(accounts.map((a) => [a.id, a]));
@@ -139,7 +152,10 @@ export function accountBalancesByPerson(
       if (!toId || !byId.has(t.accountId)) continue;
       const dest = byId.get(toId);
       if (!dest) continue;
-      const credit = transferCredit(t, dest, fx);
+      // Credit at the transfer's OWN date when a resolver is supplied — so the
+      // dest-currency amount is locked to the transfer-date rate, not re-derived at
+      // today's rate on every read.
+      const credit = transferCredit(t, dest, fxFor(fx, t.date));
       if (credit === null) continue;
       // Both legs carry the transaction's personId (SHARED for transfers), so a
       // transfer nets out within that person and doesn't shift attribution.
@@ -150,9 +166,10 @@ export function accountBalancesByPerson(
       continue;
     }
     // income / expense — a single leg on t.accountId (no-op if that account is gone).
+    // fx is irrelevant here (no transfer leg), but resolve it to a table for the type.
     const acct = byId.get(t.accountId);
     if (!acct) continue;
-    const delta = accountTxnDelta(t, acct, fx);
+    const delta = accountTxnDelta(t, acct, fxFor(fx, t.date));
     bump(t.accountId, t.personId, delta);
     track(t.accountId, t.date, delta);
   }
@@ -268,4 +285,122 @@ export function netWorth(input: NetWorthInput): NetWorthResult {
     byPerson,
     byAssetClass,
   };
+}
+
+export interface TotalReturn {
+  /** Money-weighted (XIRR) return across holdings + all asset accounts (ex
+   *  credit-card / liability), base currency; null when not computable. Idle cash
+   *  is included, so it DRAGS the figure — this is a personal rate of return on
+   *  total assets, not just investments (that's `portfolioReturn`). */
+  xirr: number | null;
+  /** Base-currency value of the included assets (net worth excluding liabilities). */
+  value: number;
+  /** Holdings + accounts that contributed cashflows. */
+  included: number;
+}
+
+/**
+ * Personal money-weighted rate of return on ALL assets (ex-liabilities): the
+ * holding cashflows (reused from `holdingReturnFlows`) PLUS each non-liability
+ * account's cashflows — money added (income / opening balance / transfer-in) is a
+ * contribution (outflow), money removed (expense / transfer-out) a distribution
+ * (inflow), and the current balance (incl. read-time interest) a final inflow at
+ * `asOf`. One XIRR over the whole series.
+ *
+ * The account cashflow at each event is the NEGATIVE of its balance effect
+ * (`accountTxnDelta`), so a savings account's series collapses to
+ * (contributions − withdrawals + interest): its contribution to the return is
+ * exactly its interest, a 0% cash account contributes 0 (a drag), and an internal
+ * transfer between two included accounts cancels. An account whose currency lacks a
+ * rate at some cashflow date is skipped whole (like a holding), never folded in
+ * with dropped flows.
+ */
+export function totalReturn(
+  holdings: Holding[],
+  eventsByHolding: Map<string, HoldingEvent[]>,
+  accounts: Account[],
+  transactions: Transaction[],
+  base: CurrencyCode,
+  fxAt: (date: string) => FxTable,
+  asOf: string,
+  /** The per-account terminal balances the caller already computed with the SAME
+   *  `fxAt`/`asOf` (e.g. the dashboard's `balances`). Passing it avoids a second
+   *  full transaction scan + interest pass. Recomputed when omitted. */
+  balances?: Map<ID, number>,
+): TotalReturn {
+  const h = holdingReturnFlows(holdings, eventsByHolding, base, fxAt, asOf);
+  const flows: Cashflow[] = [...h.flows];
+  let value = h.value;
+  let included = h.included;
+
+  // Terminal native balances (incl. read-time interest) for every account, crediting
+  // cross-currency transfers at their own date's rate (fxAt) — matching the per-flow
+  // conversion below, so terminal and flows agree. Reuse the caller's map when given.
+  const balNow = balances ?? accountBalances(accounts, transactions, fxAt, asOf);
+  const byId = new Map(accounts.map((x) => [x.id, x]));
+  // Group each transaction under every account it touches (source + destination,
+  // deduped so a self-transfer isn't counted twice).
+  const touching = new Map<ID, Transaction[]>();
+  const add = (accId: ID, t: Transaction): void => {
+    const arr = touching.get(accId);
+    if (arr) arr.push(t);
+    else touching.set(accId, [t]);
+  };
+  for (const t of transactions) {
+    add(t.accountId, t);
+    if (t.transferToAccountId && t.transferToAccountId !== t.accountId) add(t.transferToAccountId, t);
+  }
+
+  for (const a of accounts) {
+    if (a.type === "creditcard" || a.type === "liability") continue; // ex-liabilities
+    const txns = touching.get(a.id) ?? [];
+    const terminal = balNow.get(a.id) ?? 0;
+    if (terminal === 0 && txns.length === 0 && !a.openingBalance) continue; // empty account
+
+    // Native cashflows: cashflow = −(balance effect). Opening balance + contributions
+    // negative; withdrawals positive; terminal value positive.
+    let earliest: string | undefined;
+    for (const t of txns) if (earliest === undefined || t.date < earliest) earliest = t.date;
+    const openDate = a.openingBalanceDate ?? earliest ?? asOf;
+    const native: Cashflow[] = [];
+    if (a.openingBalance) native.push({ date: openDate, amount: -a.openingBalance });
+    for (const t of txns) {
+      // Mirror accountBalances' all-or-nothing transfer skip so the flows agree with
+      // the terminal: a transfer with a missing endpoint (or an unconvertible
+      // cross-currency leg) isn't in the balance, so it must not create a phantom
+      // cashflow here (which would otherwise poison the whole XIRR).
+      if (t.type === "transfer") {
+        const toId = t.transferToAccountId;
+        if (!toId || !byId.has(t.accountId)) continue;
+        const dest = byId.get(toId);
+        if (!dest || transferCredit(t, dest, fxAt(t.date)) === null) continue;
+      }
+      const delta = accountTxnDelta(t, a, fxAt(t.date));
+      if (delta !== 0) native.push({ date: t.date, amount: -delta });
+    }
+    native.push({ date: asOf, amount: terminal });
+    // Contributes nothing (empty / excluded-only / washed to zero) → skip so it
+    // neither adds a stray zero flow nor inflates `included`.
+    if (native.every((cf) => cf.amount === 0)) continue;
+
+    // Convert each to base at its date; skip the WHOLE account if any is unconvertible.
+    const accFlows: Cashflow[] = [];
+    let convertible = true;
+    for (const cf of native) {
+      const b = tryConvert({ amount: cf.amount, currency: a.currency }, base, fxAt(String(cf.date)));
+      if (b === null || !Number.isFinite(b)) {
+        convertible = false;
+        break;
+      }
+      accFlows.push({ date: cf.date, amount: b });
+    }
+    if (!convertible) continue;
+
+    flows.push(...accFlows);
+    const termBase = tryConvert({ amount: terminal, currency: a.currency }, base, fxAt(asOf));
+    if (termBase !== null && Number.isFinite(termBase)) value += termBase;
+    included++;
+  }
+
+  return { xirr: flows.length >= 2 ? xirr(flows) : null, value, included };
 }

@@ -58,10 +58,16 @@ export function xirr(cashflows: Cashflow[], guess = 0.1): number | null {
   // break-even 0-span series makes NPV a constant zero, which would otherwise let
   // Newton's first step return the initial guess as a bogus "solved" rate.
   if (t0 === Math.max(...times)) return null;
-  const flows: Normalised[] = valid.map((c, i) => ({
-    years: (times[i] - t0) / MS_PER_YEAR,
-    amount: c.amount,
-  }));
+  // Collapse flows that share a date by summing their amounts: they have the same
+  // `years`, so NPV is IDENTICAL, but the solved vector shrinks from one-per-leg to
+  // one-per-distinct-date. This keeps npv/bisection fast when a caller passes a flow
+  // per transaction over a long ledger (e.g. the blended totalReturn).
+  const byYears = new Map<number, number>();
+  for (let i = 0; i < valid.length; i++) {
+    const years = (times[i] - t0) / MS_PER_YEAR;
+    byYears.set(years, (byYears.get(years) ?? 0) + valid[i].amount);
+  }
+  const flows: Normalised[] = [...byYears].map(([years, amount]) => ({ years, amount }));
 
   // Newton–Raphson from the guess.
   let rate = guess;
@@ -81,7 +87,11 @@ export function xirr(cashflows: Cashflow[], guess = 0.1): number | null {
   let hi = 100;
   let flo = npv(flows, lo);
   const fhi = npv(flows, hi);
-  if (flo * fhi > 0) return null; // not bracketed
+  // A very long span (decades) makes (1+lo)^years ≈ 1e6^years overflow to ±Infinity,
+  // so npv is non-finite at the domain floor. `NaN > 0` is false, so without this
+  // guard the bracket check would pass and bisection would return a bogus ~hi (≈100
+  // = 10000%). Reject a non-finite (or non-bracketing) bracket → honest null.
+  if (!Number.isFinite(flo) || !Number.isFinite(fhi) || flo * fhi > 0) return null;
   for (let i = 0; i < 200; i++) {
     const mid = (lo + hi) / 2;
     const fmid = npv(flows, mid);
