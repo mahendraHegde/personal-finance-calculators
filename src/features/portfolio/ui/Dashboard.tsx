@@ -15,6 +15,7 @@ import type { PortfolioState } from "../state/store";
 import { usePortfolio } from "../state/context";
 import { Badge, BarTrend, Donut, EmptyState, RevealCard, Select, StatCard } from "./components";
 import {
+  accountLabelById,
   displayFx,
   eventsByHolding,
   makeFxAt,
@@ -95,8 +96,7 @@ function computeHeavy(state: PortfolioState) {
     const key = h.accountId && accIds.has(h.accountId) ? h.accountId : "__none";
     if (v !== null && Number.isFinite(v)) add(key, v);
   }
-  const accName = (id: string): string =>
-    id === "__none" ? "Unassigned" : (state.accounts.find((a) => a.id === id)?.name ?? "—");
+  const accName = (id: string): string => (id === "__none" ? "Unassigned" : accountLabelById(state, id));
   const exposureAssets = [...exposureMap.values()].reduce((s, v) => s + (v > 0 ? v : 0), 0);
   const exposure = [...exposureMap]
     .map(([id, value]) => ({ id, label: accName(id), value }))

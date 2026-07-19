@@ -30,6 +30,8 @@ import type {
 import { SHARED } from "../model/types";
 import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, StatCard, TextInput } from "./components";
 import {
+  accountLabel,
+  accountLabelById,
   holdingAccountOptions,
   CURRENCY_CHOICES,
   displayFx,
@@ -536,7 +538,7 @@ export function Investments() {
                           <div className="font-medium text-slate-800">{h.name}</div>
                           <div className="text-xs text-slate-400">
                             {ownerLabel(state, h.personId)} · <span className="capitalize">{h.assetClass}</span>
-                            {h.accountId && <> · {state.accounts.find((a) => a.id === h.accountId)?.name ?? "—"}</>}
+                            {h.accountId && <> · {accountLabelById(state, h.accountId, { vsOwner: h.personId })}</>}
                           </div>
                         </div>
                         <Badge tone={QUALITY_TONE[quality]}>{quality}</Badge>
@@ -680,7 +682,7 @@ function HoldingForm({
   const accountChoices = holdingAccountOptions(state);
   if (initial?.accountId && !accountChoices.some((o) => o.value === initial.accountId)) {
     const a = state.accounts.find((x) => x.id === initial.accountId);
-    if (a) accountChoices.push({ value: a.id, label: `${a.name} (${a.currency})` });
+    if (a) accountChoices.push({ value: a.id, label: accountLabel(state, a, { currency: true }) });
   }
   // Field visibility follows the asset class, so each kind of holding shows only
   // what applies to it:
@@ -1031,9 +1033,7 @@ function HoldingDetail({
             price source) are all edited in the prefilled form. */}
         <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500">
           <span className="capitalize text-slate-600">{holding.assetClass}</span>
-          {holding.accountId && (
-            <> · {state.accounts.find((a) => a.id === holding.accountId)?.name ?? "—"}</>
-          )}
+          {holding.accountId && <> · {accountLabelById(state, holding.accountId)}</>}
           {holding.ticker && <> · {holding.ticker}</>}
           <span className="ml-1">· {holding.currency}</span>
         </div>

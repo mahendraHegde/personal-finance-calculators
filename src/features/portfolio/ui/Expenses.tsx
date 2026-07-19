@@ -11,6 +11,8 @@ import type { Transaction, TxnType } from "../model/types";
 import { SHARED } from "../model/types";
 import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, TextInput } from "./components";
 import {
+  accountLabel,
+  accountLabelById,
   accountOptions,
   categoryOptions,
   categoryPath,
@@ -197,7 +199,7 @@ export function Expenses() {
                       </span>
                     </div>
                     <div className="mt-0.5 text-xs text-slate-400">
-                      {formatDate(t.date)} · {account?.name ?? "—"} · {ownerLabel(state, t.personId)}
+                      {formatDate(t.date)} · {accountLabelById(state, t.accountId, { vsOwner: t.personId })} · {ownerLabel(state, t.personId)}
                       {catPath && t.note ? ` · ${catPath}` : ""}
                     </div>
                   </div>
@@ -300,7 +302,7 @@ function TransactionForm({
   // amount to a different-currency account and corrupt balances).
   const transferTargets = state.accounts
     .filter((a) => a.id !== accountId && a.currency === currency)
-    .map((a) => ({ value: a.id, label: `${a.name} (${a.currency})` }));
+    .map((a) => ({ value: a.id, label: accountLabel(state, a, { currency: true }) }));
 
   const amountNum = Number(amount);
   const canSave =

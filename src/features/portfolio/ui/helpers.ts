@@ -150,6 +150,35 @@ export function ownerLabel(state: PortfolioState, owner: Owner): string {
   return state.people.find((p) => p.id === owner)?.name ?? "Unknown";
 }
 
+/** Display label for an account. ALWAYS appends the owner (e.g. "IBKR · Alice") so two
+ *  same-named accounts (each person's IBKR) are told apart EVERYWHERE they're shown —
+ *  dropdowns, filters, cards, ledgers, breakdowns. `currency: true` also appends the
+ *  currency, for dropdown option lists. */
+export function accountLabel(
+  state: PortfolioState,
+  account: Account,
+  // `vsOwner`: the owner already shown ALONGSIDE this label (e.g. a holding's or a
+  // transaction's owner). When given, the account-owner suffix is added only if the
+  // account's owner DIFFERS — so "Bob · IBKR" doesn't become "Bob · IBKR · Bob", but a
+  // shared holding in Bob's IBKR still reads "Shared · IBKR · Bob" (disambiguated).
+  opts?: { currency?: boolean; vsOwner?: Owner },
+): string {
+  const ccy = opts?.currency ? ` (${account.currency})` : "";
+  const showOwner = opts?.vsOwner === undefined || opts.vsOwner !== account.personId;
+  const owner = showOwner ? ` · ${ownerLabel(state, account.personId)}` : "";
+  return `${account.name}${ccy}${owner}`;
+}
+
+/** Look up an account by id and label it, or a fallback ("—") when missing. */
+export function accountLabelById(
+  state: PortfolioState,
+  id: string | undefined,
+  opts?: { currency?: boolean; vsOwner?: Owner },
+): string {
+  const account = id ? state.accounts.find((a) => a.id === id) : undefined;
+  return account ? accountLabel(state, account, opts) : "—";
+}
+
 // Archived entities are hidden from the Add/Edit pickers (declutter) but a
 // `keepId` is always kept visible so an edit form pointing at an archived entity
 // still shows its current selection instead of going blank.
@@ -177,7 +206,7 @@ export function accountOptions(
 ): Array<{ value: string; label: string }> {
   return state.accounts
     .filter((a) => live(a.archived, a.id, keepId))
-    .map((a) => ({ value: a.id, label: `${a.name} (${a.currency})` }));
+    .map((a) => ({ value: a.id, label: accountLabel(state, a, { currency: true }) }));
 }
 
 /** Accounts a holding can sit in — any ASSET account: brokerage, crypto, bank,
@@ -191,7 +220,7 @@ export function holdingAccountOptions(
 ): Array<{ value: string; label: string }> {
   return state.accounts
     .filter((a) => a.type !== "creditcard" && a.type !== "liability" && live(a.archived, a.id, keepId))
-    .map((a) => ({ value: a.id, label: `${a.name} (${a.currency})` }));
+    .map((a) => ({ value: a.id, label: accountLabel(state, a, { currency: true }) }));
 }
 
 /** Top-level categories of a kind (for the primary category dropdown). */
