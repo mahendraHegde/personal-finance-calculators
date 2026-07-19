@@ -412,6 +412,64 @@ export class PortfolioStore {
       };
     });
   }
+  /** Settle (close out) a fixed deposit in ONE atomic commit. Two modes:
+   *  - `withdraw`: record the matured/broken value as an income transaction on
+   *    `toAccountId`, flagged `excludeFromReports` (so it RAISES the account balance
+   *    — net worth is unchanged, the money merely moved from FD to bank — WITHOUT
+   *    showing up as earned income; the interest already lived inside the FD's
+   *    return), then archive the FD.
+   *  - `renew`: just archive the FD. Per the chosen model no lineage is tracked —
+   *    the user records the renewed deposit(s) as fresh holdings themselves (a broken
+   *    FD may become two, or two may combine into one).
+   *  Archiving is what removes the FD from net worth, portfolio value and the default
+   *  Active view. Guarded: throws if the holding is missing, isn't an FD, or is
+   *  already settled — and, for `withdraw`, if the account is missing or the amount
+   *  isn't a positive finite number (the UI pre-fills the accrued value; the whole
+   *  thing is one transaction, so a bad input aborts with no partial write). */
+  async settleFd(
+    holdingId: string,
+    opts:
+      | { mode: "withdraw"; toAccountId: string; amount: number; note?: string }
+      | { mode: "renew" },
+  ): Promise<void> {
+    await this.commit(() => {
+      const holding = this.state.holdings.find((h) => h.id === holdingId);
+      if (!holding) throw new Error("Holding not found");
+      if (!holding.fd) throw new Error("Only a fixed deposit can be settled");
+      if (holding.archived) throw new Error("This fixed deposit is already settled");
+
+      const archived: Holding = { ...holding, archived: true };
+      const ops: BatchOp[] = [{ collection: Collections.holdings, op: "put", value: archived }];
+      const patch: Partial<PortfolioState> = { holdings: this.replace(this.state.holdings, archived) };
+
+      if (opts.mode === "withdraw") {
+        const account = this.state.accounts.find((a) => a.id === opts.toAccountId);
+        if (!account) throw new Error("Deposit account not found");
+        if (!Number.isFinite(opts.amount) || opts.amount <= 0) {
+          throw new Error("Deposit amount must be a positive number");
+        }
+        const txn: Transaction = {
+          id: newId(),
+          date: todayIso(),
+          type: "income",
+          accountId: account.id,
+          personId: holding.personId, // the settled cash belongs to the FD's owner
+          amount: opts.amount,
+          // DERIVED from the account, never taken from the caller — a divergent currency
+          // would post `amount` raw into an account of another currency and corrupt its
+          // balance & net worth (the app's account-currency invariant).
+          currency: account.currency,
+          note: opts.note?.trim() || `FD settled: ${holding.name}`,
+          excludeFromReports: true,
+          updatedAt: new Date().toISOString(),
+          author: this.state.settings.author,
+        };
+        ops.push({ collection: Collections.transactions, op: "put", value: txn });
+        patch.transactions = this.replace(this.state.transactions, txn);
+      }
+      return { ops, patch };
+    });
+  }
   async saveHoldingEvent(e: HoldingEvent): Promise<void> {
     await this.commit(() => {
       // Stamp creation time (once) so same-date valuations have a tiebreak.

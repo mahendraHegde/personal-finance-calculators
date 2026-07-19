@@ -115,6 +115,13 @@ export interface Transaction {
    *  expenses that are already reflected in your current balance — recording them
    *  shouldn't double-deduct from net worth. */
   excludeFromBalance?: boolean;
+  /** The MIRROR of `excludeFromBalance`: when true this transaction DOES move the
+   *  account balance / net worth but is EXCLUDED from income & expense reports
+   *  (monthly trend, flow summary, category totals). For internal asset movements
+   *  that aren't real earnings/spending — e.g. an FD settled into a bank account:
+   *  the cash lands in the balance (net worth unchanged, it just moved) but must not
+   *  masquerade as income (the interest already accrued inside the FD's return). */
+  excludeFromReports?: boolean;
   /** ISO timestamp of last edit (for audit / future merge). */
   updatedAt: string;
   author?: string;

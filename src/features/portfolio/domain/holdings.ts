@@ -111,6 +111,45 @@ export function isClosed(events: HoldingEvent[]): boolean {
   return netUnits(events) === 0 && events.some((e) => e.type === "sell");
 }
 
+/** Days between two ISO (yyyy-mm-dd) dates as whole calendar days, timezone-independent
+ *  (both mapped to a UTC day number, so no DST/offset drift). */
+function isoDayNumber(iso: string): number {
+  const [y, m, d] = iso.split("-").map(Number);
+  return Math.floor(Date.UTC(y, (m ?? 1) - 1, d ?? 1) / 86_400_000);
+}
+
+/** A real calendar date in yyyy-mm-dd form: right shape AND survives a round-trip, so
+ *  out-of-range parts that Date.UTC would silently roll over ("2027-13-45" → 2028-02-14,
+ *  "2027-02-31" → Mar) are rejected rather than accepted as a different day. */
+function isValidIsoDate(iso: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return false;
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+export interface FdMaturity {
+  /** ISO maturity date. */
+  date: string;
+  /** Whole days from `asOf` to maturity (negative once past). */
+  daysUntil: number;
+  /** True once maturity has arrived/passed (value has frozen). */
+  matured: boolean;
+}
+
+/** Maturity info for a fixed-deposit holding, or null if it isn't an FD with a
+ *  maturity date. Pure + `asOf`-driven so it's testable and the card + the Dashboard
+ *  "maturing soon" banner share identical logic. */
+export function fdMaturityInfo(h: Holding, asOf: string): FdMaturity | null {
+  const date = h.fd?.maturityDate;
+  // Reject anything that isn't a real yyyy-mm-dd date — a malformed value (from a
+  // hand-edited/synced snapshot) would otherwise roll over via Date.UTC ("2027-13-45")
+  // or go NaN, quietly misleading the banner/card.
+  if (!date || !isValidIsoDate(date)) return null;
+  const daysUntil = isoDayNumber(date) - isoDayNumber(asOf);
+  return { date, daysUntil, matured: daysUntil <= 0 };
+}
+
 // --- Fixed-deposit auto-accrual -------------------------------------------
 // An FD's value is DETERMINISTIC (principal + rate + compounding + time), so
 // instead of manual valuations we compute it. Modelled as a synthetic `valuation`

@@ -31,4 +31,7 @@ export const UI = {
   /** Max rows rendered per section in the snapshot diff (keeps the DOM bounded
    *  on very large diffs; the rest show as "+N more"). */
   DIFF_ROW_CAP: 50,
+  /** A fixed deposit maturing within this many days is flagged "maturing soon"
+   *  (the "· in N days" note on its card + the Dashboard banner). */
+  FD_MATURITY_SOON_DAYS: 30,
 } as const;

@@ -5,6 +5,7 @@ import {
   currentHoldingValue,
   dataQuality,
   fdAccrualValuation,
+  fdMaturityInfo,
   fdValue,
   holdingPnl,
   holdingXirr,
@@ -13,6 +14,7 @@ import {
   withFdAccrual,
 } from "../src/features/portfolio/domain/holdings";
 import { accountBalances, accountBalancesByPerson, netWorth, totalReturn } from "../src/features/portfolio/domain/networth";
+import { categoryTotals, flowSummary, monthlyTotals } from "../src/features/portfolio/domain/transactions";
 import {
   autopayId,
   desiredAutopayTransfers,
@@ -1286,6 +1288,100 @@ section("[autopay] composeAccountExtras: parsing, drop-stray-date, since preserv
   );
   eq(composeAccountExtras({ ...apBase, statementDay: "10.7" }).autopay?.statementDay, 10, "day truncated to integer");
   eq(composeAccountExtras({ ...base, autopayEnabled: false }).autopay, undefined, "disabled → no autopay");
+}
+
+section("[fdMaturityInfo] maturity date, days-until, and matured state");
+{
+  const fd = (maturityDate?: string): Holding => ({
+    id: "F", name: "SBI FD", personId: "shared", assetClass: "debt", currency: "INR", incomeMode: "accumulating",
+    fd: { ratePct: 7, compounding: "quarterly", maturityDate },
+  });
+  eq(fdMaturityInfo(fd("2027-03-15"), "2027-02-19")?.daysUntil, 24, "24 days until maturity");
+  eq(fdMaturityInfo(fd("2027-03-15"), "2027-02-19")?.matured, false, "not matured yet");
+  eq(fdMaturityInfo(fd("2027-02-19"), "2027-02-19")?.matured, true, "maturity == today → matured");
+  eq(fdMaturityInfo(fd("2027-01-01"), "2027-02-19")?.matured, true, "past → matured");
+  eq(fdMaturityInfo(fd("2027-01-01"), "2027-02-19")?.daysUntil, -49, "negative days once past");
+  eq(fdMaturityInfo(fd(undefined), "2027-02-19"), null, "FD without a maturity date → null");
+  eq(fdMaturityInfo({ id: "S", name: "AAPL", personId: "shared", assetClass: "equity", currency: "USD", incomeMode: "accumulating" }, "2027-02-19"), null, "non-FD holding → null");
+  // Timezone-independent day math (UTC day-number diff, no DST drift).
+  eq(fdMaturityInfo(fd("2027-03-01"), "2027-02-28")?.daysUntil, 1, "Feb→Mar boundary is exactly 1 day");
+  // Malformed maturity dates (only reachable via a hand-edited/synced snapshot) are
+  // rejected rather than rolled over by Date.UTC or turned into NaN — otherwise a
+  // bogus value could silently fire the banner or show garbage.
+  eq(fdMaturityInfo(fd("garbage"), "2027-02-19"), null, "non-date string → null");
+  eq(fdMaturityInfo(fd("2027-13-45"), "2027-02-19"), null, "out-of-range parts → null (no rollover)");
+  eq(fdMaturityInfo(fd("2027"), "2027-02-19"), null, "year-only → null");
+  eq(fdMaturityInfo(fd("2027-3-1"), "2027-02-19"), null, "unpadded parts → null");
+}
+
+section("[networth] archived (settled) holdings are excluded from net worth");
+{
+  const usd: FxTable = { base: "USD", rates: { USD: 1 } };
+  const holdings: Holding[] = [
+    { id: "A", name: "Active", personId: "p1", assetClass: "equity", currency: "USD", incomeMode: "accumulating" },
+    { id: "S", name: "Settled FD", personId: "p1", assetClass: "debt", currency: "USD", incomeMode: "accumulating", fd: { ratePct: 7, compounding: "quarterly" }, archived: true },
+  ];
+  const holdingValues = new Map<string, number | null>([
+    ["A", 1000],
+    ["S", 5000],
+  ]);
+  const nw = netWorth({ accounts: [], balances: new Map(), holdings, holdingValues, fx: usd });
+  eq(nw.total, 1000, "only the active holding counts (settled FD excluded even though it has a value)");
+  eq(nw.byAssetClass.debt ?? 0, 0, "settled FD adds nothing to the debt slice");
+  eq(nw.byPerson["p1"] ?? 0, 1000, "per-person total excludes the settled FD");
+}
+
+section("[networth] settling an FD preserves net worth (value moves FD → account)");
+{
+  const usd: FxTable = { base: "USD", rates: { USD: 1 } };
+  const fd: Holding = { id: "FD", name: "FD", personId: "p1", assetClass: "debt", currency: "USD", incomeMode: "accumulating", fd: { ratePct: 7, compounding: "quarterly" } };
+  const before = netWorth({ accounts: [], balances: new Map(), holdings: [fd], holdingValues: new Map([["FD", 5000]]), fx: usd });
+  eq(before.total, 5000, "before: the FD's 5000 is the whole net worth");
+  // After settlement: the FD is archived and a bank account now holds the 5000 (the deposit).
+  const bank: Account = { id: "BANK", name: "Bank", type: "bank", currency: "USD", personId: "p1" };
+  const after = netWorth({
+    accounts: [bank],
+    balances: new Map([["BANK", 5000]]),
+    holdings: [{ ...fd, archived: true }],
+    holdingValues: new Map([["FD", 5000]]),
+    fx: usd,
+  });
+  eq(after.total, 5000, "after: same net worth — money moved FD → bank, neither lost nor doubled");
+}
+
+section("[transactions] excludeFromReports keeps a transaction out of income/expense reports");
+{
+  const usd: FxTable = { base: "USD", rates: { USD: 1 } };
+  const fxAt = (): FxTable => usd;
+  const txn = (over: Partial<Transaction>): Transaction => ({
+    id: Math.random().toString(36).slice(2),
+    date: "2026-03-10",
+    type: "income",
+    accountId: "A",
+    personId: "p1",
+    amount: 100,
+    currency: "USD",
+    updatedAt: "",
+    ...over,
+  });
+  const txns: Transaction[] = [
+    txn({ type: "income", amount: 200 }), // real income
+    txn({ type: "expense", amount: 50 }), // real expense
+    txn({ type: "income", amount: 5000, excludeFromReports: true }), // FD settlement deposit
+  ];
+  const flow = flowSummary(txns, "USD", usd);
+  eq(flow.income, 200, "flowSummary income excludes the settlement deposit");
+  eq(flow.expense, 50, "flowSummary expense unaffected");
+  eq(flow.net, 150, "flowSummary net unaffected by the settlement deposit");
+  const months = monthlyTotals(txns, "USD", fxAt);
+  eq(months.length, 1, "one month present");
+  eq(months[0]!.income, 200, "monthlyTotals income excludes the settlement deposit");
+  const cats = categoryTotals(txns, [], "income", "USD", usd);
+  eq(
+    cats.reduce((s, c) => s + c.total, 0),
+    200,
+    "categoryTotals income excludes the settlement deposit",
+  );
 }
 
 done();

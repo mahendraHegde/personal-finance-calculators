@@ -69,8 +69,10 @@ export function Expenses() {
   const visible = rows.slice(0, limit);
 
   // Income/expense totals for the current view (year + any other filters), in the
-  // display currency. Counts ALL matching transactions incl. reporting-only ones
-  // (they're real spending/income for analysis even if excluded from balances).
+  // display currency. Counts `excludeFromBalance` transactions (reporting-only — real
+  // spending/income for analysis even if they don't move a balance) but NOT
+  // `excludeFromReports` ones (internal asset moves like an FD settlement: a real
+  // balance change that isn't earnings/spending). flowSummary enforces the latter.
   const totals = useMemo(() => {
     const { fx, base } = displayFx(state);
     // Currencies in the filtered rows with NO rate to the display base silently
@@ -194,6 +196,7 @@ export function Expenses() {
                     <div className="flex items-center gap-2">
                       <Badge tone={TYPE_TONE[t.type]}>{t.type}</Badge>
                       {managed && <Badge>auto-pay</Badge>}
+                      {t.excludeFromReports && <Badge>not in reports</Badge>}
                       <span className="truncate text-sm font-medium text-slate-700">
                         {t.note || catPath || account?.name || "—"}
                       </span>
@@ -330,6 +333,11 @@ function TransactionForm({
       // Reporting-only (historical) transactions don't move account balances.
       // Not applicable to transfers.
       excludeFromBalance: type !== "transfer" && excludeFromBalance ? true : undefined,
+      // The MIRROR flag (in balance, out of income/expense reports) is set
+      // programmatically by FD settlement and has NO form field — preserve it on
+      // edit so a plain re-save can't silently drop it and turn the settled corpus
+      // back into "income" (which there's then no UI path to undo).
+      excludeFromReports: initial?.excludeFromReports || undefined,
       updatedAt: new Date().toISOString(),
     });
   };

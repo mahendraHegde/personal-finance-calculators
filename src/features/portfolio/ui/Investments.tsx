@@ -7,12 +7,15 @@ import { newId } from "../../../lib/util/id";
 import {
   currentHoldingValue,
   dataQuality,
+  fdMaturityInfo,
   holdingPnl,
   holdingXirr,
   isClosed,
   portfolioReturn,
   withFdAccrual,
+  type FdMaturity,
 } from "../domain/holdings";
+import { UI } from "../../../config";
 import { tryConvert } from "../../../lib/money/currency";
 import { usePortfolio, useSyncStatus } from "../state/context";
 import { useNavigate } from "./navigation";
@@ -43,6 +46,21 @@ import {
   QUALITY_TONE,
 } from "./helpers";
 import { ImportHoldings } from "./ImportHoldings";
+
+/** Human maturity text for an FD (dates via the app's locale `formatDate`):
+ *  "Matures today (…)" on the day, "Matures … · in N days" when near,
+ *  "Matures …" when far off, or "Matured …" once past. */
+function fdMaturityText(m: FdMaturity): string {
+  const d = formatDate(m.date);
+  if (m.daysUntil < 0) return `Matured ${d}`;
+  if (m.daysUntil === 0) return `Matures today (${d})`;
+  if (m.daysUntil <= UI.FD_MATURITY_SOON_DAYS) return `Matures ${d} · in ${m.daysUntil} day${m.daysUntil === 1 ? "" : "s"}`;
+  return `Matures ${d}`;
+}
+/** Amber styling once an FD is matured or maturing within the "soon" window. */
+function fdMaturityTone(m: FdMaturity): string {
+  return m.matured || m.daysUntil <= UI.FD_MATURITY_SOON_DAYS ? "text-amber-700" : "text-slate-400";
+}
 
 const ASSET_CLASSES: AssetClass[] = ["equity", "debt", "cash", "crypto", "gold", "realestate", "other"];
 const ASSET_CLASS_LABELS: Record<AssetClass, string> = {
@@ -166,23 +184,34 @@ export function Investments() {
     const nowFx = fxCtx.fxAt(today);
     return new Map(
       state.holdings.map((h) => {
+        const archived = !!h.archived;
         const events = withFdAccrual(h, byHolding.get(h.id) ?? [], today);
-        const value = currentHoldingValue(events);
+        // A settled (archived) holding has NO ongoing value — its worth was realized at
+        // settlement and now lives in the deposit txn / account balance. Presenting its
+        // FD accrual would keep "growing" after settlement and double-count against the
+        // bank deposit (and give a phantom XIRR), so show it like a sold-out position:
+        // value + XIRR "—". Genuinely closed (sold-out) positions already value to null.
+        const value = archived ? null : currentHoldingValue(events);
         const baseValue = value === null ? null : tryConvert({ amount: value, currency: h.currency }, fxCtx.base, nowFx);
-        // "Closed" = a fully-exited position: units tracked, netted to zero, AND a sell on
-        // record (a sold-out stock or matured T-bill). Reuses the domain's `isClosed` so the
-        // two definitions can't drift; value-only and still-held holdings stay "active".
-        const closed = isClosed(events);
-        return [h.id, { value, baseValue, xirr: holdingXirr(events), quality: dataQuality(events), closed }] as const;
+        // A holding is "inactive" (out of the Active view) when it's a fully-exited
+        // position OR has been settled/archived:
+        //  - closed: units tracked, netted to zero, AND a sell on record (a sold-out
+        //    stock or matured T-bill). Reuses the domain's `isClosed` so the definitions
+        //    can't drift; value-only and still-held holdings stay active.
+        //  - archived: an FD that was withdrawn/renewed (its cash moved to an account).
+        const inactive = isClosed(events) || archived;
+        return [h.id, { value, baseValue, xirr: archived ? null : holdingXirr(events), quality: dataQuality(events), inactive, archived }] as const;
       }),
     );
   }, [state.holdings, byHolding, fxCtx, today]);
 
   // Whole-portfolio value (display currency) — the denominator for each card's
   // "% of total" weight, so allocation stays a stable property regardless of the filter.
+  // Archived (settled) holdings are excluded: their cash has moved to an account, so
+  // they're no longer part of the portfolio the percentages describe.
   const portfolioTotal = useMemo(() => {
     let t = 0;
-    for (const r of rows.values()) t += r.baseValue ?? 0;
+    for (const r of rows.values()) if (!r.archived) t += r.baseValue ?? 0;
     return t;
   }, [rows]);
 
@@ -222,7 +251,7 @@ export function Investments() {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return state.holdings.filter((h) => {
-      if (statusFilter !== "all" && (rows.get(h.id)?.closed ?? false) !== (statusFilter === "closed")) return false;
+      if (statusFilter !== "all" && (rows.get(h.id)?.inactive ?? false) !== (statusFilter === "closed")) return false;
       if (fClass !== "all" && h.assetClass !== fClass) return false;
       if (acc !== "all" && (acc === "none" ? !!h.accountId : h.accountId !== acc)) return false;
       if (own !== "all" && h.personId !== own) return false;
@@ -237,7 +266,10 @@ export function Investments() {
   // only when the matching SET changes — sorting doesn't recompute it. Per-holding XIRRs
   // stay in `rows` (never recomputed on filter).
   const summary = useMemo(() => {
-    const agg = portfolioReturn(filtered, byHolding, fxCtx.base, fxCtx.fxAt, today);
+    // Archived (settled) holdings have no realized-exit event (no lineage tracked), so
+    // portfolioReturn would fold in their phantom ongoing accrual as a final inflow and
+    // overstate the blend. Exclude them — their money already left the portfolio.
+    const agg = portfolioReturn(filtered.filter((h) => !h.archived), byHolding, fxCtx.base, fxCtx.fxAt, today);
     let totalValue = 0;
     let missingFx = 0; // filtered holdings with a value we couldn't convert to base (no FX rate)
     for (const h of filtered) {
@@ -447,7 +479,7 @@ export function Investments() {
                 onChange={(v) => setStatusFilter(v as "active" | "closed" | "all")}
                 options={[
                   { value: "active", label: "Active (held)" },
-                  { value: "closed", label: "Closed (sold/matured)" },
+                  { value: "closed", label: "Closed (sold/matured/settled)" },
                   { value: "all", label: "All (incl. closed)" },
                 ]}
               />
@@ -516,7 +548,7 @@ export function Investments() {
               // Not filtered, yet nothing shows → every holding is closed (hidden by the
               // default Active view). Offer the way out rather than blaming filters.
               <EmptyState>
-                All {state.holdings.length} holding{state.holdings.length === 1 ? " is" : "s are"} closed (sold or matured).{" "}
+                All {state.holdings.length} holding{state.holdings.length === 1 ? " is" : "s are"} closed (sold, matured or settled).{" "}
                 <button className="font-medium text-blue-600 hover:underline" onClick={() => setStatusFilter("all")}>
                   Show all
                 </button>
@@ -529,7 +561,11 @@ export function Investments() {
                 const value = m?.value ?? null;
                 const xirr = m?.xirr ?? null;
                 const quality = m?.quality ?? "value-only";
-                const alloc = portfolioTotal > 0 && m?.baseValue != null ? m.baseValue / portfolioTotal : null;
+                // A settled (archived) holding isn't part of the live portfolio, so a
+                // "% of total" against the active denominator would be misleading — omit it.
+                const alloc = !m?.archived && portfolioTotal > 0 && m?.baseValue != null ? m.baseValue / portfolioTotal : null;
+                // A settled FD has no future maturity to advertise (F5).
+                const maturity = m?.archived ? null : fdMaturityInfo(h, today);
                 return (
                   <Card key={h.id} className="hover:border-blue-300">
                     <div className="cursor-pointer" onClick={() => setDetailId(h.id)}>
@@ -540,8 +576,9 @@ export function Investments() {
                             {ownerLabel(state, h.personId)} · <span className="capitalize">{h.assetClass}</span>
                             {h.accountId && <> · {accountLabelById(state, h.accountId, { vsOwner: h.personId })}</>}
                           </div>
+                          {maturity && <div className={`mt-0.5 text-xs ${fdMaturityTone(maturity)}`}>{fdMaturityText(maturity)}</div>}
                         </div>
-                        <Badge tone={QUALITY_TONE[quality]}>{quality}</Badge>
+                        {m?.archived ? <Badge tone="slate">settled</Badge> : <Badge tone={QUALITY_TONE[quality]}>{quality}</Badge>}
                       </div>
                       <div className="mt-3 flex items-end justify-between">
                         <div className="text-lg font-semibold text-slate-800">
@@ -956,11 +993,17 @@ function HoldingDetail({
   const [editEvent, setEditEvent] = useState<HoldingEvent | null>(null);
   const [showQuantity, setShowQuantity] = useState(false);
   const [editing, setEditing] = useState(false); // edit holding PROPERTIES via the form
+  const [settling, setSettling] = useState(false); // FD settle/redeem flow
   // Accrue an FD to today for value/return; the event LIST still shows raw events
   // (the synthetic FD valuation is a read-time estimate, not a real ledger entry).
   const accrued = withFdAccrual(holding, events, todayIso());
   const pnl = holdingPnl(accrued);
   const xirr = holdingXirr(accrued);
+  // A settled (archived) holding has no ONGOING value/return — its worth was realized
+  // and now lives in an account. Show "—" here (like a sold-out position) rather than a
+  // still-accruing FD estimate. `pnl.value` stays intact for the Settle modal, which
+  // only opens while the FD is still active.
+  const settled = !!holding.archived;
   const sorted = [...events].sort((a, b) => (a.date < b.date ? 1 : -1));
   const existingOpening = events.find((e) => e.type === "opening");
 
@@ -969,9 +1012,9 @@ function HoldingDetail({
       <div className="space-y-4">
         <div className="grid grid-cols-3 gap-2 text-center">
           <div className="rounded-lg bg-slate-50 p-2">
-            <div className="text-xs text-slate-400">Value</div>
+            <div className="text-xs text-slate-400">{settled ? "Value (settled)" : "Value"}</div>
             <div className="font-semibold text-slate-800">
-              {pnl.value === null ? "—" : formatMoney(pnl.value, holding.currency)}
+              {settled || pnl.value === null ? "—" : formatMoney(pnl.value, holding.currency)}
             </div>
           </div>
           <div className="rounded-lg bg-slate-50 p-2">
@@ -980,7 +1023,7 @@ function HoldingDetail({
           </div>
           <div className="rounded-lg bg-slate-50 p-2">
             <div className="text-xs text-slate-400">XIRR</div>
-            <div className="font-semibold text-slate-800">{formatPercent(xirr)}</div>
+            <div className="font-semibold text-slate-800">{settled ? "—" : formatPercent(xirr)}</div>
           </div>
         </div>
 
@@ -1036,13 +1079,26 @@ function HoldingDetail({
           {holding.accountId && <> · {accountLabelById(state, holding.accountId)}</>}
           {holding.ticker && <> · {holding.ticker}</>}
           <span className="ml-1">· {holding.currency}</span>
+          {(() => {
+            if (settled) return null; // a settled FD has no future maturity to advertise
+            const m = fdMaturityInfo(holding, todayIso());
+            return m ? <span className={`ml-1 ${fdMaturityTone(m)}`}>· {fdMaturityText(m)}</span> : null;
+          })()}
         </div>
 
         <div className="flex justify-between pt-2">
           <Button variant="danger" onClick={onDelete}>
             Delete holding
           </Button>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
+            {holding.fd &&
+              (holding.archived ? (
+                <span className="text-xs text-slate-400">Settled</span>
+              ) : (
+                <Button variant="ghost" onClick={() => setSettling(true)}>
+                  Settle FD
+                </Button>
+              ))}
             <Button variant="ghost" onClick={() => setEditing(true)}>
               Edit details
             </Button>
@@ -1052,6 +1108,19 @@ function HoldingDetail({
           </div>
         </div>
       </div>
+
+      {settling && (
+        <SettleFdModal
+          holding={holding}
+          nativeValue={pnl.value}
+          onClose={() => setSettling(false)}
+          onSettled={() => {
+            setSettling(false);
+            onLivePriceSaved(); // refresh derived views
+            onClose(); // the FD leaves the Active list — close the (now-settled) detail
+          }}
+        />
+      )}
 
       {editing && (
         <HoldingForm
@@ -1104,6 +1173,168 @@ function HoldingDetail({
           }}
         />
       )}
+    </Modal>
+  );
+}
+
+/** Settle a matured (or early-broken) fixed deposit. Two paths:
+ *  - Withdraw: auto-deposit the FD's current value into a chosen account (amount
+ *    pre-filled + editable, converted to that account's currency). Net worth is
+ *    unchanged — the cash just moves from FD to bank — and the deposit is flagged so
+ *    it doesn't count as income.
+ *  - Renew: just close this FD. No lineage is tracked, so the user re-adds the renewed
+ *    deposit(s) as fresh holdings (a broken FD may split into two, or several combine).
+ *  Either way the FD is archived → it leaves the Active view and net worth as a holding. */
+function SettleFdModal({
+  holding,
+  nativeValue,
+  onClose,
+  onSettled,
+}: {
+  holding: Holding;
+  /** The FD's current value in its OWN currency (from holdingPnl), or null if not computable. */
+  nativeValue: number | null;
+  onClose: () => void;
+  onSettled: () => void;
+}) {
+  const { state, store } = usePortfolio();
+  const [mode, setMode] = useState<"withdraw" | "renew">("withdraw");
+  // Cash destinations for the withdrawn money — exclude credit-card / liability
+  // accounts (you can't deposit a matured FD into a card). Keep the FD's own account
+  // visible even if archived, so the default selection always resolves.
+  const accounts = state.accounts
+    .filter(
+      (a) => a.type !== "creditcard" && a.type !== "liability" && (!a.archived || a.id === holding.accountId),
+    )
+    .map((a) => ({ value: a.id, label: accountLabel(state, a, { currency: true }) }));
+  const [toAccountId, setToAccountId] = useState<string>(() => {
+    const preferred = holding.accountId && accounts.some((o) => o.value === holding.accountId) ? holding.accountId : "";
+    return preferred || accounts[0]?.value || "";
+  });
+  const [amountStr, setAmountStr] = useState<string | null>(null); // null = follow the suggestion
+  const [note, setNote] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const account = state.accounts.find((a) => a.id === toAccountId);
+  // Suggested deposit = the FD's current value, in the target account's currency at
+  // today's rate. Same currency → no conversion; no rate → no suggestion (type it in).
+  const suggested: number | null = (() => {
+    if (nativeValue === null || !account) return null;
+    if (account.currency === holding.currency) return nativeValue;
+    const { fx, base } = displayFx(state);
+    const fxNow = makeFxAt(state.fxRates, base, fx)(todayIso());
+    return tryConvert({ amount: nativeValue, currency: holding.currency }, account.currency, fxNow);
+  })();
+  const suggestedStr = suggested === null ? "" : String(Math.round(suggested * 100) / 100);
+  const shownAmount = amountStr ?? suggestedStr;
+  const parse = (s: string): number | null => {
+    const n = Number(s);
+    return s.trim() !== "" && Number.isFinite(n) ? n : null;
+  };
+
+  const noAccounts = accounts.length === 0;
+
+  const confirm = async (): Promise<void> => {
+    setError(null);
+    try {
+      if (mode === "renew") {
+        setBusy(true);
+        await store.settleFd(holding.id, { mode: "renew" });
+      } else {
+        if (!account) {
+          setError("Choose an account to deposit into.");
+          return;
+        }
+        const amount = parse(shownAmount);
+        if (amount === null || amount <= 0) {
+          setError("Enter a positive deposit amount.");
+          return;
+        }
+        setBusy(true);
+        await store.settleFd(holding.id, {
+          mode: "withdraw",
+          toAccountId: account.id,
+          amount,
+          note: note.trim() || undefined,
+        });
+      }
+      onSettled();
+    } catch (e) {
+      setBusy(false);
+      setError(e instanceof Error ? e.message : "Could not settle this deposit.");
+    }
+  };
+
+  return (
+    <Modal title={`Settle ${holding.name}`} onClose={onClose}>
+      <div className="space-y-4">
+        <p className="text-sm text-slate-500">
+          Closing this fixed deposit removes it from your active investments. Its value stays in your net
+          worth — either moved into an account (withdraw) or re-added by you as new deposit(s) (renew).
+        </p>
+
+        <Field label="What happened?">
+          <Select
+            value={mode}
+            onChange={(v) => setMode(v as "withdraw" | "renew")}
+            options={[
+              { value: "withdraw", label: "Withdrew — deposit the money into an account" },
+              { value: "renew", label: "Renewed — I'll add the new deposit(s) myself" },
+            ]}
+          />
+        </Field>
+
+        {mode === "withdraw" ? (
+          noAccounts ? (
+            <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
+              You have no accounts to deposit into. Add one under Accounts first, or choose “Renewed”.
+            </p>
+          ) : (
+            <>
+              <Field label="Deposit into">
+                <Select
+                  value={toAccountId}
+                  onChange={(v) => {
+                    setToAccountId(v);
+                    setAmountStr(null); // re-suggest in the new account's currency
+                  }}
+                  options={accounts}
+                />
+              </Field>
+              <Field
+                label={`Amount${account ? ` (${account.currency})` : ""}`}
+                hint={
+                  suggested !== null
+                    ? "Pre-filled with the current value — adjust for the exact amount credited (TDS, rounding)."
+                    : "No exchange rate to this account's currency — enter the amount credited."
+                }
+              >
+                <NumberInput value={shownAmount} onChange={setAmountStr} placeholder="amount credited" />
+              </Field>
+              <Field label="Note (optional)">
+                <TextInput value={note} onChange={setNote} placeholder={`FD settled: ${holding.name}`} />
+              </Field>
+            </>
+          )
+        ) : (
+          <p className="rounded-lg bg-slate-50 p-3 text-sm text-slate-500">
+            This closes the FD only. Add the renewed deposit(s) as new holdings — a broken FD may become
+            two, or several may combine into one — since no link is kept between the old and new deposits.
+          </p>
+        )}
+
+        {error && <p className="text-sm text-red-600">{error}</p>}
+
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={() => void confirm()} disabled={busy || (mode === "withdraw" && noAccounts)}>
+            {mode === "withdraw" ? "Withdraw & settle" : "Settle (renew)"}
+          </Button>
+        </div>
+      </div>
     </Modal>
   );
 }

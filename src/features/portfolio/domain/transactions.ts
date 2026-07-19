@@ -65,6 +65,7 @@ export function monthlyTotals(
   const map = new Map<string, MonthlyPoint>();
   for (const t of txns) {
     if (t.type === "transfer") continue;
+    if (t.excludeFromReports) continue; // internal asset move (e.g. FD settlement) — not earnings/spend
     const fx = fxAt(t.date);
     const m = monthKey(t.date);
     const point = map.get(m) ?? { month: m, income: 0, expense: 0 };
@@ -93,6 +94,7 @@ export function categoryTotals(
   const map = new Map<string, number>();
   for (const t of txns) {
     if (t.type !== type) continue;
+    if (t.excludeFromReports) continue; // internal asset move (e.g. FD settlement) — not earnings/spend
     const key = t.categoryId ?? "uncategorized";
     map.set(key, (map.get(key) ?? 0) + inBase(t, base, fx));
   }
@@ -115,6 +117,7 @@ export function flowSummary(txns: Transaction[], base: CurrencyCode, fx: FxTable
   let income = 0;
   let expense = 0;
   for (const t of txns) {
+    if (t.excludeFromReports) continue; // internal asset move (e.g. FD settlement) — not earnings/spend
     if (t.type === "income") income += inBase(t, base, fx);
     else if (t.type === "expense") expense += inBase(t, base, fx);
   }

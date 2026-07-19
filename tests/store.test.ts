@@ -462,4 +462,120 @@ section("[store] deleting a payer cascade-removes managed auto-pay transfers + c
   eq(store.getState().accounts.find((a) => a.id === "CC")?.autopay, undefined, "CC's dangling auto-pay config cleared");
 }
 
+const rejects = async (fn: () => Promise<unknown>, msg: string): Promise<void> => {
+  let threw = false;
+  try {
+    await fn();
+  } catch {
+    threw = true;
+  }
+  ok(threw, msg);
+};
+
+section("[store] settleFd withdraw: deposits (excludeFromReports) + archives the FD");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveAccount({ id: "BANK", name: "SBI", type: "bank", currency: "INR", personId: "p1" });
+  await store.saveHolding({
+    id: "FD1",
+    name: "SBI FD",
+    personId: "p1",
+    accountId: "BANK",
+    assetClass: "debt",
+    currency: "INR",
+    incomeMode: "accumulating",
+    fd: { ratePct: 7, compounding: "quarterly", maturityDate: "2026-01-01" },
+  });
+  await store.settleFd("FD1", { mode: "withdraw", toAccountId: "BANK", amount: 108000 });
+  ok(store.getState().holdings.find((x) => x.id === "FD1")?.archived === true, "FD archived after withdraw");
+  const txns = store.getState().transactions;
+  eq(txns.length, 1, "one deposit transaction created");
+  const t = txns[0]!;
+  eq(t.type, "income", "deposit is an income transaction");
+  eq(t.accountId, "BANK", "deposited into the chosen account");
+  eq(t.amount, 108000, "amount is the settled value");
+  eq(t.currency, "INR", "currency DERIVED from the account (not the caller)");
+  eq(t.personId, "p1", "attributed to the FD owner");
+  ok(t.excludeFromReports === true, "flagged out of income/expense reports");
+  ok((t.note ?? "").includes("SBI FD"), "note references the FD");
+  // Persisted, not just in memory.
+  const exported = (await store.exportDocument()).data;
+  ok((exported.holdings ?? []).find((h) => h.id === "FD1")?.archived === true, "archive persisted");
+  eq((exported.transactions ?? []).length, 1, "deposit persisted");
+}
+
+section("[store] settleFd withdraw: deposit currency is the ACCOUNT's, not the FD's");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveAccount({ id: "USDACC", name: "Schwab", type: "brokerage", currency: "USD", personId: "p1" });
+  await store.saveHolding({
+    id: "FD1",
+    name: "INR FD",
+    personId: "p1",
+    assetClass: "debt",
+    currency: "INR",
+    incomeMode: "accumulating",
+    fd: { ratePct: 7, compounding: "quarterly" },
+  });
+  // The UI converts the amount; the store records it verbatim but must stamp the
+  // ACCOUNT's currency (a divergent currency would corrupt the account balance).
+  await store.settleFd("FD1", { mode: "withdraw", toAccountId: "USDACC", amount: 1300 });
+  const t = store.getState().transactions[0]!;
+  eq(t.currency, "USD", "deposit currency = the target account's (USD), not the FD's (INR)");
+  eq(t.accountId, "USDACC", "deposited into the USD account");
+}
+
+section("[store] settleFd renew: archives with NO transaction");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveHolding({
+    id: "FD1",
+    name: "HDFC FD",
+    personId: "p1",
+    assetClass: "debt",
+    currency: "INR",
+    incomeMode: "accumulating",
+    fd: { ratePct: 6, compounding: "quarterly" },
+  });
+  await store.settleFd("FD1", { mode: "renew" });
+  ok(store.getState().holdings.find((x) => x.id === "FD1")?.archived === true, "FD archived on renew");
+  eq(store.getState().transactions.length, 0, "renew creates no transaction");
+}
+
+section("[store] settleFd guards are atomic (non-FD, missing account, bad amount, double-settle)");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveAccount({ id: "BANK", name: "Bank", type: "bank", currency: "USD", personId: "p1" });
+  await store.saveHolding({ id: "EQ", name: "AAPL", personId: "p1", assetClass: "equity", currency: "USD", incomeMode: "accumulating" });
+  await rejects(() => store.settleFd("EQ", { mode: "renew" }), "settling a non-FD throws");
+  ok(store.getState().holdings.find((x) => x.id === "EQ")?.archived !== true, "non-FD left unarchived");
+
+  await rejects(() => store.settleFd("MISSING", { mode: "renew" }), "settling a missing holding throws");
+
+  await store.saveHolding({ id: "FD", name: "FD", personId: "p1", assetClass: "debt", currency: "USD", incomeMode: "accumulating", fd: { ratePct: 5, compounding: "annually" } });
+  await rejects(
+    () => store.settleFd("FD", { mode: "withdraw", toAccountId: "NOPE", amount: 100 }),
+    "withdraw to a missing account throws",
+  );
+  ok(store.getState().holdings.find((x) => x.id === "FD")?.archived !== true, "FD NOT archived after failed withdraw (atomic — no partial write)");
+  eq(store.getState().transactions.length, 0, "no deposit written on failure");
+
+  await rejects(
+    () => store.settleFd("FD", { mode: "withdraw", toAccountId: "BANK", amount: 0 }),
+    "non-positive amount throws",
+  );
+  await rejects(
+    () => store.settleFd("FD", { mode: "withdraw", toAccountId: "BANK", amount: Number.NaN }),
+    "NaN amount throws",
+  );
+  await rejects(
+    () => store.settleFd("FD", { mode: "withdraw", toAccountId: "BANK", amount: Number.POSITIVE_INFINITY }),
+    "infinite amount throws",
+  );
+  ok(store.getState().holdings.find((x) => x.id === "FD")?.archived !== true, "FD NOT archived after a bad amount");
+
+  await store.settleFd("FD", { mode: "renew" });
+  await rejects(() => store.settleFd("FD", { mode: "renew" }), "settling an already-settled FD throws");
+}
+
 done();

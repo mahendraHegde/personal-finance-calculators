@@ -9,7 +9,8 @@ import { useMemo, useState } from "react";
 import { formatCompactMoney, formatMoney, formatPercent, monthKey, todayIso } from "../../../lib/util/format";
 import { tryConvert } from "../../../lib/money/currency";
 import { accountBalancesByPerson, netWorth, sumAccountBalances, totalReturn } from "../domain/networth";
-import { currentHoldingValue, dataQuality, holdingXirr, portfolioReturn, withFdAccrual } from "../domain/holdings";
+import { currentHoldingValue, dataQuality, fdMaturityInfo, holdingXirr, isClosed, portfolioReturn, withFdAccrual } from "../domain/holdings";
+import { UI } from "../../../config";
 import { categoryTotals, flowSummary, monthlyTotals, type CategoryTotal } from "../domain/transactions";
 import type { PortfolioState } from "../state/store";
 import { usePortfolio } from "../state/context";
@@ -32,6 +33,11 @@ function computeHeavy(state: PortfolioState) {
   const { fx, base } = displayFx(state);
   const today = todayIso(); // FDs + savings interest accrue their value up to today
   const fxAt = makeFxAt(state.fxRates, base, fx);
+  // Settled/redeemed holdings (archived) are out of the live picture entirely — their
+  // value has already moved into an account (net worth is preserved by that deposit).
+  // netWorth also drops them defensively, but excluding here keeps the exposure /
+  // holdings-list / return scans consistent with it in one place.
+  const activeHoldings = state.holdings.filter((h) => !h.archived);
   // One transaction scan (+ interest pass): derive the totals by summing the
   // per-person breakdown rather than scanning twice. Pass the per-date FX resolver
   // so a cross-currency transfer is credited at its own date's rate (fixed) instead
@@ -40,13 +46,13 @@ function computeHeavy(state: PortfolioState) {
   const balances = sumAccountBalances(balancesByPerson);
   const byHolding = eventsByHolding(state);
   const holdingValues = new Map(
-    state.holdings.map((h) => [h.id, currentHoldingValue(withFdAccrual(h, byHolding.get(h.id) ?? [], today))]),
+    activeHoldings.map((h) => [h.id, currentHoldingValue(withFdAccrual(h, byHolding.get(h.id) ?? [], today))]),
   );
   const nw = netWorth({
     accounts: state.accounts,
     balances,
     balancesByPerson,
-    holdings: state.holdings,
+    holdings: activeHoldings,
     holdingValues,
     fx,
   });
@@ -55,7 +61,7 @@ function computeHeavy(state: PortfolioState) {
   const monthTxns = state.transactions.filter((t) => monthKey(t.date) === thisMonth);
   const flow = flowSummary(monthTxns, base, fx);
 
-  const holdings = state.holdings
+  const holdings = activeHoldings
     .map((h) => {
       const events = withFdAccrual(h, byHolding.get(h.id) ?? [], today);
       const native = currentHoldingValue(events);
@@ -89,7 +95,7 @@ function computeHeavy(state: PortfolioState) {
     const v = tryConvert({ amount: balances.get(a.id) ?? 0, currency: a.currency }, base, fx);
     if (v !== null && Number.isFinite(v)) add(a.id, Math.max(0, v));
   }
-  for (const h of state.holdings) {
+  for (const h of activeHoldings) {
     const native = holdingValues.get(h.id);
     if (native == null || !Number.isFinite(native)) continue;
     const v = tryConvert({ amount: native, currency: h.currency }, base, fx);
@@ -108,12 +114,12 @@ function computeHeavy(state: PortfolioState) {
       pct: exposureAssets > 0 ? (e.value / exposureAssets) * 100 : 0,
     }));
 
-  const ret = portfolioReturn(state.holdings, byHolding, base, fxAt, today);
+  const ret = portfolioReturn(activeHoldings, byHolding, base, fxAt, today);
   // Personal rate of return on ALL assets ex-liabilities (holdings + accounts,
   // incl. cash & savings interest) — the blended figure, idle cash counts as drag.
   // Reuse the `balances` already scanned above (same fxAt + today) so totalReturn
   // doesn't repeat the full transaction scan + interest pass.
-  const totalRet = totalReturn(state.holdings, byHolding, state.accounts, state.transactions, base, fxAt, today, balances);
+  const totalRet = totalReturn(activeHoldings, byHolding, state.accounts, state.transactions, base, fxAt, today, balances);
 
   return { base, nw, flow, holdings, allocation, people, exposure, ret, totalRet };
 }
@@ -121,6 +127,20 @@ function computeHeavy(state: PortfolioState) {
 export function Dashboard() {
   const { state } = usePortfolio();
   const { base } = displayFx(state); // cheap (no scan): just the latest rates + display ccy
+
+  // Fixed deposits maturing within the "soon" window or already matured — a nudge to
+  // reinvest/withdraw (cheap: no full scan). INACTIVE FDs are excluded — the same
+  // invariant as the Investments "Closed" view: settled (archived) OR fully-exited
+  // (isClosed via a unit sell). isClosed needs the holding's events, so it's evaluated
+  // only for the handful that clear the maturity gate. Ordered by urgency (most overdue
+  // first) so the named few in the banner are the ones that matter most.
+  const today = todayIso();
+  const maturingFds = state.holdings
+    .map((h) => ({ h, info: fdMaturityInfo(h, today) }))
+    .filter((x) => !x.h.archived && x.info !== null && x.info.daysUntil <= UI.FD_MATURITY_SOON_DAYS)
+    .filter((x) => !isClosed(state.holdingEvents.filter((e) => e.holdingId === x.h.id)))
+    .sort((a, b) => a.info!.daysUntil - b.info!.daysUntil)
+    .map((x) => x.h);
 
   const [open, setOpen] = useState<Set<string>>(() => new Set());
   const isOpen = (k: string): boolean => open.has(k);
@@ -182,6 +202,15 @@ export function Dashboard() {
         <div className="rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
           No exchange rate for {unconvertible.join(", ")} — amounts in{" "}
           {unconvertible.length === 1 ? "it" : "them"} are counted as 0. Refresh rates in Settings.
+        </div>
+      )}
+
+      {maturingFds.length > 0 && (
+        <div className="rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
+          ⚡ {maturingFds.length} fixed deposit{maturingFds.length === 1 ? "" : "s"}{" "}
+          {maturingFds.length === 1 ? "is" : "are"} maturing within {UI.FD_MATURITY_SOON_DAYS} days or already matured:{" "}
+          {maturingFds.slice(0, 4).map((h) => h.name).join(", ")}
+          {maturingFds.length > 4 ? `, +${maturingFds.length - 4} more` : ""}. Review them under Investments.
         </div>
       )}
 

@@ -268,6 +268,7 @@ export function netWorth(input: NetWorthInput): NetWorthResult {
   }
 
   for (const h of input.holdings) {
+    if (h.archived) continue; // settled/redeemed — no longer an asset (its cash moved to an account)
     const native = input.holdingValues.get(h.id);
     if (native === null || native === undefined || !Number.isFinite(native)) continue;
     const v = tryConvert({ amount: native, currency: h.currency }, fx.base, fx);
