@@ -189,21 +189,30 @@ export function Investments() {
   const [fClass, setFClass] = useState("all");
   const [fAccount, setFAccount] = useState("all");
   const [fOwner, setFOwner] = useState("all");
+  const [fCurrency, setFCurrency] = useState("all");
   const [statusFilter, setStatusFilter] = useState<"active" | "closed" | "all">("active"); // default: hide fully-exited positions
   const [sortBy, setSortBy] = useState<"value" | "xirr" | "name" | "type">("value");
 
-  // Normalize once: a filter whose account/owner no longer exists (e.g. deleted via sync)
-  // collapses to "all". Both `filtered` AND `filtersActive` derive from these, so a stale
-  // hidden id can neither blank the list nor leave a phantom "filtered" badge with no way
-  // to clear it. `status: "active"` is the DEFAULT view, so it doesn't count as filtering.
+  // Distinct currencies across holdings — drives the currency filter (only shown when
+  // there's more than one, like the account/owner filters).
+  const currencies = useMemo(() => [...new Set(state.holdings.map((h) => h.currency))].sort(), [state.holdings]);
+
+  // Normalize once: a filter whose account/owner/currency no longer exists (e.g. deleted
+  // or its last holding removed) collapses to "all". Both `filtered` AND `filtersActive`
+  // derive from these, so a stale value can neither blank the list nor leave a phantom
+  // "filtered" badge with no way to clear it. `status: "active"` is the DEFAULT view, so
+  // it doesn't count as filtering.
   const acc = fAccount === "all" || fAccount === "none" || state.accounts.some((a) => a.id === fAccount) ? fAccount : "all";
   const own = fOwner === "all" || fOwner === SHARED || state.people.some((p) => p.id === fOwner) ? fOwner : "all";
-  const filtersActive = search.trim() !== "" || fClass !== "all" || acc !== "all" || own !== "all" || statusFilter !== "active";
+  const cur = fCurrency === "all" || currencies.includes(fCurrency) ? fCurrency : "all";
+  const filtersActive =
+    search.trim() !== "" || fClass !== "all" || acc !== "all" || own !== "all" || cur !== "all" || statusFilter !== "active";
   const clearFilters = (): void => {
     setSearch("");
     setFClass("all");
     setFAccount("all");
     setFOwner("all");
+    setFCurrency("all");
     setStatusFilter("active");
   };
 
@@ -215,10 +224,11 @@ export function Investments() {
       if (fClass !== "all" && h.assetClass !== fClass) return false;
       if (acc !== "all" && (acc === "none" ? !!h.accountId : h.accountId !== acc)) return false;
       if (own !== "all" && h.personId !== own) return false;
+      if (cur !== "all" && h.currency !== cur) return false;
       if (q && !`${h.name} ${h.ticker ?? ""}`.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [state.holdings, rows, statusFilter, acc, own, search, fClass]);
+  }, [state.holdings, rows, statusFilter, acc, own, cur, search, fClass]);
 
   // Summary reflects the FILTERED set, so filtering to (say) equity / one account shows
   // that subset's value, cost and return. Only ONE blended XIRR root-find runs here, and
@@ -443,7 +453,7 @@ export function Investments() {
             {state.accounts.length > 0 && (
               <div className="sm:w-44">
                 <Select
-                  value={fAccount}
+                  value={acc}
                   onChange={setFAccount}
                   options={[
                     { value: "all", label: "All accounts" },
@@ -456,13 +466,22 @@ export function Investments() {
             {state.people.length > 1 && (
               <div className="sm:w-44">
                 <Select
-                  value={fOwner}
+                  value={own}
                   onChange={setFOwner}
                   options={[
                     { value: "all", label: "All owners" },
                     { value: SHARED, label: "Shared" },
                     ...state.people.map((p) => ({ value: p.id, label: p.name })),
                   ]}
+                />
+              </div>
+            )}
+            {currencies.length > 1 && (
+              <div className="sm:w-40">
+                <Select
+                  value={cur}
+                  onChange={setFCurrency}
+                  options={[{ value: "all", label: "All currencies" }, ...currencies.map((c) => ({ value: c, label: c }))]}
                 />
               </div>
             )}
