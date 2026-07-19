@@ -49,6 +49,41 @@ export function Card({ children, className = "" }: { children: ReactNode; classN
   );
 }
 
+/** A horizontal step indicator for multi-step flows (e.g. the CSV importer).
+ *  Highlights the current step, marks completed ones, and stays readable on a phone
+ *  (the connector lines collapse, labels stay). Purely presentational. */
+export function Stepper({ steps, current }: { steps: string[]; current: number }) {
+  return (
+    <ol className="flex items-center gap-1 text-xs sm:gap-2" aria-label="Progress">
+      {steps.map((label, i) => {
+        const state = i < current ? "done" : i === current ? "active" : "todo";
+        return (
+          <li key={i} className="flex min-w-0 flex-1 items-center gap-1 sm:gap-2" aria-current={state === "active" ? "step" : undefined}>
+            <span
+              aria-hidden="true"
+              className={
+                "flex h-6 w-6 flex-none items-center justify-center rounded-full text-[11px] font-semibold " +
+                (state === "active"
+                  ? "bg-blue-600 text-white"
+                  : state === "done"
+                    ? "bg-blue-100 text-blue-700"
+                    : "bg-slate-100 text-slate-400")
+              }
+            >
+              {state === "done" ? "✓" : i + 1}
+            </span>
+            <span className={`truncate ${state === "todo" ? "text-slate-400" : "font-medium text-slate-600"}`}>
+              {state === "done" && <span className="sr-only">Completed: </span>}
+              {label}
+            </span>
+            {i < steps.length - 1 && <span className="mx-0.5 hidden h-px flex-1 bg-slate-200 sm:block" />}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 /** A card whose body is hidden until the user reveals it. The body is rendered
  *  only when `open`, so callers can gate expensive computation behind it (nothing
  *  runs until you open the section). `variant="eye"` reads as privacy/disclose
@@ -106,11 +141,12 @@ export function Badge({ children, tone = "slate" }: { children: ReactNode; tone?
   );
 }
 
-export function Field({ label, children }: { label: string; children: ReactNode }) {
+export function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) {
   return (
     <label className="block">
       <span className="mb-1 block text-xs font-medium text-slate-500">{label}</span>
       {children}
+      {hint ? <span className="mt-1 block text-xs font-normal text-slate-400">{hint}</span> : null}
     </label>
   );
 }
@@ -330,11 +366,27 @@ export function Modal({
   );
 }
 
-export function StatCard({ label, value, sub }: { label: string; value: string; sub?: ReactNode }) {
+export function StatCard({
+  label,
+  value,
+  sub,
+  valueClass = "text-slate-800",
+  title,
+}: {
+  label: string;
+  value: string;
+  sub?: ReactNode;
+  /** Override the value colour (e.g. green/red for a gain). */
+  valueClass?: string;
+  /** Full-precision figure shown on hover when `value` is abbreviated. */
+  title?: string;
+}) {
   return (
     <Card>
       <div className="text-xs font-medium uppercase tracking-wide text-slate-400">{label}</div>
-      <div className="mt-1 text-2xl font-semibold text-slate-800">{value}</div>
+      <div className={`mt-1 truncate text-2xl font-semibold ${valueClass}`} title={title}>
+        {value}
+      </div>
       {sub && <div className="mt-1 text-sm text-slate-500">{sub}</div>}
     </Card>
   );

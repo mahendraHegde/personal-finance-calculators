@@ -14,6 +14,9 @@ export const Collections = {
   holdingEvents: "holdingEvents",
   fxRates: "fxRates",
   settings: "settings",
+  // Device-local only: a short log of CSV imports so each can be undone. Stripped from
+  // backups AND Drive sync (see store.stripLocal) — ephemeral, no long-term value.
+  importBatches: "importBatches",
 } as const;
 
 // NO secondary indexes: the store loads each collection fully into memory on
@@ -26,7 +29,7 @@ export const Collections = {
 // DESTINATIONS, which the old account_date index missed). The adapter's generic
 // index/pagination machinery stays — it's exercised by lib.test's own schema.
 export const SCHEMA: StorageSchema = {
-  version: 2,
+  version: 3,
   collections: [
     { name: Collections.people },
     { name: Collections.accounts },
@@ -36,5 +39,6 @@ export const SCHEMA: StorageSchema = {
     { name: Collections.holdingEvents },
     { name: Collections.fxRates },
     { name: Collections.settings },
+    { name: Collections.importBatches },
   ],
 };

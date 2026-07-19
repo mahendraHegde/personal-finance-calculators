@@ -197,6 +197,24 @@ export interface HoldingEvent {
   createdAt?: string;
 }
 
+/** A record of one CSV import, kept DEVICE-LOCAL (never backed up or synced) so the
+ *  import can be undone. Undo = delete `addedEventIds`, delete the `createdHoldingIds`
+ *  that have no other events left, and re-insert `replacedOpenings`. */
+export interface ImportBatch {
+  id: ID;
+  createdAt: string; // ISO
+  /** Human label for the history list, e.g. "schwab-trans.csv". */
+  label: string;
+  /** Holdings the import CREATED (not merge targets). */
+  createdHoldingIds: ID[];
+  /** Event ids the import INSERTED. */
+  addedEventIds: ID[];
+  /** Full opening-estimate events the import DELETED (estimate-replace), to restore on undo. */
+  replacedOpenings: HoldingEvent[];
+  /** For the history UI. */
+  counts: { holdings: number; events: number };
+}
+
 export interface FxRateSnapshot {
   id: ID;
   /** ISO date this rate set applies to. */

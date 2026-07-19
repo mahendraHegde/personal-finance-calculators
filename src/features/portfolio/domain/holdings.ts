@@ -107,7 +107,7 @@ export function netUnits(events: HoldingEvent[]): number | null {
 
 /** A position is "closed" (fully realized) when units net to zero after a sell —
  *  its return is knowable from realized cashflows without a current value. */
-function isClosed(events: HoldingEvent[]): boolean {
+export function isClosed(events: HoldingEvent[]): boolean {
   return netUnits(events) === 0 && events.some((e) => e.type === "sell");
 }
 

@@ -246,7 +246,19 @@ export function openIndexedDB(dbName: string, schema: StorageSchema): Promise<St
         }
       }
     };
-    req.onsuccess = () => resolve(new IdbStorage(req.result, schema));
+    req.onsuccess = () => {
+      const db = req.result;
+      // If ANOTHER tab later opens a higher schema version, release our connection so
+      // its upgrade isn't blocked forever (the classic multi-tab IndexedDB deadlock).
+      // New builds carry this, so future version bumps won't block; existing older-build
+      // tabs that predate it are handled by `onblocked` below.
+      db.onversionchange = () => db.close();
+      resolve(new IdbStorage(db, schema));
+    };
+    // A version bump is blocked because another tab holds an older-version connection.
+    // Fail loudly with an actionable message instead of hanging on "Loading…" forever.
+    req.onblocked = () =>
+      reject(new Error("This app is open in another tab on an older version. Close the other tabs and reload."));
     req.onerror = () => reject(req.error);
   });
 }

@@ -1,14 +1,14 @@
 // Settings: display currency, FX refresh + overrides, vault passphrase, local
 // encrypted backup/restore, and Google Drive shared-folder sync.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { fetchUsdRates } from "../../../lib/fx/fx-service";
 import { diffDatasets, type DatasetDiff } from "../../../lib/sync/diff";
 import { isEncryptedFile } from "../../../lib/crypto/codec";
 import { formatDate, todayIso } from "../../../lib/util/format";
 import { usePortfolio, useSyncStatus } from "../state/context";
 import type { SyncPhase } from "../state/sync-controller";
-import type { SnapshotDoc } from "../model/types";
+import type { ImportBatch, SnapshotDoc } from "../model/types";
 import { Badge, Button, Card, Field, Modal, NumberInput, Select, SectionTitle, TextInput } from "./components";
 import { CURRENCY_CHOICES } from "./helpers";
 import { DiffModal } from "./DiffModal";
@@ -155,6 +155,8 @@ export function Settings() {
           <RestoreButton onPicked={onPickedBackup} />
         </div>
       </Card>
+
+      <ImportHistoryCard />
 
       <Card>
         <SectionTitle>Google Drive sync</SectionTitle>
@@ -650,4 +652,72 @@ function downloadBytes(bytes: Uint8Array, filename: string): void {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+/** Recent CSV imports, each undoable. The list is device-local (never synced/backed up)
+ *  and read on demand — it isn't part of the reactive portfolio state. */
+function ImportHistoryCard() {
+  const { store } = usePortfolio();
+  const [batches, setBatches] = useState<ImportBatch[] | null>(null); // null = loading
+  const [busy, setBusy] = useState<string | null>(null); // id being undone
+  const [err, setErr] = useState<string | null>(null);
+
+  const reload = (): void => {
+    void store.listImportBatches().then(setBatches);
+  };
+  useEffect(() => {
+    void store.listImportBatches().then(setBatches);
+  }, [store]);
+
+  const undo = (b: ImportBatch): void => {
+    if (!window.confirm(`Undo this import? It removes the ${b.counts.events} transaction(s) it added and any holdings it created.`)) return;
+    setBusy(b.id);
+    setErr(null);
+    void store
+      .undoImportBatch(b.id)
+      .then(reload)
+      .catch(() => setErr("Couldn't undo that import — please try again."))
+      .finally(() => setBusy(null));
+  };
+
+  if (batches !== null && batches.length === 0) return null; // nothing imported yet → hide the section
+
+  // The undo log stamps a full ISO timestamp; show the LOCAL calendar day (not UTC).
+  const localDay = (iso: string): string => {
+    const d = new Date(iso);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+
+  return (
+    <Card>
+      <SectionTitle>Import history</SectionTitle>
+      <p className="mb-3 text-sm text-slate-500">
+        Recent CSV imports (this device only). Undo removes exactly what an import added and restores anything it replaced —
+        your other holdings and manually-added transactions are left alone.
+      </p>
+      {err && <p className="mb-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{err}</p>}
+      {batches === null ? (
+        <p className="text-sm text-slate-400">Loading…</p>
+      ) : (
+        <ul className="divide-y divide-slate-100">
+          {batches.map((b) => (
+            <li key={b.id} className="flex items-center justify-between gap-3 py-2">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium text-slate-700" title={b.label}>
+                  {b.label}
+                </div>
+                <div className="text-xs text-slate-400">
+                  {formatDate(localDay(b.createdAt))} · {b.counts.events} transaction{b.counts.events === 1 ? "" : "s"}
+                  {b.counts.holdings > 0 ? ` · ${b.counts.holdings} new holding${b.counts.holdings === 1 ? "" : "s"}` : ""}
+                </div>
+              </div>
+              <Button variant="ghost" disabled={busy !== null} onClick={() => undo(b)}>
+                {busy === b.id ? "Undoing…" : "Undo"}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
 }

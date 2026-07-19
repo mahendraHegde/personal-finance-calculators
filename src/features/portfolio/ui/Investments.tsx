@@ -2,15 +2,18 @@
 // valuation), and per-holding event management.
 
 import { useMemo, useState } from "react";
-import { formatDate, formatMoney, formatPercent, todayIso } from "../../../lib/util/format";
+import { formatCompactMoney, formatDate, formatMoney, formatPercent, todayIso } from "../../../lib/util/format";
 import { newId } from "../../../lib/util/id";
 import {
   currentHoldingValue,
   dataQuality,
   holdingPnl,
   holdingXirr,
+  isClosed,
+  portfolioReturn,
   withFdAccrual,
 } from "../domain/holdings";
+import { tryConvert } from "../../../lib/money/currency";
 import { usePortfolio, useSyncStatus } from "../state/context";
 import { useNavigate } from "./navigation";
 import { createPriceProviders, fetchPrices } from "../services/price-service";
@@ -25,16 +28,19 @@ import type {
   PriceSource,
 } from "../model/types";
 import { SHARED } from "../model/types";
-import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, TextInput } from "./components";
+import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, StatCard, TextInput } from "./components";
 import {
   holdingAccountOptions,
   CURRENCY_CHOICES,
+  displayFx,
   eventsByHolding,
   INTEREST_FREQUENCY_OPTIONS,
+  makeFxAt,
   ownerLabel,
   personOptions,
   QUALITY_TONE,
 } from "./helpers";
+import { ImportHoldings } from "./ImportHoldings";
 
 const ASSET_CLASSES: AssetClass[] = ["equity", "debt", "cash", "crypto", "gold", "realestate", "other"];
 const ASSET_CLASS_LABELS: Record<AssetClass, string> = {
@@ -134,28 +140,119 @@ const EVENT_TYPE_LABELS: Record<HoldingEventType, string> = {
 export function Investments() {
   const { state, store, sync } = usePortfolio();
   const [showHoldingForm, setShowHoldingForm] = useState(false);
+  const [showImport, setShowImport] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [addFor, setAddFor] = useState<string | null>(null); // quick "add transaction" target
 
   const byHolding = useMemo(() => eventsByHolding(state), [state]);
-  // Precompute value/XIRR/quality once per state change (XIRR is iterative) so
-  // the card grid doesn't recompute it for every holding on every render —
-  // matching the Dashboard's memoized approach.
-  const metrics = useMemo(
+  const today = todayIso(); // stable per calendar day → doesn't churn the memos below
+  // Display currency + a per-date FX resolver, rebuilt only when rates/settings change.
+  const fxCtx = useMemo(
     () => {
-      const today = todayIso(); // FDs accrue their computed value up to today
-      return new Map(
-        state.holdings.map((h) => {
-          const events = withFdAccrual(h, byHolding.get(h.id) ?? [], today);
-          return [
-            h.id,
-            { value: currentHoldingValue(events), xirr: holdingXirr(events), quality: dataQuality(events) },
-          ] as const;
-        }),
-      );
+      const { fx, base } = displayFx(state);
+      return { base, fxAt: makeFxAt(state.fxRates, base, fx) };
     },
-    [state.holdings, byHolding],
+    // displayFx reads only fxRates + settings (display currency + overrides).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [state.fxRates, state.settings],
   );
+
+  // Per-holding value / display-currency value / XIRR / quality — computed ONCE per data
+  // change. This is the only place the iterative per-holding XIRR runs; sort/search/filter
+  // never recompute it (they read this map), so typing never re-runs a per-holding root-find.
+  const rows = useMemo(() => {
+    const nowFx = fxCtx.fxAt(today);
+    return new Map(
+      state.holdings.map((h) => {
+        const events = withFdAccrual(h, byHolding.get(h.id) ?? [], today);
+        const value = currentHoldingValue(events);
+        const baseValue = value === null ? null : tryConvert({ amount: value, currency: h.currency }, fxCtx.base, nowFx);
+        // "Closed" = a fully-exited position: units tracked, netted to zero, AND a sell on
+        // record (a sold-out stock or matured T-bill). Reuses the domain's `isClosed` so the
+        // two definitions can't drift; value-only and still-held holdings stay "active".
+        const closed = isClosed(events);
+        return [h.id, { value, baseValue, xirr: holdingXirr(events), quality: dataQuality(events), closed }] as const;
+      }),
+    );
+  }, [state.holdings, byHolding, fxCtx, today]);
+
+  // Whole-portfolio value (display currency) — the denominator for each card's
+  // "% of total" weight, so allocation stays a stable property regardless of the filter.
+  const portfolioTotal = useMemo(() => {
+    let t = 0;
+    for (const r of rows.values()) t += r.baseValue ?? 0;
+    return t;
+  }, [rows]);
+
+  // --- sort / filter / search ---
+  const [search, setSearch] = useState("");
+  const [fClass, setFClass] = useState("all");
+  const [fAccount, setFAccount] = useState("all");
+  const [fOwner, setFOwner] = useState("all");
+  const [statusFilter, setStatusFilter] = useState<"active" | "closed" | "all">("active"); // default: hide fully-exited positions
+  const [sortBy, setSortBy] = useState<"value" | "xirr" | "name" | "type">("value");
+
+  // Normalize once: a filter whose account/owner no longer exists (e.g. deleted via sync)
+  // collapses to "all". Both `filtered` AND `filtersActive` derive from these, so a stale
+  // hidden id can neither blank the list nor leave a phantom "filtered" badge with no way
+  // to clear it. `status: "active"` is the DEFAULT view, so it doesn't count as filtering.
+  const acc = fAccount === "all" || fAccount === "none" || state.accounts.some((a) => a.id === fAccount) ? fAccount : "all";
+  const own = fOwner === "all" || fOwner === SHARED || state.people.some((p) => p.id === fOwner) ? fOwner : "all";
+  const filtersActive = search.trim() !== "" || fClass !== "all" || acc !== "all" || own !== "all" || statusFilter !== "active";
+  const clearFilters = (): void => {
+    setSearch("");
+    setFClass("all");
+    setFAccount("all");
+    setFOwner("all");
+    setStatusFilter("active");
+  };
+
+  // The matching set (pre-sort), recomputed on a filter/search change — cheap array work.
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return state.holdings.filter((h) => {
+      if (statusFilter !== "all" && (rows.get(h.id)?.closed ?? false) !== (statusFilter === "closed")) return false;
+      if (fClass !== "all" && h.assetClass !== fClass) return false;
+      if (acc !== "all" && (acc === "none" ? !!h.accountId : h.accountId !== acc)) return false;
+      if (own !== "all" && h.personId !== own) return false;
+      if (q && !`${h.name} ${h.ticker ?? ""}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [state.holdings, rows, statusFilter, acc, own, search, fClass]);
+
+  // Summary reflects the FILTERED set, so filtering to (say) equity / one account shows
+  // that subset's value, cost and return. Only ONE blended XIRR root-find runs here, and
+  // only when the matching SET changes — sorting doesn't recompute it. Per-holding XIRRs
+  // stay in `rows` (never recomputed on filter).
+  const summary = useMemo(() => {
+    const agg = portfolioReturn(filtered, byHolding, fxCtx.base, fxCtx.fxAt, today);
+    let totalValue = 0;
+    let missingFx = 0; // filtered holdings with a value we couldn't convert to base (no FX rate)
+    for (const h of filtered) {
+      const r = rows.get(h.id);
+      if (!r) continue;
+      totalValue += r.baseValue ?? 0;
+      if (r.value !== null && r.baseValue === null) missingFx++;
+    }
+    return { agg, totalValue, missingFx, base: fxCtx.base };
+  }, [filtered, byHolding, fxCtx, today, rows]);
+
+  const visible = useMemo(() => {
+    const bv = (h: Holding): number => rows.get(h.id)?.baseValue ?? -Infinity;
+    const xr = (h: Holding): number => rows.get(h.id)?.xirr ?? -Infinity;
+    return [...filtered].sort((a, b) => {
+      switch (sortBy) {
+        case "name":
+          return a.name.localeCompare(b.name);
+        case "xirr":
+          return xr(b) - xr(a);
+        case "type":
+          return a.assetClass.localeCompare(b.assetClass) || a.name.localeCompare(b.name);
+        default:
+          return bv(b) - bv(a); // value (display currency), high → low
+      }
+    });
+  }, [filtered, rows, sortBy]);
   const detail = state.holdings.find((h) => h.id === detailId) ?? null;
   const addForHolding = state.holdings.find((h) => h.id === addFor) ?? null;
 
@@ -219,12 +316,13 @@ export function Investments() {
 
   return (
     <div className="space-y-4">
-      <div className="flex justify-end gap-2">
+      <div className="flex flex-wrap justify-end gap-2">
         {hasLivePriced && (
           <Button variant="ghost" onClick={() => void refreshPrices()} disabled={refreshing}>
             {refreshing ? "Refreshing…" : "↻ Refresh prices"}
           </Button>
         )}
+        <Button variant="ghost" onClick={() => setShowImport(true)}>Import CSV</Button>
         <Button onClick={() => setShowHoldingForm(true)}>+ Add holding</Button>
       </div>
 
@@ -260,54 +358,197 @@ export function Investments() {
       {state.holdings.length === 0 ? (
         <EmptyState>No holdings yet. Add your existing investments with their cost basis.</EmptyState>
       ) : (
-        <div className="grid gap-3 sm:grid-cols-2">
-          {state.holdings.map((h) => {
-            const m = metrics.get(h.id);
-            const value = m?.value ?? null;
-            const xirr = m?.xirr ?? null;
-            const quality = m?.quality ?? "value-only";
-            return (
-              <Card key={h.id} className="hover:border-blue-300">
-                <div className="cursor-pointer" onClick={() => setDetailId(h.id)}>
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <div className="font-medium text-slate-800">{h.name}</div>
-                      <div className="text-xs text-slate-400">
-                        {ownerLabel(state, h.personId)} · <span className="capitalize">{h.assetClass}</span>
-                        {h.accountId && (
-                          <> · {state.accounts.find((a) => a.id === h.accountId)?.name ?? "—"}</>
-                        )}
+        <>
+          {/* Portfolio summary — money-weighted (XIRR) blend, in your display currency. Reflects
+              the ACTIVE filter/search (all holdings when nothing is filtered). */}
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <StatCard
+              label={filtersActive ? "Value (filtered)" : "Total value"}
+              value={formatCompactMoney(summary.totalValue, summary.base)}
+              title={formatMoney(summary.totalValue, summary.base)}
+              sub={`${filtered.length} holding${filtered.length === 1 ? "" : "s"}${filtersActive ? ` of ${state.holdings.length}` : ""}`}
+            />
+            <StatCard
+              label="Invested"
+              value={formatCompactMoney(summary.agg.invested, summary.base)}
+              title={formatMoney(summary.agg.invested, summary.base)}
+              sub="cost basis"
+            />
+            <StatCard
+              label="Total gain"
+              value={
+                summary.agg.absoluteGain === null
+                  ? "—"
+                  : `${summary.agg.absoluteGain > 0 ? "+" : ""}${formatCompactMoney(summary.agg.absoluteGain, summary.base)}`
+              }
+              title={summary.agg.absoluteGain === null ? undefined : formatMoney(summary.agg.absoluteGain, summary.base)}
+              valueClass={
+                summary.agg.absoluteGain === null || summary.agg.absoluteGain === 0
+                  ? "text-slate-800"
+                  : summary.agg.absoluteGain > 0
+                    ? "text-emerald-600"
+                    : "text-red-600"
+              }
+              sub={summary.agg.absoluteGain !== null && summary.agg.invested > 0 ? formatPercent(summary.agg.absoluteGain / summary.agg.invested) : undefined}
+            />
+            <StatCard
+              label="Blended XIRR"
+              value={formatPercent(summary.agg.xirr)}
+              valueClass={
+                summary.agg.xirr === null || summary.agg.xirr === 0 ? "text-slate-800" : summary.agg.xirr > 0 ? "text-emerald-600" : "text-red-600"
+              }
+              sub={`${summary.agg.included} of ${summary.agg.total} holdings`}
+            />
+          </div>
+
+          {/* Honest scoping: return metrics can only cover holdings with a cost basis + a
+              price; value-only / unpriced holdings count toward Total value but not returns. */}
+          {summary.agg.included < summary.agg.total && (
+            <p className="-mt-1 text-xs text-slate-400">
+              Invested, gain &amp; XIRR cover the {summary.agg.included} of {summary.agg.total} holdings with a recorded cost basis, a
+              current price and a usable exchange rate. Value-only or unpriced holdings count toward{" "}
+              {filtersActive ? "Value" : "Total value"} only{summary.missingFx > 0 ? "; those with no exchange rate are excluded (see below)" : ""}.
+            </p>
+          )}
+          {summary.missingFx > 0 && (
+            <p className="-mt-1 text-xs text-amber-700">
+              {summary.missingFx} holding{summary.missingFx === 1 ? "" : "s"} excluded from totals — no exchange rate for their currency.
+              Add one under Settings to include them.
+            </p>
+          )}
+
+          {/* Search / filter / sort — pure UI over the memoized figures (no recompute). */}
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+            <div className="sm:w-52">
+              <TextInput value={search} onChange={setSearch} placeholder="Search name or ticker…" />
+            </div>
+            <div className="sm:w-44">
+              <Select
+                value={fClass}
+                onChange={setFClass}
+                options={[{ value: "all", label: "All types" }, ...ASSET_CLASSES.map((c) => ({ value: c, label: ASSET_CLASS_LABELS[c] }))]}
+              />
+            </div>
+            <div className="sm:w-44">
+              <Select
+                value={statusFilter}
+                onChange={(v) => setStatusFilter(v as "active" | "closed" | "all")}
+                options={[
+                  { value: "active", label: "Active (held)" },
+                  { value: "closed", label: "Closed (sold/matured)" },
+                  { value: "all", label: "All (incl. closed)" },
+                ]}
+              />
+            </div>
+            {state.accounts.length > 0 && (
+              <div className="sm:w-44">
+                <Select
+                  value={fAccount}
+                  onChange={setFAccount}
+                  options={[
+                    { value: "all", label: "All accounts" },
+                    { value: "none", label: "No account" },
+                    ...holdingAccountOptions(state, fAccount),
+                  ]}
+                />
+              </div>
+            )}
+            {state.people.length > 1 && (
+              <div className="sm:w-44">
+                <Select
+                  value={fOwner}
+                  onChange={setFOwner}
+                  options={[
+                    { value: "all", label: "All owners" },
+                    { value: SHARED, label: "Shared" },
+                    ...state.people.map((p) => ({ value: p.id, label: p.name })),
+                  ]}
+                />
+              </div>
+            )}
+            <div className="sm:w-40">
+              <Select
+                value={sortBy}
+                onChange={(v) => setSortBy(v as "value" | "xirr" | "name" | "type")}
+                options={[
+                  { value: "value", label: "Sort: Value" },
+                  { value: "xirr", label: "Sort: Return" },
+                  { value: "name", label: "Sort: Name" },
+                  { value: "type", label: "Sort: Type" },
+                ]}
+              />
+            </div>
+            <span className="text-xs text-slate-400 sm:ml-auto">
+              {visible.length} of {state.holdings.length}
+            </span>
+          </div>
+
+          {visible.length === 0 ? (
+            filtersActive ? (
+              <EmptyState>
+                No holdings match your filters.{" "}
+                <button className="font-medium text-blue-600 hover:underline" onClick={clearFilters}>
+                  Clear filters
+                </button>
+              </EmptyState>
+            ) : (
+              // Not filtered, yet nothing shows → every holding is closed (hidden by the
+              // default Active view). Offer the way out rather than blaming filters.
+              <EmptyState>
+                All {state.holdings.length} holding{state.holdings.length === 1 ? " is" : "s are"} closed (sold or matured).{" "}
+                <button className="font-medium text-blue-600 hover:underline" onClick={() => setStatusFilter("all")}>
+                  Show all
+                </button>
+              </EmptyState>
+            )
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-2">
+              {visible.map((h) => {
+                const m = rows.get(h.id);
+                const value = m?.value ?? null;
+                const xirr = m?.xirr ?? null;
+                const quality = m?.quality ?? "value-only";
+                const alloc = portfolioTotal > 0 && m?.baseValue != null ? m.baseValue / portfolioTotal : null;
+                return (
+                  <Card key={h.id} className="hover:border-blue-300">
+                    <div className="cursor-pointer" onClick={() => setDetailId(h.id)}>
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <div className="font-medium text-slate-800">{h.name}</div>
+                          <div className="text-xs text-slate-400">
+                            {ownerLabel(state, h.personId)} · <span className="capitalize">{h.assetClass}</span>
+                            {h.accountId && <> · {state.accounts.find((a) => a.id === h.accountId)?.name ?? "—"}</>}
+                          </div>
+                        </div>
+                        <Badge tone={QUALITY_TONE[quality]}>{quality}</Badge>
+                      </div>
+                      <div className="mt-3 flex items-end justify-between">
+                        <div className="text-lg font-semibold text-slate-800">
+                          {value === null ? "—" : formatMoney(value, h.currency)}
+                          {alloc !== null && (
+                            <span className="ml-2 text-xs font-normal text-slate-400">{(alloc * 100).toFixed(1)}% of total</span>
+                          )}
+                        </div>
+                        <div className="text-sm text-slate-500">XIRR {formatPercent(xirr)}</div>
                       </div>
                     </div>
-                    <Badge tone={QUALITY_TONE[quality]}>{quality}</Badge>
-                  </div>
-                  <div className="mt-3 flex items-end justify-between">
-                    <div className="text-lg font-semibold text-slate-800">
-                      {value === null ? "—" : formatMoney(value, h.currency)}
+                    <div className="mt-3 flex justify-between border-t border-slate-100 pt-2">
+                      <button onClick={() => setDetailId(h.id)} className="text-xs text-slate-500 hover:underline">
+                        View &amp; history
+                      </button>
+                      <button onClick={() => setAddFor(h.id)} className="text-xs font-medium text-blue-600 hover:underline">
+                        + Add transaction
+                      </button>
                     </div>
-                    <div className="text-sm text-slate-500">XIRR {formatPercent(xirr)}</div>
-                  </div>
-                </div>
-                <div className="mt-3 flex justify-between border-t border-slate-100 pt-2">
-                  <button
-                    onClick={() => setDetailId(h.id)}
-                    className="text-xs text-slate-500 hover:underline"
-                  >
-                    View &amp; history
-                  </button>
-                  <button
-                    onClick={() => setAddFor(h.id)}
-                    className="text-xs font-medium text-blue-600 hover:underline"
-                  >
-                    + Add transaction
-                  </button>
-                </div>
-              </Card>
-            );
-          })}
-        </div>
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </>
       )}
 
+      {showImport && <ImportHoldings onClose={() => setShowImport(false)} />}
       {showHoldingForm && (
         <HoldingForm
           onClose={() => setShowHoldingForm(false)}

@@ -17,13 +17,16 @@ import type {
   FxRateSnapshot,
   Holding,
   HoldingEvent,
+  ImportBatch,
   Person,
   SnapshotDoc,
   Transaction,
 } from "../model/types";
 import { createPortfolioRepo, type PortfolioRepo } from "../repo/portfolio-repo";
 import { netUnits } from "../domain/holdings";
+import { AUTO_VALUATION_NOTE } from "../domain/prices";
 import { desiredAutopayTransfers, isAutopayTransaction, planAutopayReconcile } from "../domain/autopay";
+import { importEventIdPrefix, type ImportPlan } from "../domain/import-holdings";
 
 export interface PortfolioState {
   ready: boolean;
@@ -43,6 +46,11 @@ export interface PortfolioState {
 
 const USD_ONLY: FxTable = { base: "USD", rates: { USD: 1 } };
 
+// Import-undo log retention — undo is a short-term convenience, so the local record is
+// bounded by BOTH age and count and never kept forever.
+const IMPORT_BATCH_TTL_DAYS = 30;
+const IMPORT_BATCH_KEEP = 25;
+
 function defaultSettings(): AppSettings {
   return {
     id: "app",
@@ -53,6 +61,18 @@ function defaultSettings(): AppSettings {
     lastSyncedVersion: 0,
     localVersion: 0,
   };
+}
+
+/** Re-point an imported event to `toHoldingId`, stamping createdAt. Identity when
+ *  from === to (the common case); only the M1 re-match (a draft merged into a live
+ *  holding a concurrent preview created) changes the holding, and then the event's
+ *  `import:<fromId>:...` id must be rewritten to `import:<toId>:...` so it dedups
+ *  against that holding's existing imported events instead of double-counting. */
+function retargetImportEvent(e: HoldingEvent, fromHoldingId: string, toHoldingId: string, now: string): HoldingEvent {
+  if (fromHoldingId === toHoldingId) return { ...e, createdAt: e.createdAt ?? now };
+  const oldPrefix = importEventIdPrefix(fromHoldingId);
+  const id = e.id.startsWith(oldPrefix) ? `${importEventIdPrefix(toHoldingId)}${e.id.slice(oldPrefix.length)}` : e.id;
+  return { ...e, id, holdingId: toHoldingId, createdAt: e.createdAt ?? now };
 }
 
 export class PortfolioStore {
@@ -144,6 +164,8 @@ export class PortfolioStore {
       version,
       dirty: version > settings.lastSyncedVersion,
     });
+    // Sweep expired/over-cap import-undo records on open (device-local, best-effort).
+    void this.pruneImportBatches();
   }
 
   private computeFx(fxRates: FxRateSnapshot[], settings: AppSettings): FxTable {
@@ -475,6 +497,234 @@ export class PortfolioStore {
     });
   }
 
+  /** Apply a reviewed holdings-import plan in ONE atomic commit: create new
+   *  holdings, delete the opening estimates the import supersedes, and insert the
+   *  new events (deterministic ids → re-applying is a no-op). Re-validated against
+   *  post-serialization state inside the lock: a planned merge INTO an existing
+   *  holding that was deleted while the preview was open is skipped rather than
+   *  writing orphan events. Returns how many holdings/events were actually written. */
+  async applyImport(
+    plan: ImportPlan,
+    opts: { label?: string } = {},
+  ): Promise<{ holdings: number; events: number; batch: ImportBatch | null }> {
+    let written = { holdings: 0, events: 0 };
+    let batch: ImportBatch | null = null;
+    await this.commit(() => {
+      const now = new Date().toISOString();
+      const addedEventIds: string[] = []; // events this import inserts (for undo)
+      const replacedOpenings: HoldingEvent[] = []; // full events it deletes (to restore on undo)
+      const liveHoldingIds = new Set(this.state.holdings.map((h) => h.id));
+      const liveAccountIds = new Set(this.state.accounts.map((a) => a.id));
+      const livePersonIds = new Set(this.state.people.map((pp) => pp.id));
+      // Every event id already in the DB — so a re-import (or a concurrent second
+      // preview) never re-inserts or overwrites an existing event.
+      const existingEventIds = new Set(this.state.holdingEvents.map((e) => e.id));
+      // Live holdings indexed by (account, normalised ticker) so a NEW draft can be
+      // re-matched to a holding that a concurrent tab/preview already created since the
+      // plan was built — merging into it instead of creating a duplicate (M1). ONLY
+      // holdings that did NOT exist when the plan was built are eligible: re-matching
+      // into a holding the user SAW at plan time would silently defeat an explicit
+      // "create new" choice (N1) or hijack an unrelated same-ticker holding (N4).
+      const knownAtPlan = new Set(plan.knownHoldingIds);
+      const norm = (s: string): string => s.trim().toLowerCase();
+      const acctTickerKey = (accountId: string | undefined, ticker: string): string => `${accountId ?? ""}|${norm(ticker)}`;
+      const liveByAcctTicker = new Map<string, string>(); // key -> holdingId (holdings created since the plan was built)
+      for (const h of this.state.holdings) {
+        if (h.archived || !h.ticker || knownAtPlan.has(h.id)) continue;
+        const k = acctTickerKey(h.accountId, h.ticker);
+        if (!liveByAcctTicker.has(k)) liveByAcctTicker.set(k, h.id);
+      }
+      const ops: BatchOp[] = [];
+      const newHoldings: Holding[] = [];
+      const putEvents = new Map<string, HoldingEvent>();
+      const deleteIds = new Set<string>();
+      for (const p of plan.holdings) {
+        // Resolve which live holding this plan entry writes into (creating it if new).
+        let targetHoldingId: string;
+        let fromHoldingId: string; // the id the plan's events were built under
+        if (p.draft) {
+          if (liveHoldingIds.has(p.draft.id)) continue; // this exact draft already applied
+          fromHoldingId = p.draft.id;
+          // Account deleted while the preview was open → keep the holding but unassign it.
+          const accountId = p.draft.accountId && liveAccountIds.has(p.draft.accountId) ? p.draft.accountId : undefined;
+          // M1: a concurrent preview may have created this (account, ticker) already.
+          // Skip the re-match if F6 changed the account (accountId !== the draft's
+          // original), else the fallback key could hijack a bystander holding (N4).
+          const matchId =
+            p.draft.ticker && accountId === p.draft.accountId
+              ? liveByAcctTicker.get(acctTickerKey(accountId, p.draft.ticker))
+              : undefined;
+          if (matchId) {
+            targetHoldingId = matchId; // merge into the existing holding, don't duplicate
+          } else {
+            // Create it, dropping a dangling account (F6) and a deleted owner (M3).
+            const draft: Holding = {
+              ...p.draft,
+              accountId,
+              personId: livePersonIds.has(p.draft.personId) ? p.draft.personId : "shared",
+            };
+            newHoldings.push(draft);
+            ops.push({ collection: Collections.holdings, op: "put", value: draft });
+            liveHoldingIds.add(draft.id);
+            if (draft.ticker) liveByAcctTicker.set(acctTickerKey(draft.accountId, draft.ticker), draft.id);
+            targetHoldingId = draft.id;
+          }
+        } else if (p.existingHoldingId && liveHoldingIds.has(p.existingHoldingId)) {
+          targetHoldingId = p.existingHoldingId;
+          fromHoldingId = p.existingHoldingId;
+        } else {
+          continue; // merge target vanished during the preview → skip (no orphans)
+        }
+
+        for (const id of p.replacedOpeningIds) {
+          if (deleteIds.has(id)) continue;
+          const ev = this.state.holdingEvents.find((e) => e.id === id);
+          if (!ev) continue; // already gone (stale re-apply) → don't emit a no-op delete
+          replacedOpenings.push(ev); // capture the FULL event so undo can restore it
+          deleteIds.add(id);
+          ops.push({ collection: Collections.holdingEvents, op: "delete", id });
+        }
+        for (const e of p.newEvents) {
+          // Retarget the event to the resolved holding (identity unless M1 re-matched a
+          // draft into a different live holding), then skip it if that id already exists
+          // (idempotent re-import / concurrent-preview race) or repeats within this plan.
+          const rec = retargetImportEvent(e, fromHoldingId, targetHoldingId, now);
+          if (existingEventIds.has(rec.id) || putEvents.has(rec.id) || deleteIds.has(rec.id)) continue;
+          putEvents.set(rec.id, rec);
+          addedEventIds.push(rec.id);
+          ops.push({ collection: Collections.holdingEvents, op: "put", value: rec });
+        }
+      }
+      if (ops.length === 0) return { ops, patch: {} };
+      // Rebuild the events list in ONE pass (O(E + changes)), not replace/filter per
+      // event (O(changes × E)) — an import can carry thousands of events.
+      const holdingEvents: HoldingEvent[] = [];
+      for (const e of this.state.holdingEvents) {
+        if (deleteIds.has(e.id)) continue;
+        const upd = putEvents.get(e.id);
+        if (upd) {
+          holdingEvents.push(upd);
+          putEvents.delete(e.id);
+        } else {
+          holdingEvents.push(e);
+        }
+      }
+      for (const rec of putEvents.values()) holdingEvents.push(rec);
+      written = {
+        holdings: newHoldings.length,
+        events: ops.filter((o) => o.collection === Collections.holdingEvents && o.op === "put").length,
+      };
+      // Record an undo batch (device-local, stripped from backup/sync) IN THE SAME atomic
+      // write, so the record can never desync from the data it describes.
+      if (written.holdings + written.events > 0) {
+        batch = {
+          id: newId(),
+          createdAt: now,
+          label: opts.label?.trim() || "CSV import",
+          createdHoldingIds: newHoldings.map((h) => h.id),
+          addedEventIds,
+          replacedOpenings,
+          counts: { ...written },
+        };
+        ops.push({ collection: Collections.importBatches, op: "put", value: batch });
+      }
+      return { ops, patch: { holdings: [...this.state.holdings, ...newHoldings], holdingEvents } };
+    });
+    // Best-effort retention: keep the undo log small (local-only, no long-term value).
+    if (batch) await this.pruneImportBatches();
+    return { ...written, batch };
+  }
+
+  /** Recent, still-valid CSV imports, newest first (device-local; never synced/backed
+   *  up). Expired ones (past the TTL) are filtered from the result and swept by
+   *  pruneImportBatches on init / next import — undo is a short-term convenience. */
+  async listImportBatches(): Promise<ImportBatch[]> {
+    const cutoff = new Date(Date.now() - IMPORT_BATCH_TTL_DAYS * 86_400_000).toISOString();
+    const all = await this.adapter.collection<ImportBatch>(Collections.importBatches).getAll();
+    return all
+      .filter((b) => b.createdAt >= cutoff)
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0))
+      .slice(0, IMPORT_BATCH_KEEP);
+  }
+
+  /** Delete import-undo records that are expired (older than the TTL) OR beyond the keep
+   *  cap, so the local log is both time- and count-bounded and never grows forever. Runs
+   *  on init and after each import; writes DIRECTLY (not via commit) so sweeping this
+   *  local-only, stripped collection never bumps the sync version. */
+  private async pruneImportBatches(): Promise<void> {
+    const cutoff = new Date(Date.now() - IMPORT_BATCH_TTL_DAYS * 86_400_000).toISOString();
+    const all = (await this.adapter.collection<ImportBatch>(Collections.importBatches).getAll()).sort((a, b) =>
+      a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
+    ); // newest first
+    const stale = all.filter((b, i) => b.createdAt < cutoff || i >= IMPORT_BATCH_KEEP);
+    if (stale.length > 0) {
+      await this.adapter.batch(stale.map((b) => ({ collection: Collections.importBatches, op: "delete", id: b.id })));
+    }
+  }
+
+  /** Undo one import: remove the transactions it added, delete only the holdings it
+   *  CREATED that have no other events left (a holding you've since added your own
+   *  transactions to is kept — just its imported rows go), and restore any opening
+   *  estimate it replaced. Atomic. Returns what was reverted, or null if the batch is gone. */
+  async undoImportBatch(batchId: string): Promise<{ holdings: number; events: number } | null> {
+    const batch = await this.adapter.collection<ImportBatch>(Collections.importBatches).get(batchId);
+    if (!batch) return null;
+    let reverted: { holdings: number; events: number } | null = null;
+    await this.commit(() => {
+      const addedSet = new Set(batch.addedEventIds);
+      const existingEventIds = new Set(this.state.holdingEvents.map((e) => e.id));
+      const liveHoldingIds = new Set(this.state.holdings.map((h) => h.id));
+      // An auto price-refresh valuation isn't the user's own data — it's derived from the
+      // (now-being-removed) position. It must NOT keep an import-created holding alive, and
+      // it must be cleaned up WITH that holding (a user-edited valuation drops this note, so
+      // it counts as real data and is preserved).
+      const isAutoValuation = (e: HoldingEvent): boolean => e.type === "valuation" && e.note === AUTO_VALUATION_NOTE;
+      // A created holding is deleted unless a GENUINE user event survives (not the import's
+      // rows, not an auto valuation) — so a holding that only got auto-priced still reverts.
+      const userRemaining = new Map<string, number>();
+      for (const e of this.state.holdingEvents) {
+        if (addedSet.has(e.id) || isAutoValuation(e)) continue;
+        userRemaining.set(e.holdingId, (userRemaining.get(e.holdingId) ?? 0) + 1);
+      }
+      const holdingsToDelete = new Set(
+        batch.createdHoldingIds.filter((hid) => liveHoldingIds.has(hid) && (userRemaining.get(hid) ?? 0) === 0),
+      );
+      // Remove the import's transactions AND every event of a holding being deleted
+      // (including its auto-valuations) — otherwise those valuations orphan a dead holding.
+      const delEventIds = new Set<string>();
+      for (const id of batch.addedEventIds) if (existingEventIds.has(id)) delEventIds.add(id);
+      for (const e of this.state.holdingEvents) if (holdingsToDelete.has(e.holdingId)) delEventIds.add(e.id);
+      const removedImportEvents = batch.addedEventIds.filter((id) => existingEventIds.has(id)).length;
+      const reinsert = batch.replacedOpenings.filter(
+        (ev) => !existingEventIds.has(ev.id) && liveHoldingIds.has(ev.holdingId) && !holdingsToDelete.has(ev.holdingId),
+      );
+
+      // Nothing left to revert (already undone, e.g. a concurrent double-undo) → do a
+      // true no-op: don't bump the sync version. The stale batch record is swept below
+      // via a direct write (like prune), so it doesn't dirty the synced document.
+      if (delEventIds.size === 0 && holdingsToDelete.size === 0 && reinsert.length === 0) {
+        return { ops: [], patch: {} };
+      }
+
+      const ops: BatchOp[] = [];
+      for (const id of delEventIds) ops.push({ collection: Collections.holdingEvents, op: "delete", id });
+      for (const hid of holdingsToDelete) ops.push({ collection: Collections.holdings, op: "delete", id: hid });
+      for (const ev of reinsert) ops.push({ collection: Collections.holdingEvents, op: "put", value: ev });
+      ops.push({ collection: Collections.importBatches, op: "delete", id: batchId });
+
+      const holdingEvents = this.state.holdingEvents.filter((e) => !delEventIds.has(e.id)).concat(reinsert);
+      const holdings = this.state.holdings.filter((h) => !holdingsToDelete.has(h.id));
+      reverted = { holdings: holdingsToDelete.size, events: removedImportEvents };
+      return { ops, patch: { holdings, holdingEvents } };
+    });
+    // If there was nothing to revert, the batch record may still linger (e.g. it was
+    // read before a concurrent undo consumed it) → sweep it locally without a version bump.
+    if (reverted === null) {
+      await this.adapter.batch([{ collection: Collections.importBatches, op: "delete", id: batchId }]);
+    }
+    return reverted;
+  }
+
   // -- settings & FX -------------------------------------------------------
   // Settings are device-local and excluded from snapshots, so changing them
   // does NOT bump the sync version or mark the document dirty.
@@ -540,6 +790,7 @@ export class PortfolioStore {
     const out = { ...data };
     delete out[Collections.settings];
     delete out[Collections.fxRates];
+    delete out[Collections.importBatches]; // device-local undo log — never backed up or synced
     return out;
   }
 
@@ -592,7 +843,7 @@ export class PortfolioStore {
       // version info. `init()` then reloads the consistent state and derives the
       // same version/dirty (version = max(localVersion, lastSyncedVersion)).
       await this.adapter.importAll(this.stripLocal(doc.data), "replace", {
-        preserve: [Collections.settings, Collections.fxRates],
+        preserve: [Collections.settings, Collections.fxRates, Collections.importBatches],
         alsoPut: [{ collection: Collections.settings, op: "put", value: settings }],
       });
       await this.init();
