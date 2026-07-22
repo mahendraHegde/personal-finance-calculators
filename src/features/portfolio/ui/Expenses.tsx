@@ -176,7 +176,7 @@ export function Expenses() {
       <Card className="flex flex-wrap items-center justify-between gap-2 py-3">
         <span className="text-sm font-medium text-slate-600">
           {periodLabel}
-          {filter.type || filter.personId || filter.text ? " (filtered)" : ""}
+          {filter.type || filter.personId || filter.currency || filter.text ? " (filtered)" : ""}
         </span>
         <div className="flex gap-4 text-sm">
           <span className="text-green-600">Income {formatMoney(totals.income, totals.base)}</span>
