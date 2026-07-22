@@ -80,15 +80,13 @@ export interface Account {
   autopay?: AutopayTerms;
   archived?: boolean;
 }
-
-export type CategoryKind = "expense" | "income";
-
+/** Categories are shared across income & expense — a transaction's own `type`
+ *  distinguishes the two, so there's no per-category kind. */
 export interface Category {
   id: ID;
   name: string;
-  kind: CategoryKind;
   /** Parent category id for a SUB-category; absent for a top-level category.
-   *  A subcategory inherits its parent's `kind`. (Two levels only.) */
+   *  (Two levels only.) */
   parentId?: ID;
   /** Hidden from the Add/Edit pickers but kept for history (old transactions
    *  still resolve its name). Set when a referenced category can't be deleted. */

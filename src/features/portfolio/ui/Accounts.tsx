@@ -6,7 +6,7 @@ import { useState } from "react";
 import { newId } from "../../../lib/util/id";
 import { todayIso } from "../../../lib/util/format";
 import { usePortfolio } from "../state/context";
-import type { Account, AccountType, Category, CategoryKind, InterestFrequency, Person } from "../model/types";
+import type { Account, AccountType, Category, InterestFrequency, Person } from "../model/types";
 import { SHARED } from "../model/types";
 import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, SectionTitle, TextInput } from "./components";
 import {
@@ -21,6 +21,8 @@ import {
 
 type EntityKind = "person" | "account" | "category";
 type Entity = Person | Account | Category;
+
+const byName = (a: Category, b: Category): number => a.name.localeCompare(b.name);
 
 const ACCOUNT_TYPES: AccountType[] = [
   "bank",
@@ -54,6 +56,7 @@ export function Accounts() {
   const [form, setForm] = useState<FormState>(null);
   const [error, setError] = useState<string | null>(null);
   const [del, setDel] = useState<{ kind: EntityKind; rec: Entity } | null>(null);
+  const [merge, setMerge] = useState<Category | null>(null); // category to merge INTO another
 
   const remove = (fn: Promise<void>): void => {
     setError(null);
@@ -89,6 +92,26 @@ export function Accounts() {
     </span>
   );
   const nameCls = (archived?: boolean): string => (archived ? "text-slate-400" : "text-slate-700");
+
+  // Category rows also offer "merge" (fold this category into another, migrating its
+  // transactions + subcategories) alongside the standard archive/delete.
+  const categoryActions = (c: Category) => (
+    <span className="flex shrink-0 items-center gap-3" onClick={(e) => e.stopPropagation()}>
+      {c.archived && <Badge>archived</Badge>}
+      <button onClick={() => setMerge(c)} className="text-xs text-slate-500 hover:underline">
+        merge
+      </button>
+      <button
+        onClick={() => remove(setArchived("category", c, !c.archived))}
+        className="text-xs text-slate-500 hover:underline"
+      >
+        {c.archived ? "unarchive" : "archive"}
+      </button>
+      <button onClick={() => setDel({ kind: "category", rec: c })} className="text-xs text-red-500 hover:underline">
+        delete
+      </button>
+    </span>
+  );
 
   return (
     <div className="space-y-6">
@@ -148,18 +171,38 @@ export function Accounts() {
           </Button>
         </div>
         {state.categories.length === 0 ? (
-          <EmptyState>Add expense/income categories.</EmptyState>
+          <EmptyState>Add categories to tag income &amp; expenses.</EmptyState>
         ) : (
           <ul className="divide-y divide-slate-100 text-sm">
-            {state.categories.map((c) => (
-              <li key={c.id} {...rowProps(() => setForm({ kind: "category", rec: c }))}>
-                <span className={nameCls(c.archived)}>
-                  {c.parentId ? <span className="text-slate-400">↳ </span> : null}
-                  {c.name} <span className="text-xs text-slate-400">{c.kind}</span>
-                </span>
-                {actions("category", c)}
-              </li>
-            ))}
+            {state.categories
+              // Top-level categories, plus any orphan (its parent was removed) so a
+              // category can never silently disappear from management.
+              .filter((c) => !c.parentId || !state.categories.some((p) => p.id === c.parentId))
+              .sort(byName)
+              .map((top) => {
+                const kids = state.categories.filter((c) => c.parentId === top.id).sort(byName);
+                return (
+                  <li key={top.id}>
+                    <div {...rowProps(() => setForm({ kind: "category", rec: top }))}>
+                      <span className={nameCls(top.archived)}>{top.name}</span>
+                      {categoryActions(top)}
+                    </div>
+                    {kids.length > 0 && (
+                      <ul className="ml-3 border-l border-slate-100 pl-3">
+                        {kids.map((kid) => (
+                          <li key={kid.id} {...rowProps(() => setForm({ kind: "category", rec: kid }))}>
+                            <span className={nameCls(kid.archived)}>
+                              <span className="text-slate-300">↳ </span>
+                              {kid.name}
+                            </span>
+                            {categoryActions(kid)}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </li>
+                );
+              })}
           </ul>
         )}
       </Card>
@@ -169,6 +212,7 @@ export function Accounts() {
         <AccountForm key={form.rec?.id ?? "new"} initial={form.rec} onClose={() => setForm(null)} />
       )}
       {form?.kind === "category" && <CategoryForm initial={form.rec} onClose={() => setForm(null)} />}
+      {merge && <MergeCategoryDialog source={merge} onClose={() => setMerge(null)} />}
       {del && <DeleteDialog kind={del.kind} rec={del.rec} onClose={() => setDel(null)} />}
     </div>
   );
@@ -530,20 +574,16 @@ function AccountForm({ initial, onClose }: { initial?: Account; onClose: () => v
 function CategoryForm({ initial, onClose }: { initial?: Category; onClose: () => void }) {
   const { state, store } = usePortfolio();
   const [name, setName] = useState(initial?.name ?? "");
-  const [kind, setKind] = useState<CategoryKind>(initial?.kind ?? "expense");
   const [parentId, setParentId] = useState(initial?.parentId ?? ""); // "" = top-level
 
-  // A category that already HAS subcategories must stay top-level (we only allow
-  // two levels), so editing it can't move it under a parent.
+  // A category that already HAS subcategories must stay top-level (two levels only),
+  // so editing it can't move it under a parent.
   const hasChildren = initial ? state.categories.some((c) => c.parentId === initial.id) : false;
-  // Eligible parents: top-level categories of the chosen kind, never itself.
-  // Hide archived parents, but keep the currently-selected one visible.
+  // Eligible parents: any top-level category, never itself. Hide archived parents but
+  // keep the currently-selected one visible.
   const parents = state.categories.filter(
-    (c) => !c.parentId && c.kind === kind && c.id !== initial?.id && (!c.archived || c.id === parentId),
+    (c) => !c.parentId && c.id !== initial?.id && (!c.archived || c.id === parentId),
   );
-  const parent = state.categories.find((c) => c.id === parentId);
-  // A subcategory inherits its parent's kind.
-  const effectiveKind = parent ? parent.kind : kind;
 
   const [err, setErr] = useState<string | null>(null);
 
@@ -551,19 +591,12 @@ function CategoryForm({ initial, onClose }: { initial?: Category; onClose: () =>
     if (!name.trim()) return;
     setErr(null);
     try {
-      const id = initial?.id ?? newId();
       await store.saveCategory({
-        id,
+        id: initial?.id ?? newId(),
         name: name.trim(),
-        kind: effectiveKind,
         parentId: parentId || undefined,
         archived: initial?.archived, // preserve archived state across an edit
       });
-      // Keep subcategories' kind in sync if a parent's kind changed (they inherit it).
-      if (initial) {
-        const children = state.categories.filter((c) => c.parentId === id && c.kind !== effectiveKind);
-        for (const child of children) await store.saveCategory({ ...child, kind: effectiveKind });
-      }
       onClose();
     } catch (e) {
       setErr(String(e)); // keep the modal open so the edit isn't lost
@@ -577,43 +610,108 @@ function CategoryForm({ initial, onClose }: { initial?: Category; onClose: () =>
         <Field label="Name">
           <TextInput value={name} onChange={setName} placeholder="e.g. Groceries" />
         </Field>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Kind">
+        {hasChildren ? (
+          <p className="text-xs text-slate-400">Has subcategories — stays top-level.</p>
+        ) : (
+          <Field label="Parent (optional)">
             <Select
-              value={kind}
-              onChange={(v) => {
-                setKind(v as CategoryKind);
-                setParentId(""); // parents are kind-specific
-              }}
+              value={parentId}
+              onChange={setParentId}
               options={[
-                { value: "expense", label: "Expense" },
-                { value: "income", label: "Income" },
+                { value: "", label: "— top-level —" },
+                ...parents.map((p) => ({ value: p.id, label: p.name })),
               ]}
             />
           </Field>
-          {hasChildren ? (
-            <Field label="Parent">
-              <p className="py-2 text-xs text-slate-400">Has subcategories — stays top-level.</p>
-            </Field>
-          ) : (
-            <Field label="Parent (optional)">
-              <Select
-                value={parentId}
-                onChange={setParentId}
-                options={[
-                  { value: "", label: "— top-level —" },
-                  ...parents.map((p) => ({ value: p.id, label: p.name })),
-                ]}
-              />
-            </Field>
-          )}
-        </div>
+        )}
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
           <Button disabled={!name.trim()} onClick={() => void save()}>
             Save
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// Fold one category into another, migrating its transactions + subcategories, then
+// deleting it. The heavy lifting (re-point txns, re-parent children, delete) is one
+// atomic store commit; this just picks the target and shows what will move.
+function MergeCategoryDialog({ source, onClose }: { source: Category; onClose: () => void }) {
+  const { state, store } = usePortfolio();
+  const [targetId, setTargetId] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const childCount = state.categories.filter((c) => c.parentId === source.id).length;
+  const txnCount = state.transactions.filter((t) => t.categoryId === source.id).length;
+  // Eligible targets: any OTHER live category, never the source's own subcategory (would
+  // cycle). If the source has subcategories they re-parent under the target, so the
+  // target must itself be top-level (keeps the two-level limit).
+  const targets = state.categories.filter(
+    (c) => c.id !== source.id && c.parentId !== source.id && !c.archived && (childCount === 0 || !c.parentId),
+  );
+  const label = (c: Category): string => {
+    const parent = c.parentId ? state.categories.find((p) => p.id === c.parentId) : undefined;
+    return parent ? `${parent.name} › ${c.name}` : c.name;
+  };
+
+  const confirm = async (): Promise<void> => {
+    if (!targetId) {
+      setErr("Choose a category to merge into.");
+      return;
+    }
+    setErr(null);
+    setBusy(true);
+    try {
+      await store.mergeCategories(source.id, targetId);
+      onClose();
+    } catch (e) {
+      setBusy(false);
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <Modal title={`Merge “${source.name}”`} onClose={onClose}>
+      <div className="space-y-3 text-sm">
+        {err && <p className="text-red-600">{err}</p>}
+        {targets.length === 0 ? (
+          <p className="text-slate-600">No eligible category to merge into.</p>
+        ) : (
+          <>
+            <Field label="Merge into">
+              <Select
+                value={targetId}
+                onChange={setTargetId}
+                options={[
+                  { value: "", label: "Select a category…" },
+                  ...targets.sort(byName).map((t) => ({ value: t.id, label: label(t) })),
+                ]}
+              />
+            </Field>
+            <p className="text-slate-500">
+              {txnCount} transaction{txnCount === 1 ? "" : "s"} will move to the target
+              {childCount > 0
+                ? `, ${childCount} subcategor${childCount === 1 ? "y" : "ies"} will re-parent`
+                : ""}
+              , then “{source.name}” is deleted. This can’t be undone.
+            </p>
+          </>
+        )}
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            disabled={busy || !targetId || targets.length === 0}
+            onClick={() => void confirm()}
+          >
+            Merge
           </Button>
         </div>
       </div>

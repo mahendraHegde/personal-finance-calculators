@@ -24,12 +24,19 @@ import {
 
 const PAGE = 25;
 const TYPE_TONE: Record<TxnType, string> = { income: "green", expense: "red", transfer: "blue" };
+const MONTH_OPTIONS: { value: string; label: string }[] = [
+  ["01", "January"], ["02", "February"], ["03", "March"], ["04", "April"],
+  ["05", "May"], ["06", "June"], ["07", "July"], ["08", "August"],
+  ["09", "September"], ["10", "October"], ["11", "November"], ["12", "December"],
+].map(([value, label]) => ({ value, label }));
 
 export function Expenses() {
   const { state, store } = usePortfolio();
   const [filter, setFilter] = useState<TxnFilter>({});
   // Default to the current year; "" = all years.
   const [year, setYear] = useState<string>(todayIso().slice(0, 4));
+  // Month-of-year "01".."12"; "" = all months (the default).
+  const [month, setMonth] = useState<string>("");
   const [limit, setLimit] = useState(PAGE);
   const [editing, setEditing] = useState<Transaction | null>(null);
   const [showForm, setShowForm] = useState(false);
@@ -60,8 +67,9 @@ export function Expenses() {
     if (f.personId && f.personId !== SHARED && !state.people.some((p) => p.id === f.personId)) {
       f = { ...f, personId: undefined };
     }
-    return year ? { ...f, from: `${year}-01-01`, to: `${year}-12-31` } : f;
-  }, [filter, year, currencies, state.people]);
+    const scoped = year ? { ...f, from: `${year}-01-01`, to: `${year}-12-31` } : f;
+    return month ? { ...scoped, month } : scoped;
+  }, [filter, year, month, currencies, state.people]);
   const rows = useMemo(
     () => sortByDateDesc(filterTransactions(state.transactions, effFilter)),
     [state.transactions, effFilter],
@@ -100,6 +108,10 @@ export function Expenses() {
     setShowForm(true);
   };
 
+  const monthName = month ? (MONTH_OPTIONS.find((m) => m.value === month)?.label ?? "") : "";
+  const periodLabel =
+    year && month ? `${monthName} ${year}` : year ? year : month ? `${monthName} (all years)` : "All time";
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -111,6 +123,16 @@ export function Expenses() {
               setLimit(PAGE);
             }}
             options={[{ value: "", label: "All years" }, ...years.map((y) => ({ value: y, label: y }))]}
+          />
+        </div>
+        <div className="w-32">
+          <Select
+            value={month}
+            onChange={(v) => {
+              setMonth(v);
+              setLimit(PAGE);
+            }}
+            options={[{ value: "", label: "All months" }, ...MONTH_OPTIONS]}
           />
         </div>
         <div className="w-32">
@@ -153,7 +175,7 @@ export function Expenses() {
 
       <Card className="flex flex-wrap items-center justify-between gap-2 py-3">
         <span className="text-sm font-medium text-slate-600">
-          {year || "All years"}
+          {periodLabel}
           {filter.type || filter.personId || filter.text ? " (filtered)" : ""}
         </span>
         <div className="flex gap-4 text-sm">
@@ -356,12 +378,9 @@ function TransactionForm({
         <Field label="Type">
           <Select
             value={type}
-            onChange={(v) => {
-              setType(v as TxnType);
-              // categories are kind-specific → clear when switching expense/income
-              setParentCat("");
-              setSubCat("");
-            }}
+            onChange={(v) => setType(v as TxnType)}
+            // Categories are shared across income & expense now, so switching type keeps
+            // the chosen category (transfers ignore it — save() drops categoryId for them).
             options={[
               { value: "expense", label: "Expense" },
               { value: "income", label: "Income" },
@@ -401,7 +420,7 @@ function TransactionForm({
                     setParentCat(v);
                     setSubCat(""); // subcategories belong to a parent
                   }}
-                  options={categoryOptions(state, type, parentCat)}
+                  options={categoryOptions(state, parentCat)}
                 />
               </Field>
               <Field label="Subcategory">

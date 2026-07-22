@@ -14,18 +14,19 @@ import {
   withFdAccrual,
 } from "../src/features/portfolio/domain/holdings";
 import { accountBalances, accountBalancesByPerson, netWorth, totalReturn } from "../src/features/portfolio/domain/networth";
-import { categoryTotals, flowSummary, monthlyTotals } from "../src/features/portfolio/domain/transactions";
+import { categoryTotals, filterTransactions, flowSummary, monthlyTotals, type TxnFilter } from "../src/features/portfolio/domain/transactions";
 import {
   autopayId,
   desiredAutopayTransfers,
   isAutopayTransaction,
   planAutopayReconcile,
 } from "../src/features/portfolio/domain/autopay";
-import { composeAccountExtras } from "../src/features/portfolio/ui/helpers";
+import { categoryOptions, composeAccountExtras } from "../src/features/portfolio/ui/helpers";
+import type { PortfolioState } from "../src/features/portfolio/state/store";
 import { accruedInterest, compoundValue } from "../src/lib/money/interest";
 import { xirr, type Cashflow } from "../src/lib/money/xirr";
 import { addMonthsIso, daysInMonth, ddmmyyyyToIso, formatDdmmyyyy, isoFromParts, isoToDdmmyyyy } from "../src/lib/util/date";
-import type { Account, Holding, HoldingEvent, Transaction } from "../src/features/portfolio/model/types";
+import type { Account, Category, Holding, HoldingEvent, Transaction } from "../src/features/portfolio/model/types";
 import type { FxTable } from "../src/lib/money/currency";
 import { done, eq, near, ok, section } from "./_harness";
 
@@ -1382,6 +1383,36 @@ section("[transactions] excludeFromReports keeps a transaction out of income/exp
     200,
     "categoryTotals income excludes the settlement deposit",
   );
+}
+
+section("[helpers] categoryOptions: shared top-level categories (no kind); subcategories & archived excluded");
+{
+  const cats: Category[] = [
+    { id: "grocery", name: "Groceries" },
+    { id: "salary", name: "Salary" },
+    { id: "sub", name: "Sub", parentId: "grocery" }, // subcategory: not a top-level option
+    { id: "arch", name: "Old", archived: true }, // archived: hidden from the picker
+  ];
+  const state = { categories: cats } as unknown as PortfolioState;
+  const vals = categoryOptions(state).map((o) => o.value);
+  ok(vals[0] === "", "first option is Uncategorized (empty value)");
+  ok(vals.includes("grocery") && vals.includes("salary"), "top-level categories offered regardless of income/expense");
+  ok(!vals.includes("sub"), "subcategory is not offered as a top-level option");
+  ok(!vals.includes("arch"), "archived category excluded");
+  ok(categoryOptions(state, "arch").map((o) => o.value).includes("arch"), "keepId re-includes an archived category");
+}
+
+section("[transactions] filterTransactions month predicate composes with date bounds");
+{
+  const t = (id: string, date: string): Transaction => ({
+    id, date, type: "expense", accountId: "A", personId: "p1", amount: 1, currency: "USD", updatedAt: "",
+  });
+  const txns = [t("a", "2026-03-10"), t("b", "2026-07-04"), t("c", "2025-03-22"), t("d", "2026-03-31")];
+  const ids = (f: TxnFilter): string => filterTransactions(txns, f).map((x) => x.id).sort().join(",");
+  eq(ids({ month: "03" }), "a,c,d", "month alone → that month across ALL years");
+  eq(ids({ from: "2026-01-01", to: "2026-12-31", month: "03" }), "a,d", "month within a year (composes with bounds)");
+  eq(ids({ from: "2026-01-01", to: "2026-12-31" }), "a,b,d", "year bounds only → all months of that year");
+  eq(ids({}), "a,b,c,d", "no filter → all");
 }
 
 done();

@@ -223,16 +223,16 @@ export function holdingAccountOptions(
     .map((a) => ({ value: a.id, label: accountLabel(state, a, { currency: true }) }));
 }
 
-/** Top-level categories of a kind (for the primary category dropdown). */
+/** Top-level categories for the primary category dropdown. Categories are shared across
+ *  income & expense (the transaction's own `type` distinguishes them), so no kind filter. */
 export function categoryOptions(
   state: PortfolioState,
-  kind: "expense" | "income",
   keepId?: string,
 ): Array<{ value: string; label: string }> {
   return [
     { value: "", label: "Uncategorized" },
     ...state.categories
-      .filter((c) => c.kind === kind && !c.parentId && live(c.archived, c.id, keepId))
+      .filter((c) => !c.parentId && live(c.archived, c.id, keepId))
       .map((c) => ({ value: c.id, label: c.name })),
   ];
 }

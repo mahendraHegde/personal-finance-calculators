@@ -217,8 +217,8 @@ section("[store] setFxOverride sets then clears a single rate");
 section("[store] blocks deleting a category with subcategories or used by a transaction");
 {
   const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
-  await store.saveCategory({ id: "food", name: "Food", kind: "expense" });
-  await store.saveCategory({ id: "groc", name: "Groceries", kind: "expense", parentId: "food" });
+  await store.saveCategory({ id: "food", name: "Food" });
+  await store.saveCategory({ id: "groc", name: "Groceries", parentId: "food" });
   let threwParent = false;
   try {
     await store.deleteCategory("food");
@@ -576,6 +576,47 @@ section("[store] settleFd guards are atomic (non-FD, missing account, bad amount
 
   await store.settleFd("FD", { mode: "renew" });
   await rejects(() => store.settleFd("FD", { mode: "renew" }), "settling an already-settled FD throws");
+}
+
+section("[store] mergeCategories: re-points transactions, re-parents subcategories, deletes the source");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveAccount({ id: "A1", name: "Bank", type: "bank", currency: "USD", personId: "p1" });
+  await store.saveCategory({ id: "food", name: "Food" }); // source: top-level, has a child
+  await store.saveCategory({ id: "snacks", name: "Snacks", parentId: "food" });
+  await store.saveCategory({ id: "grocery", name: "Grocery" }); // target: top-level
+  const tx = (id: string, categoryId: string): Promise<void> =>
+    store.saveTransaction({
+      id, date: "2026-01-01", type: "expense", accountId: "A1", personId: "p1", amount: 5, currency: "USD", categoryId, updatedAt: "",
+    });
+  await tx("t1", "food");
+  await tx("t2", "food");
+  await tx("t3", "snacks"); // on the CHILD — must not move (child survives, re-parented)
+  await store.mergeCategories("food", "grocery");
+  const cats = store.getState().categories;
+  const txns = store.getState().transactions;
+  ok(!cats.some((c) => c.id === "food"), "source category deleted");
+  eq(cats.find((c) => c.id === "snacks")?.parentId, "grocery", "source's subcategory re-parented under target");
+  eq(txns.find((t) => t.id === "t1")?.categoryId, "grocery", "source txn re-pointed to target");
+  eq(txns.find((t) => t.id === "t2")?.categoryId, "grocery", "source txn re-pointed to target");
+  eq(txns.find((t) => t.id === "t3")?.categoryId, "snacks", "child's txn left unchanged");
+}
+
+section("[store] mergeCategories guards are atomic (self, missing, into-own-subcategory, subcats→non-top target)");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveCategory({ id: "a", name: "A" });
+  await store.saveCategory({ id: "asub", name: "A-sub", parentId: "a" });
+  await store.saveCategory({ id: "b", name: "B" });
+  await store.saveCategory({ id: "bsub", name: "B-sub", parentId: "b" });
+  await rejects(() => store.mergeCategories("a", "a"), "merge into itself throws");
+  await rejects(() => store.mergeCategories("a", "nope"), "merge into a missing target throws");
+  await rejects(() => store.mergeCategories("nope", "b"), "merge from a missing source throws");
+  await rejects(() => store.mergeCategories("a", "asub"), "merge a parent into its own subcategory throws");
+  // 'a' has a subcategory, so a non-top-level target ('bsub') would nest 3 levels → block.
+  await rejects(() => store.mergeCategories("a", "bsub"), "merge (source has subcats) into a subcategory target throws");
+  eq(store.getState().categories.length, 4, "no category added/removed by failed merges");
+  eq(store.getState().categories.find((c) => c.id === "asub")?.parentId, "a", "asub still under 'a' (atomic — no partial write)");
 }
 
 done();

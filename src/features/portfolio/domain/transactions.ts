@@ -16,6 +16,10 @@ export interface TxnFilter {
   /** Inclusive ISO date bounds. */
   from?: string;
   to?: string;
+  /** Month-of-year "01".."12" — keeps only txns in that calendar month. Composes with
+   *  from/to (e.g. year bounds + month = that month of that year; no bounds + month =
+   *  that month across all years). */
+  month?: string;
   /** Case-insensitive substring match on the note. */
   text?: string;
 }
@@ -30,6 +34,7 @@ export function filterTransactions(txns: Transaction[], f: TxnFilter): Transacti
     if (f.currency && t.currency !== f.currency) return false;
     if (f.from && t.date < f.from) return false;
     if (f.to && t.date > f.to) return false;
+    if (f.month && t.date.slice(5, 7) !== f.month) return false;
     if (text && !(t.note ?? "").toLowerCase().includes(text)) return false;
     return true;
   });

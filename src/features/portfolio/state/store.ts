@@ -320,6 +320,56 @@ export class PortfolioStore {
       };
     });
   }
+  /** Fold `sourceId` INTO `targetId` in one atomic commit: re-point every transaction
+   *  tagged with the source to the target, re-parent the source's subcategories under
+   *  the target, then delete the source. Guarded so it can't orphan data or exceed the
+   *  two-level hierarchy (all checks read post-serialization state). */
+  async mergeCategories(sourceId: string, targetId: string): Promise<void> {
+    await this.commit(() => {
+      if (sourceId === targetId) throw new Error("Cannot merge a category into itself");
+      const source = this.state.categories.find((c) => c.id === sourceId);
+      const target = this.state.categories.find((c) => c.id === targetId);
+      if (!source) throw new Error("Source category not found");
+      if (!target) throw new Error("Target category not found");
+      // Can't merge a parent into its own subcategory (would orphan/cycle the rest).
+      if (target.parentId === sourceId) {
+        throw new Error("Cannot merge a category into its own subcategory");
+      }
+      const children = this.state.categories.filter((c) => c.parentId === sourceId);
+      // If the source has subcategories they move under the target, so the target must
+      // be top-level (else those children would nest three levels deep).
+      if (children.length > 0 && target.parentId) {
+        throw new Error("Pick a top-level target — it will receive the subcategories");
+      }
+
+      const now = new Date().toISOString();
+      const author = this.state.settings.author;
+      const movedTxns = this.state.transactions
+        .filter((t) => t.categoryId === sourceId)
+        .map((t): Transaction => ({ ...t, categoryId: targetId, updatedAt: now, author }));
+      const reparented = children.map((c): Category => ({ ...c, parentId: targetId }));
+
+      // Nothing actually changes? (no txns, no children) — still delete the source.
+      const movedIds = new Set(movedTxns.map((t) => t.id));
+      const reparentedIds = new Set(reparented.map((c) => c.id));
+      const ops: BatchOp[] = [
+        ...movedTxns.map((t): BatchOp => ({ collection: Collections.transactions, op: "put", value: t })),
+        ...reparented.map((c): BatchOp => ({ collection: Collections.categories, op: "put", value: c })),
+        { collection: Collections.categories, op: "delete", id: sourceId },
+      ];
+      const txnById = new Map(movedTxns.map((t) => [t.id, t]));
+      const catById = new Map(reparented.map((c) => [c.id, c]));
+      return {
+        ops,
+        patch: {
+          transactions: this.state.transactions.map((t) => (movedIds.has(t.id) ? txnById.get(t.id)! : t)),
+          categories: this.state.categories
+            .filter((c) => c.id !== sourceId)
+            .map((c) => (reparentedIds.has(c.id) ? catById.get(c.id)! : c)),
+        },
+      };
+    });
+  }
 
   // -- transactions --------------------------------------------------------
   async saveTransaction(t: Transaction): Promise<void> {
