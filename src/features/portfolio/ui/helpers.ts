@@ -233,6 +233,7 @@ export function categoryOptions(
     { value: "", label: "Uncategorized" },
     ...state.categories
       .filter((c) => !c.parentId && live(c.archived, c.id, keepId))
+      .sort((a, b) => a.name.localeCompare(b.name))
       .map((c) => ({ value: c.id, label: c.name })),
   ];
 }
@@ -248,6 +249,7 @@ export function subcategoryOptions(
     { value: "", label: "(none)" },
     ...state.categories
       .filter((c) => c.parentId === parentId && live(c.archived, c.id, keepId))
+      .sort((a, b) => a.name.localeCompare(b.name))
       .map((c) => ({ value: c.id, label: c.name })),
   ];
 }

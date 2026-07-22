@@ -11,6 +11,9 @@ export interface TxnFilter {
   personId?: Owner;
   accountId?: string;
   categoryId?: string;
+  /** Match any of these category ids — used by the ledger's category filter, where
+   *  selecting a PARENT category matches the parent AND its subcategories. */
+  categoryIds?: string[];
   type?: TxnType;
   currency?: CurrencyCode;
   /** Inclusive ISO date bounds. */
@@ -30,6 +33,7 @@ export function filterTransactions(txns: Transaction[], f: TxnFilter): Transacti
     if (f.personId && t.personId !== f.personId) return false;
     if (f.accountId && t.accountId !== f.accountId) return false;
     if (f.categoryId && t.categoryId !== f.categoryId) return false;
+    if (f.categoryIds && (t.categoryId === undefined || !f.categoryIds.includes(t.categoryId))) return false;
     if (f.type && t.type !== f.type) return false;
     if (f.currency && t.currency !== f.currency) return false;
     if (f.from && t.date < f.from) return false;

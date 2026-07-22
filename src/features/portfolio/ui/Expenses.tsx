@@ -37,6 +37,8 @@ export function Expenses() {
   const [year, setYear] = useState<string>(todayIso().slice(0, 4));
   // Month-of-year "01".."12"; "" = all months (the default).
   const [month, setMonth] = useState<string>("");
+  const [fCat, setFCat] = useState<string>(""); // top-level category filter ("" = all)
+  const [fSubCat, setFSubCat] = useState<string>(""); // subcategory filter ("" = all)
   const [limit, setLimit] = useState(PAGE);
   const [editing, setEditing] = useState<Transaction | null>(null);
   const [showForm, setShowForm] = useState(false);
@@ -54,6 +56,37 @@ export function Expenses() {
     [state.transactions],
   );
 
+  // Category / subcategory filter. Selecting a PARENT matches it AND its subcategories;
+  // selecting a subcategory narrows to exactly that. Archived categories are included
+  // (labelled) so transactions tagged with a now-archived/merged-away category stay
+  // filterable. Alphabetical by name.
+  const catFilterOptions = useMemo(
+    () => [
+      { value: "", label: "All categories" },
+      ...state.categories
+        .filter((c) => !c.parentId)
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((c) => ({ value: c.id, label: c.archived ? `${c.name} (archived)` : c.name })),
+    ],
+    [state.categories],
+  );
+  // Collapse a stale selection (its category was deleted/merged) down to "all".
+  const catVal = fCat && state.categories.some((c) => c.id === fCat && !c.parentId) ? fCat : "";
+  const subFilterOptions = useMemo(
+    () =>
+      catVal
+        ? [
+            { value: "", label: "All subcategories" },
+            ...state.categories
+              .filter((c) => c.parentId === catVal)
+              .sort((a, b) => a.name.localeCompare(b.name))
+              .map((c) => ({ value: c.id, label: c.archived ? `${c.name} (archived)` : c.name })),
+          ]
+        : [],
+    [state.categories, catVal],
+  );
+  const subVal = fSubCat && subFilterOptions.some((o) => o.value === fSubCat) ? fSubCat : "";
+
   // Merge the year selection into the filter as inclusive date bounds.
   const effFilter = useMemo<TxnFilter>(() => {
     // Drop a filter value that no longer resolves, so the ledger + totals can't
@@ -67,9 +100,15 @@ export function Expenses() {
     if (f.personId && f.personId !== SHARED && !state.people.some((p) => p.id === f.personId)) {
       f = { ...f, personId: undefined };
     }
+    // Category filter → the set of category ids to match: a subcategory alone, or a
+    // parent PLUS all of its subcategories (both computed from the normalized values).
+    if (subVal) f = { ...f, categoryIds: [subVal] };
+    else if (catVal) {
+      f = { ...f, categoryIds: [catVal, ...state.categories.filter((c) => c.parentId === catVal).map((c) => c.id)] };
+    }
     const scoped = year ? { ...f, from: `${year}-01-01`, to: `${year}-12-31` } : f;
     return month ? { ...scoped, month } : scoped;
-  }, [filter, year, month, currencies, state.people]);
+  }, [filter, year, month, catVal, subVal, currencies, state.people, state.categories]);
   const rows = useMemo(
     () => sortByDateDesc(filterTransactions(state.transactions, effFilter)),
     [state.transactions, effFilter],
@@ -149,6 +188,29 @@ export function Expenses() {
         </div>
         <div className="w-40">
           <Select
+            value={catVal}
+            onChange={(v) => {
+              setFCat(v);
+              setFSubCat(""); // subcategories belong to a parent
+              setLimit(PAGE);
+            }}
+            options={catFilterOptions}
+          />
+        </div>
+        {subFilterOptions.length > 1 && (
+          <div className="w-40">
+            <Select
+              value={subVal}
+              onChange={(v) => {
+                setFSubCat(v);
+                setLimit(PAGE);
+              }}
+              options={subFilterOptions}
+            />
+          </div>
+        )}
+        <div className="w-40">
+          <Select
             value={filter.personId ?? ""}
             onChange={(v) => updateFilter({ personId: v || undefined })}
             options={[{ value: "", label: "All people" }, ...personOptions(state, true, undefined, true)]}
@@ -176,7 +238,7 @@ export function Expenses() {
       <Card className="flex flex-wrap items-center justify-between gap-2 py-3">
         <span className="text-sm font-medium text-slate-600">
           {periodLabel}
-          {filter.type || filter.personId || filter.currency || filter.text ? " (filtered)" : ""}
+          {filter.type || filter.personId || filter.currency || filter.text || catVal ? " (filtered)" : ""}
         </span>
         <div className="flex gap-4 text-sm">
           <span className="text-green-600">Income {formatMoney(totals.income, totals.base)}</span>

@@ -581,9 +581,9 @@ function CategoryForm({ initial, onClose }: { initial?: Category; onClose: () =>
   const hasChildren = initial ? state.categories.some((c) => c.parentId === initial.id) : false;
   // Eligible parents: any top-level category, never itself. Hide archived parents but
   // keep the currently-selected one visible.
-  const parents = state.categories.filter(
-    (c) => !c.parentId && c.id !== initial?.id && (!c.archived || c.id === parentId),
-  );
+  const parents = state.categories
+    .filter((c) => !c.parentId && c.id !== initial?.id && (!c.archived || c.id === parentId))
+    .sort(byName);
 
   const [err, setErr] = useState<string | null>(null);
 

@@ -1385,18 +1385,21 @@ section("[transactions] excludeFromReports keeps a transaction out of income/exp
   );
 }
 
-section("[helpers] categoryOptions: shared top-level categories (no kind); subcategories & archived excluded");
+section("[helpers] categoryOptions: shared top-level list, alphabetical by name, sentinel first");
 {
+  // Stored out of alphabetical order on purpose, to prove the sort.
   const cats: Category[] = [
-    { id: "grocery", name: "Groceries" },
-    { id: "salary", name: "Salary" },
-    { id: "sub", name: "Sub", parentId: "grocery" }, // subcategory: not a top-level option
+    { id: "zoo", name: "Zoo" },
+    { id: "apple", name: "Apple" },
+    { id: "mango", name: "Mango" },
+    { id: "sub", name: "Sub", parentId: "apple" }, // subcategory: not a top-level option
     { id: "arch", name: "Old", archived: true }, // archived: hidden from the picker
   ];
   const state = { categories: cats } as unknown as PortfolioState;
-  const vals = categoryOptions(state).map((o) => o.value);
-  ok(vals[0] === "", "first option is Uncategorized (empty value)");
-  ok(vals.includes("grocery") && vals.includes("salary"), "top-level categories offered regardless of income/expense");
+  const opts = categoryOptions(state);
+  eq(opts[0]!.value, "", "first option is Uncategorized (empty value) — sentinel stays first");
+  eq(opts.slice(1).map((o) => o.label).join(","), "Apple,Mango,Zoo", "top-level categories sorted alphabetically by name");
+  const vals = opts.map((o) => o.value);
   ok(!vals.includes("sub"), "subcategory is not offered as a top-level option");
   ok(!vals.includes("arch"), "archived category excluded");
   ok(categoryOptions(state, "arch").map((o) => o.value).includes("arch"), "keepId re-includes an archived category");
@@ -1413,6 +1416,20 @@ section("[transactions] filterTransactions month predicate composes with date bo
   eq(ids({ from: "2026-01-01", to: "2026-12-31", month: "03" }), "a,d", "month within a year (composes with bounds)");
   eq(ids({ from: "2026-01-01", to: "2026-12-31" }), "a,b,d", "year bounds only → all months of that year");
   eq(ids({}), "a,b,c,d", "no filter → all");
+}
+
+section("[transactions] filterTransactions categoryIds matches any id in the set (parent + its children)");
+{
+  const t = (id: string, categoryId?: string): Transaction => ({
+    id, date: "2026-01-01", type: "expense", accountId: "A", personId: "p1", amount: 1, currency: "USD", categoryId, updatedAt: "",
+  });
+  const txns = [t("a", "food"), t("b", "dining"), t("c", "salary"), t("d", undefined)];
+  const ids = (f: TxnFilter): string => filterTransactions(txns, f).map((x) => x.id).sort().join(",");
+  eq(ids({ categoryIds: ["food", "dining"] }), "a,b", "parent + its subcategory ids both match");
+  eq(ids({ categoryIds: ["dining"] }), "b", "a single subcategory matches exactly");
+  eq(ids({ categoryIds: ["salary"] }), "c", "an unrelated category matches only itself");
+  eq(ids({ categoryIds: ["nope"] }), "", "no member matches → empty");
+  eq(filterTransactions(txns, { categoryIds: ["food"] }).some((x) => x.id === "d"), false, "uncategorized txn excluded by a category filter");
 }
 
 done();
