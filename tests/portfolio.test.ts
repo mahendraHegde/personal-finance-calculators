@@ -13,7 +13,7 @@ import {
   portfolioReturn,
   withFdAccrual,
 } from "../src/features/portfolio/domain/holdings";
-import { accountBalances, accountBalancesByPerson, netWorth, totalReturn } from "../src/features/portfolio/domain/networth";
+import { accountBalances, accountBalancesByPerson, netWorth, sumAccountBalances, totalReturn } from "../src/features/portfolio/domain/networth";
 import { categoryTotals, filterTransactions, flowSummary, monthlyTotals, type TxnFilter } from "../src/features/portfolio/domain/transactions";
 import {
   autopayId,
@@ -21,7 +21,7 @@ import {
   isAutopayTransaction,
   planAutopayReconcile,
 } from "../src/features/portfolio/domain/autopay";
-import { categoryOptions, composeAccountExtras } from "../src/features/portfolio/ui/helpers";
+import { accountOptions, categoryOptions, composeAccountExtras, personOptions } from "../src/features/portfolio/ui/helpers";
 import type { PortfolioState } from "../src/features/portfolio/state/store";
 import { accruedInterest, compoundValue } from "../src/lib/money/interest";
 import { xirr, type Cashflow } from "../src/lib/money/xirr";
@@ -1430,6 +1430,47 @@ section("[transactions] filterTransactions categoryIds matches any id in the set
   eq(ids({ categoryIds: ["salary"] }), "c", "an unrelated category matches only itself");
   eq(ids({ categoryIds: ["nope"] }), "", "no member matches → empty");
   eq(filterTransactions(txns, { categoryIds: ["food"] }).some((x) => x.id === "d"), false, "uncategorized txn excluded by a category filter");
+}
+
+section("[networth] cross-currency transfer credits the explicit transferToAmount (bypasses FX)");
+{
+  const accounts: Account[] = [
+    { id: "usd", name: "USD", type: "bank", currency: "USD", personId: "p1" },
+    { id: "thb", name: "THB", type: "bank", currency: "THB", personId: "p1" },
+  ];
+  // 100 USD out of the USD account; exactly 3450 THB credited to the THB account.
+  const txns: Transaction[] = [
+    { id: "t1", date: "2026-01-01", type: "transfer", accountId: "usd", transferToAccountId: "thb", personId: "p1", amount: 100, currency: "USD", transferToAmount: 3450, updatedAt: "" },
+  ];
+  // No FX table passed — the explicit target amount must still credit verbatim.
+  const bal = sumAccountBalances(accountBalancesByPerson(accounts, txns));
+  eq(bal.get("usd") ?? 0, -100, "source debited 100 in its own (USD) currency");
+  eq(bal.get("thb") ?? 0, 3450, "dest credited the explicit 3450 THB, not an FX conversion");
+  // Same-currency transfer (no transferToAmount) still credits the raw amount.
+  const same: Transaction[] = [
+    { id: "t2", date: "2026-01-01", type: "transfer", accountId: "usd", transferToAccountId: "thb", personId: "p1", amount: 50, currency: "USD", updatedAt: "" },
+  ];
+  const acc2: Account[] = [accounts[0]!, { ...accounts[1]!, currency: "USD" }];
+  const bal2 = sumAccountBalances(accountBalancesByPerson(acc2, same));
+  eq(bal2.get("thb") ?? 0, 50, "same-currency transfer credits the source amount as before");
+}
+
+section("[helpers] account & person dropdowns sort alphabetically (Shared sentinel first)");
+{
+  const state = {
+    accounts: [
+      { id: "z", name: "Zeta", type: "bank", currency: "USD", personId: "p1" },
+      { id: "a", name: "Alpha", type: "bank", currency: "USD", personId: "p1" },
+    ],
+    people: [
+      { id: "p2", name: "Bob" },
+      { id: "p1", name: "Ann" },
+    ],
+  } as unknown as PortfolioState;
+  eq(accountOptions(state).map((o) => o.label.split(" ")[0]).join(","), "Alpha,Zeta", "accounts sorted A→Z by name");
+  const p = personOptions(state).map((o) => o.label);
+  eq(p[0], "Shared", "Shared sentinel stays first");
+  eq(p.slice(1).join(","), "Ann,Bob", "people sorted A→Z after Shared");
 }
 
 done();

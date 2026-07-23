@@ -196,6 +196,7 @@ export function personOptions(
 ): Array<{ value: string; label: string }> {
   const opts = state.people
     .filter((p) => includeArchived || live(p.archived, p.id, keepId))
+    .sort((a, b) => a.name.localeCompare(b.name))
     .map((p) => ({ value: p.id, label: p.archived ? `${p.name} (archived)` : p.name }));
   return includeShared ? [{ value: SHARED, label: "Shared" }, ...opts] : opts;
 }
@@ -206,6 +207,7 @@ export function accountOptions(
 ): Array<{ value: string; label: string }> {
   return state.accounts
     .filter((a) => live(a.archived, a.id, keepId))
+    .sort((a, b) => a.name.localeCompare(b.name))
     .map((a) => ({ value: a.id, label: accountLabel(state, a, { currency: true }) }));
 }
 
@@ -220,6 +222,7 @@ export function holdingAccountOptions(
 ): Array<{ value: string; label: string }> {
   return state.accounts
     .filter((a) => a.type !== "creditcard" && a.type !== "liability" && live(a.archived, a.id, keepId))
+    .sort((a, b) => a.name.localeCompare(b.name))
     .map((a) => ({ value: a.id, label: accountLabel(state, a, { currency: true }) }));
 }
 
@@ -309,7 +312,7 @@ export function eventsByHolding(state: PortfolioState): Map<string, HoldingEvent
   return map;
 }
 
-export const CURRENCY_CHOICES = ["USD", "INR", "CLP", "EUR", "GBP", "AED", "THB", "SGD"];
+export const CURRENCY_CHOICES = ["AED", "CLP", "EUR", "GBP", "INR", "SGD", "THB", "USD"];
 
 /** Categorical colour palette for charts/legends. */
 export const PALETTE = [

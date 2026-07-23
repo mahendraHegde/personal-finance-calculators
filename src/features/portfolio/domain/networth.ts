@@ -30,6 +30,12 @@ const ACCOUNT_ASSET_CLASS: Partial<Record<AccountType, AssetClass>> = {
  *  rather than credit a mis-scaled amount. Centralised so the conversion rule lives
  *  in one place (the balance rollup and `accountTxnDelta`). */
 function transferCredit(t: Transaction, dest: Account, fx?: FxTable): number | null {
+  // An explicit destination amount (cross-currency transfer where the user gave the
+  // target amount / rate) is the truth — credit it verbatim in the dest currency, no FX
+  // needed (so it also never goes null for want of a rate).
+  if (t.transferToAmount !== undefined && Number.isFinite(t.transferToAmount)) {
+    return t.transferToAmount;
+  }
   if (fx && dest.currency !== t.currency) {
     return tryConvert({ amount: t.amount, currency: t.currency }, dest.currency, fx);
   }

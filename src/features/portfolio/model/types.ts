@@ -108,6 +108,11 @@ export interface Transaction {
   note?: string;
   /** For transfers: the destination account. */
   transferToAccountId?: ID;
+  /** For a CROSS-CURRENCY transfer: the exact amount credited to the destination, in the
+   *  DESTINATION account's currency (the user's target amount / applied rate). When set it
+   *  is the truth — the destination is credited this verbatim, bypassing FX conversion.
+   *  Omitted for same-currency transfers (the source `amount` is credited as-is). */
+  transferToAmount?: number;
   /** Reporting-only: when true this transaction is EXCLUDED from account balances
    *  & net worth, but still counts in income/expense reports. For importing past
    *  expenses that are already reflected in your current balance — recording them

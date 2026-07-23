@@ -297,6 +297,14 @@ export function Expenses() {
                   >
                     {t.type === "expense" ? "−" : t.type === "income" ? "+" : ""}
                     {formatMoney(t.amount, t.currency)}
+                    {t.type === "transfer" && t.transferToAmount !== undefined
+                      ? (() => {
+                          const d = state.accounts.find((a) => a.id === t.transferToAccountId);
+                          return d ? (
+                            <span className="font-normal text-slate-400"> → {formatMoney(t.transferToAmount, d.currency)}</span>
+                          ) : null;
+                        })()
+                      : null}
                   </div>
                 </li>
               );
@@ -367,6 +375,12 @@ function TransactionForm({
   );
   const [subCat, setSubCat] = useState(initialCat?.parentId ? initialCat.id : "");
   const [transferTo, setTransferTo] = useState(initial?.transferToAccountId ?? "");
+  // Cross-currency transfer: the destination amount, "" = follow the FX-suggested value.
+  // Both the Rate and Target-amount fields write through to it; reset when either account
+  // changes so the suggestion re-derives in the new destination currency.
+  const [destOverride, setDestOverride] = useState<string | null>(
+    initial?.transferToAmount !== undefined ? String(initial.transferToAmount) : null,
+  );
   const [note, setNote] = useState(initial?.note ?? "");
   const [excludeFromBalance, setExcludeFromBalance] = useState(initial?.excludeFromBalance ?? false);
 
@@ -376,29 +390,45 @@ function TransactionForm({
   const selectAccount = (id: string): void => {
     setAccountId(id);
     const acc = state.accounts.find((a) => a.id === id);
-    if (acc) {
-      setPersonId(acc.personId);
-      // A transfer's two legs share one amount, so both accounts must use the
-      // same currency. Clear a now-mismatched destination.
-      const dest = state.accounts.find((a) => a.id === transferTo);
-      if (dest && dest.currency !== acc.currency) setTransferTo("");
-    }
+    if (acc) setPersonId(acc.personId);
+    setDestOverride(null); // the source currency may have changed → re-suggest the target
   };
 
-  // Same-currency destinations only (cross-currency would post the source
-  // amount to a different-currency account and corrupt balances).
+  // Any other account can receive a transfer; a different-currency destination makes it a
+  // CROSS-CURRENCY transfer (the target amount / rate is entered below). Sorted by name.
   const transferTargets = state.accounts
-    .filter((a) => a.id !== accountId && a.currency === currency)
+    .filter((a) => a.id !== accountId)
+    .sort((a, b) => a.name.localeCompare(b.name))
     .map((a) => ({ value: a.id, label: accountLabel(state, a, { currency: true }) }));
 
   const amountNum = Number(amount);
+
+  // --- Cross-currency transfer: destination amount + conversion rate, prefilled from FX ---
+  const dest = state.accounts.find((a) => a.id === transferTo);
+  const isCrossCurrency = type === "transfer" && !!dest && dest.currency !== currency;
+  const round = (n: number, dp: number): string => String(Math.round(n * 10 ** dp) / 10 ** dp);
+  // Live rate: 1 source-unit = ? dest-units (null when no rate is available).
+  const fxRate = isCrossCurrency && dest ? tryConvert({ amount: 1, currency }, dest.currency, state.fx) : null;
+  // While the user hasn't overridden it, the target is source × the live rate.
+  const suggestedDest =
+    isCrossCurrency && fxRate !== null && Number.isFinite(amountNum) && amountNum > 0 ? amountNum * fxRate : null;
+  const shownDest = destOverride ?? (suggestedDest !== null ? round(suggestedDest, 2) : "");
+  const destNum = Number(shownDest);
+  const shownRate =
+    Number.isFinite(amountNum) && amountNum > 0 && Number.isFinite(destNum) && destNum > 0
+      ? round(destNum / amountNum, 6)
+      : fxRate !== null
+        ? round(fxRate, 6)
+        : "";
   const canSave =
     accountId !== "" &&
     date !== "" && // a transaction must be dated (the date field holds a partial silently)
     amount.trim() !== "" &&
     Number.isFinite(amountNum) && // rejects "", Infinity, NaN ("1e999", "1.2.3")
     amountNum > 0 &&
-    (type !== "transfer" || (transferTo !== "" && transferTo !== accountId));
+    (type !== "transfer" || (transferTo !== "" && transferTo !== accountId)) &&
+    // A cross-currency transfer must have a positive destination amount.
+    (!isCrossCurrency || (Number.isFinite(destNum) && destNum > 0));
   const save = (): void => {
     if (!canSave) return;
     onSave({
@@ -413,6 +443,8 @@ function TransactionForm({
       currency,
       categoryId: type === "transfer" ? undefined : leafCategoryId,
       transferToAccountId: type === "transfer" ? transferTo || undefined : undefined,
+      // Cross-currency: store the exact destination amount so the credit bypasses FX.
+      transferToAmount: isCrossCurrency ? destNum : undefined,
       note: note || undefined,
       // Reporting-only (historical) transactions don't move account balances.
       // Not applicable to transfers.
@@ -462,13 +494,39 @@ function TransactionForm({
           <Select value={accountId} onChange={selectAccount} options={accountOptions(state, accountId)} />
         </Field>
         {type === "transfer" ? (
-          <Field label="To account">
-            <Select
-              value={transferTo}
-              onChange={setTransferTo}
-              options={[{ value: "", label: "Select destination…" }, ...transferTargets]}
-            />
-          </Field>
+          <>
+            <Field label="To account">
+              <Select
+                value={transferTo}
+                onChange={(v) => {
+                  setTransferTo(v);
+                  setDestOverride(null); // re-suggest the target in the new destination currency
+                }}
+                options={[{ value: "", label: "Select destination…" }, ...transferTargets]}
+              />
+            </Field>
+            {isCrossCurrency && dest && (
+              <div className="grid grid-cols-2 gap-3">
+                <Field label={`Rate (1 ${currency} = ? ${dest.currency})`} hint="Prefilled from live FX; edit either field.">
+                  <NumberInput
+                    value={shownRate}
+                    onChange={(v) => {
+                      const r = Number(v);
+                      setDestOverride(
+                        v.trim() !== "" && Number.isFinite(r) && Number.isFinite(amountNum) && amountNum > 0
+                          ? round(amountNum * r, 2)
+                          : "",
+                      );
+                    }}
+                    placeholder="rate"
+                  />
+                </Field>
+                <Field label={`Target amount (${dest.currency})`}>
+                  <NumberInput value={shownDest} onChange={setDestOverride} placeholder="amount received" />
+                </Field>
+              </div>
+            )}
+          </>
         ) : (
           <>
             <Field label="Person">

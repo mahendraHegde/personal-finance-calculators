@@ -22,7 +22,7 @@ import {
 type EntityKind = "person" | "account" | "category";
 type Entity = Person | Account | Category;
 
-const byName = (a: Category, b: Category): number => a.name.localeCompare(b.name);
+const byName = <T extends { name: string }>(a: T, b: T): number => a.name.localeCompare(b.name);
 
 const ACCOUNT_TYPES: AccountType[] = [
   "bank",
@@ -127,7 +127,7 @@ export function Accounts() {
           <EmptyState>Add the people whose finances you track.</EmptyState>
         ) : (
           <ul className="divide-y divide-slate-100 text-sm">
-            {state.people.map((p) => (
+            {[...state.people].sort(byName).map((p) => (
               <li key={p.id} {...rowProps(() => setForm({ kind: "person", rec: p }))}>
                 <span className={nameCls(p.archived)}>{p.name}</span>
                 {actions("person", p)}
@@ -148,7 +148,7 @@ export function Accounts() {
           <EmptyState>Add bank, cash, brokerage, or liability accounts.</EmptyState>
         ) : (
           <ul className="divide-y divide-slate-100 text-sm">
-            {state.accounts.map((a) => (
+            {[...state.accounts].sort(byName).map((a) => (
               <li key={a.id} {...rowProps(() => setForm({ kind: "account", rec: a }))}>
                 <span className={nameCls(a.archived)}>
                   {a.name}{" "}

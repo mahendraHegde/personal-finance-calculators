@@ -505,7 +505,7 @@ export function Investments() {
                   options={[
                     { value: "all", label: "All owners" },
                     { value: SHARED, label: "Shared" },
-                    ...state.people.map((p) => ({ value: p.id, label: p.name })),
+                    ...[...state.people].sort((a, b) => a.name.localeCompare(b.name)).map((p) => ({ value: p.id, label: p.name })),
                   ]}
                 />
               </div>
@@ -1206,6 +1206,7 @@ function SettleFdModal({
     .filter(
       (a) => a.type !== "creditcard" && a.type !== "liability" && (!a.archived || a.id === holding.accountId),
     )
+    .sort((a, b) => a.name.localeCompare(b.name))
     .map((a) => ({ value: a.id, label: accountLabel(state, a, { currency: true }) }));
   const [toAccountId, setToAccountId] = useState<string>(() => {
     const preferred = holding.accountId && accounts.some((o) => o.value === holding.accountId) ? holding.accountId : "";
