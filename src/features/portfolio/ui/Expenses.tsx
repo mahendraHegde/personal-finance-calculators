@@ -7,7 +7,7 @@ import { newId } from "../../../lib/util/id";
 import { filterTransactions, flowSummary, sortByDateDesc, type TxnFilter } from "../domain/transactions";
 import { isAutopayTransaction } from "../domain/autopay";
 import { usePortfolio } from "../state/context";
-import type { Transaction, TxnType } from "../model/types";
+import type { Category, Transaction, TxnType } from "../model/types";
 import { SHARED } from "../model/types";
 import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, TextInput } from "./components";
 import {
@@ -72,19 +72,23 @@ export function Expenses() {
   );
   // Collapse a stale selection (its category was deleted/merged) down to "all".
   const catVal = fCat && state.categories.some((c) => c.id === fCat && !c.parentId) ? fCat : "";
-  const subFilterOptions = useMemo(
-    () =>
-      catVal
-        ? [
-            { value: "", label: "All subcategories" },
-            ...state.categories
-              .filter((c) => c.parentId === catVal)
-              .sort((a, b) => a.name.localeCompare(b.name))
-              .map((c) => ({ value: c.id, label: c.archived ? `${c.name} (archived)` : c.name })),
-          ]
-        : [],
-    [state.categories, catVal],
-  );
+  // Subcategories are directly filterable — the dropdown is always available whenever any
+  // subcategory exists (not gated behind picking a parent). With a parent selected it lists
+  // that parent's children by plain name; with NO parent it lists EVERY subcategory,
+  // labelled "Parent › Sub" so you can pick one without first drilling into its parent.
+  const subFilterOptions = useMemo(() => {
+    const label = (c: Category): string => {
+      const base = c.archived ? `${c.name} (archived)` : c.name;
+      if (catVal) return base;
+      const parent = state.categories.find((p) => p.id === c.parentId);
+      return parent ? `${parent.name} › ${base}` : base;
+    };
+    const subs = state.categories
+      .filter((c) => c.parentId !== undefined && (catVal ? c.parentId === catVal : true))
+      .map((c) => ({ value: c.id, label: label(c) }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    return subs.length > 0 ? [{ value: "", label: "All subcategories" }, ...subs] : [];
+  }, [state.categories, catVal]);
   const subVal = fSubCat && subFilterOptions.some((o) => o.value === fSubCat) ? fSubCat : "";
 
   // Merge the year selection into the filter as inclusive date bounds.
@@ -238,7 +242,7 @@ export function Expenses() {
       <Card className="flex flex-wrap items-center justify-between gap-2 py-3">
         <span className="text-sm font-medium text-slate-600">
           {periodLabel}
-          {filter.type || filter.personId || filter.currency || filter.text || catVal ? " (filtered)" : ""}
+          {filter.type || filter.personId || filter.currency || filter.text || catVal || subVal ? " (filtered)" : ""}
         </span>
         <div className="flex gap-4 text-sm">
           <span className="text-green-600">Income {formatMoney(totals.income, totals.base)}</span>
