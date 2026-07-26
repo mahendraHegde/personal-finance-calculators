@@ -27,6 +27,44 @@ export function formatMoney(amount: number, currency: CurrencyCode): string {
   }
 }
 
+/** How many decimal places this number actually needs (0 for integers, capped at 6). */
+function significantDecimals(amount: number): number {
+  if (Number.isInteger(amount)) return 0;
+  const s = String(Math.abs(amount));
+  // Exponential notation ("1.5e-7") has a dot but no counted decimals — check for the exponent
+  // FIRST, or the digits of the mantissa get mistaken for decimal places.
+  if (s.includes("e") || s.includes("E")) return 2;
+  const dot = s.indexOf(".");
+  if (dot < 0) return 2;
+  return Math.min(6, s.length - dot - 1);
+}
+
+/** Money with every stored digit intact — for SIDE-BY-SIDE COMPARISON (a sync conflict, a
+ *  diff row), never for dashboards.
+ *
+ *  `formatMoney` drops the cents above 1000, which is right when a number is being READ and
+ *  wrong when it is being CHOSEN: 1240.20 and 1240.40 both render "US$1,240", so two
+ *  genuinely different values look identical — nothing to choose between — and the figure
+ *  shown isn't the one that gets adopted. */
+export function formatMoneyExact(amount: number, currency: CurrencyCode): string {
+  if (!Number.isFinite(amount)) return "—";
+  const locale = localeFor(currency);
+  // A fractional amount always shows at least the cents ("$1,240.20", not "$1,240.2"), while a
+  // whole one gains no noise digits.
+  const needed = significantDecimals(amount);
+  const digits = needed === 0 ? 0 : Math.max(2, needed);
+  try {
+    return new Intl.NumberFormat(locale, {
+      style: "currency",
+      currency,
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    }).format(amount);
+  } catch {
+    return `${amount.toLocaleString(locale, { maximumFractionDigits: digits })} ${currency}`;
+  }
+}
+
 /** Compact form for big dashboard numbers (e.g. $1.2M; ₹9.9L / ₹1.2Cr for INR). */
 export function formatCompactMoney(amount: number, currency: CurrencyCode): string {
   if (!Number.isFinite(amount)) return "—";

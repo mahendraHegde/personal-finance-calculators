@@ -10,6 +10,7 @@ import { usePortfolio } from "../state/context";
 import type { Category, Transaction, TxnType } from "../model/types";
 import { SHARED } from "../model/types";
 import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, TextInput } from "./components";
+import { ImportTransactions } from "./ImportTransactions";
 import {
   accountLabel,
   accountLabelById,
@@ -42,6 +43,7 @@ export function Expenses() {
   const [limit, setLimit] = useState(PAGE);
   const [editing, setEditing] = useState<Transaction | null>(null);
   const [showForm, setShowForm] = useState(false);
+  const [showImport, setShowImport] = useState(false);
 
   // Years present in the data, plus the current year, newest first.
   const years = useMemo(() => {
@@ -236,6 +238,9 @@ export function Expenses() {
             placeholder="Search notes…"
           />
         </div>
+        <Button variant="ghost" onClick={() => setShowImport(true)}>
+          Import CSV
+        </Button>
         <Button onClick={openNew}>+ Add</Button>
       </div>
 
@@ -324,6 +329,8 @@ export function Expenses() {
           </Button>
         </div>
       )}
+
+      {showImport && <ImportTransactions onClose={() => setShowImport(false)} />}
 
       {showForm && (
         <TransactionForm

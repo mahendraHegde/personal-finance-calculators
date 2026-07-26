@@ -1,7 +1,7 @@
 // Import historical investments from a broker / mutual-fund CSV. Everything runs
 // in the browser — the file never leaves the device. Flow: upload + target →
 // map columns/actions → REVIEW a detailed diff (per holding before→after) → apply.
-// The merge/dedup logic is the pure engine in domain/import-holdings; this is only
+// The merge/dedup logic is the pure engine in domain/import/holdings; this is only
 // the mapping UI + the review screen.
 
 import { useMemo, useState } from "react";
@@ -9,17 +9,19 @@ import { formatMoney, todayIso } from "../../../lib/util/format";
 import { parseCsvTable, type CsvTable } from "../../../lib/util/csv";
 import {
   detectDayFirst,
+  guessColumn,
   planImport,
   toCanonicalRows,
   type ActionMap,
   type ColumnMap,
   type ImportPlan,
   type SkippedRow,
-} from "../domain/import-holdings";
+} from "../domain/import/holdings";
 import { usePortfolio } from "../state/context";
 import type { CurrencyCode } from "../../../lib/money/currency";
 import type { AssetClass, Owner } from "../model/types";
 import { Badge, Button, Field, Modal, Select, Stepper } from "./components";
+import { ColumnMapGrid, type ColumnSpec } from "./ImportShared";
 import { accountOptions, CURRENCY_CHOICES, personOptions } from "./helpers";
 
 const ASSET_CLASS_OPTS: Array<{ value: AssetClass; label: string }> = [
@@ -42,8 +44,20 @@ const ACTION_OPTS: Array<{ value: Act; label: string }> = [
   { value: "ignore", label: "Ignore" },
 ];
 
-const guessCol = (headers: string[], kws: string[]): string =>
-  headers.find((h) => kws.some((k) => h.toLowerCase().includes(k))) ?? "";
+/** "Which column is which" for a broker/fund export — rendered by the shared grid. */
+const HOLDING_COLUMN_SPECS: Array<ColumnSpec<keyof ColumnMap>> = [
+  { key: "date", label: "Date *", hint: "When the transaction happened." },
+  { key: "action", label: "Type / action *", hint: "What the row is: buy, sell, dividend… (mapped below)." },
+  { key: "symbol", label: "Security / symbol *", hint: "The stock ticker or fund name. Rows are grouped into holdings by this." },
+  { key: "name", label: "Name (optional)", hint: "A friendlier display name, if your file has one." },
+  { key: "units", label: "Units / quantity", hint: "Shares or fund units transacted." },
+  { key: "price", label: "Price / NAV", hint: "Price per share/unit." },
+  { key: "amount", label: "Amount", hint: "Total money for the row. Needed if there's no price." },
+  { key: "fee", label: "Fee (optional)", hint: "Brokerage/commission/tax on the row." },
+  { key: "currency", label: "Currency (optional)", hint: "3-letter code (USD, INR). Falls back to the default." },
+  { key: "ref", label: "Order / reference id (optional)", hint: "Helps detect duplicates on re-import." },
+  { key: "assetType", label: "Security type (optional)", hint: "e.g. Equity, Bond — used to guess each holding's type." },
+];
 
 function guessAction(v: string): "buy" | "sell" | "dividend" | "ignore" {
   const s = v.toLowerCase();
@@ -103,19 +117,19 @@ export function ImportHoldings({ onClose }: { onClose: () => void }) {
       setTable(t);
       setFileName(file.name);
       const h = t.headers;
-      const dateCol = guessCol(h, ["date"]);
+      const dateCol = guessColumn(h, ["date"]);
       setCol({
         date: dateCol,
-        action: guessCol(h, ["type", "action", "transaction", "txn type"]),
-        symbol: guessCol(h, ["symbol", "ticker", "scheme", "fund", "security", "isin", "name"]),
-        name: guessCol(h, ["name", "description", "scheme"]),
-        units: guessCol(h, ["unit", "qty", "quantity", "shares"]),
-        price: guessCol(h, ["price", "nav", "rate"]),
-        amount: guessCol(h, ["amount", "value", "net", "consideration"]),
-        fee: guessCol(h, ["fee", "charge", "commission", "brokerage", "tax", "stt"]),
-        currency: guessCol(h, ["currency", "ccy"]),
-        ref: guessCol(h, ["order", "txn id", "transaction id", "ref", "folio", "confirmation"]),
-        assetType: guessCol(h, ["security type", "sec type", "asset type", "asset class", "instrument type", "product type"]),
+        action: guessColumn(h, ["type", "action", "transaction", "txn type"]),
+        symbol: guessColumn(h, ["symbol", "ticker", "scheme", "fund", "security", "isin", "name"]),
+        name: guessColumn(h, ["name", "description", "scheme"]),
+        units: guessColumn(h, ["unit", "qty", "quantity", "shares"]),
+        price: guessColumn(h, ["price", "nav", "rate"]),
+        amount: guessColumn(h, ["amount", "value", "net", "consideration"]),
+        fee: guessColumn(h, ["fee", "charge", "commission", "brokerage", "tax", "stt"]),
+        currency: guessColumn(h, ["currency", "ccy"]),
+        ref: guessColumn(h, ["order", "txn id", "transaction id", "ref", "folio", "confirmation"]),
+        assetType: guessColumn(h, ["security type", "sec type", "asset type", "asset class", "instrument type", "product type"]),
       });
       // Auto-detect day-first vs month-first from the actual dates (so a US month-first
       // export like Schwab imports correctly without the user touching the toggle). A new
@@ -382,38 +396,19 @@ export function ImportHoldings({ onClose }: { onClose: () => void }) {
                 “Security” is the stock/fund identifier we group by; “Type” is what each row did (buy, sell, etc.).
               </p>
             </div>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              {(
-                [
-                  ["date", "Date *", "When the transaction happened."],
-                  ["action", "Type / action *", "What the row is: buy, sell, dividend… (mapped below)."],
-                  ["symbol", "Security / symbol *", "The stock ticker or fund name. Rows are grouped into holdings by this."],
-                  ["name", "Name (optional)", "A friendlier display name, if your file has one."],
-                  ["units", "Units / quantity", "Shares or fund units transacted."],
-                  ["price", "Price / NAV", "Price per share/unit."],
-                  ["amount", "Amount", "Total money for the row. Needed if there's no price."],
-                  ["fee", "Fee (optional)", "Brokerage/commission/tax on the row."],
-                  ["currency", "Currency (optional)", "3-letter code (USD, INR). Falls back to the default."],
-                  ["ref", "Order / reference id (optional)", "Helps detect duplicates on re-import."],
-                  ["assetType", "Security type (optional)", "e.g. Equity, Bond — used to guess each holding's type."],
-                ] as Array<[keyof ColumnMap, string, string]>
-              ).map(([key, label, hint]) => (
-                <Field key={key} label={label} hint={hint}>
-                  <Select
-                    value={col[key]}
-                    onChange={(v) => {
-                      setCol((c) => ({ ...c, [key]: v }));
-                      if (key === "action") setActions({});
-                      if (key === "date" && v && !dayFirstTouched) {
-                        const d = detectDayFirst(table.rows.map((r) => r[v] ?? ""));
-                        if (d !== null) setDayFirst(d);
-                      }
-                    }}
-                    options={[{ value: "", label: "— none —" }, ...table.headers.map((h) => ({ value: h, label: h }))]}
-                  />
-                </Field>
-              ))}
-            </div>
+            <ColumnMapGrid
+              specs={HOLDING_COLUMN_SPECS}
+              headers={table.headers}
+              value={col}
+              onChange={(key, v) => {
+                setCol((c) => ({ ...c, [key]: v }));
+                if (key === "action") setActions({});
+                if (key === "date" && v && !dayFirstTouched) {
+                  const d = detectDayFirst(table.rows.map((r) => r[v] ?? ""));
+                  if (d !== null) setDayFirst(d);
+                }
+              }}
+            />
             {!columnMap && (
               <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700">
                 To continue, map <b>Date</b>, <b>Type</b>, <b>Security</b>, and either an <b>Amount</b> column or both <b>Units</b> and <b>Price</b>.

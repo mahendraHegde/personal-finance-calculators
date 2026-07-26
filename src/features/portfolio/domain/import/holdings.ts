@@ -12,12 +12,23 @@
 //  - Full transparency: the plan carries each holding's before/after units, cost,
 //    and value so the UI can show an exact diff and the user confirms before write.
 
-import { isoFromParts } from "../../../lib/util/date";
-import type { CsvTable } from "../../../lib/util/csv";
-import type { CurrencyCode } from "../../../lib/money/currency";
-import type { AssetClass, Holding, HoldingEvent, Owner, PriceSource } from "../model/types";
-import { newId } from "../../../lib/util/id";
-import { currentHoldingValue, holdingPnl, netUnits, withFdAccrual } from "./holdings";
+import type { CsvTable } from "../../../../lib/util/csv";
+import {
+  detectDayFirst,
+  guessColumn,
+  IGNORE_VALUE,
+  NEW_ENTITY,
+  norm as normalise,
+  parseImportDate,
+  parseImportNumber,
+} from "./common";
+// Re-exported so existing importers/tests can keep importing them from here while the
+// implementations live once in import-common.
+export { detectDayFirst, guessColumn, IGNORE_VALUE, NEW_ENTITY, parseImportDate, parseImportNumber };
+import type { CurrencyCode } from "../../../../lib/money/currency";
+import type { AssetClass, Holding, HoldingEvent, Owner, PriceSource } from "../../model/types";
+import { newId } from "../../../../lib/util/id";
+import { currentHoldingValue, holdingPnl, netUnits, withFdAccrual } from "../holdings";
 
 // --- Canonical row --------------------------------------------------------
 
@@ -84,110 +95,6 @@ export function guessAssetClass(raw: string | undefined): AssetClass | null {
  *  (CoinGecko). The user can change the source per holding afterward. */
 export function defaultPriceSource(assetClass: AssetClass): PriceSource | undefined {
   return assetClass === "crypto" ? "coingecko" : "googlefinance";
-}
-
-/** Parse a numeric cell for EN/INR-formatted numbers (dot = decimal, comma =
- *  thousands, incl. Indian lakh grouping). Strips currency symbols/spaces and reads
- *  (1,234) as -1234. Crucially it REJECTS (returns null) rather than silently
- *  mangles anything ambiguous — EU decimals ("1.234,56"), scientific ("1e3"), or
- *  other letters — because a mis-parsed amount corrupts the ledger. */
-export function parseImportNumber(raw: string): number | null {
-  if (raw == null) return null;
-  let s = raw.trim();
-  if (s === "") return null;
-  let neg = false;
-  if (/^\(.*\)$/.test(s)) {
-    neg = true;
-    s = s.slice(1, -1);
-  }
-  s = s.replace(/[₹$€£\s]/g, ""); // currency symbols + whitespace only
-  if (s.startsWith("-")) {
-    neg = true;
-    s = s.slice(1);
-  }
-  if (/[a-zA-Z]/.test(s)) return null; // "1e3", "USD100", "N/A" → reject, don't strip-and-guess
-  const hasDot = s.includes(".");
-  const hasComma = s.includes(",");
-  if (hasDot && hasComma) {
-    // Whichever separator is LAST is the decimal. Last-comma = EU decimal → reject.
-    if (s.lastIndexOf(",") > s.lastIndexOf(".")) return null;
-    s = s.replace(/,/g, ""); // EN: comma is thousands
-  } else if (hasComma) {
-    // Only commas: accept ONLY genuine EN/INR grouping, where the FINAL group is
-    // always exactly 3 digits — all-3-digit (US: 1,234,567) or Indian lakh
-    // (2-digit groups then a 3-digit tail: 1,23,456). A 2-digit final group ("12,50",
-    // "1,234,56") is an EU decimal → reject rather than mangle it ×100.
-    if (!/^\d{1,3}((,\d{3})+|(,\d{2})+,\d{3})$/.test(s)) return null;
-    s = s.replace(/,/g, "");
-  }
-  if (!/^\d*\.?\d+$/.test(s)) return null; // must now be plain digits(.digits)
-  const n = Number(s);
-  if (!Number.isFinite(n)) return null;
-  return neg ? -n : n;
-}
-
-const MONTHS: Record<string, number> = {
-  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
-  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
-};
-
-/** Parse a date cell to ISO yyyy-mm-dd, or null. Handles ISO (yyyy-mm-dd),
- *  dd-Mon-yyyy / dd Mon yyyy (unambiguous), and numeric d/m/y or m/d/y separated by
- *  / - or . — the numeric case uses `dayFirst` to resolve the d-vs-m ambiguity. */
-export function parseImportDate(raw: string, dayFirst = true): string | null {
-  if (raw == null) return null;
-  const s = raw.trim();
-  if (s === "") return null;
-  // ISO first.
-  const iso = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/.exec(s);
-  if (iso) return validIso(Number(iso[1]), Number(iso[2]), Number(iso[3]));
-  // dd-Mon-yyyy / dd Mon yyyy.
-  const mon = /^(\d{1,2})[-\s/]([A-Za-z]{3,})[-\s/](\d{2,4})/.exec(s);
-  if (mon) {
-    const m = MONTHS[mon[2].slice(0, 3).toLowerCase()];
-    if (m) return validIso(fullYear(Number(mon[3])), m, Number(mon[1]));
-    return null;
-  }
-  // Numeric d/m/y (or m/d/y).
-  const num = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})/.exec(s);
-  if (num) {
-    const a = Number(num[1]);
-    const b = Number(num[2]);
-    const y = fullYear(Number(num[3]));
-    const [dd, mm] = dayFirst ? [a, b] : [b, a];
-    return validIso(y, mm, dd);
-  }
-  return null;
-}
-function fullYear(y: number): number {
-  return y < 100 ? (y >= 70 ? 1900 + y : 2000 + y) : y;
-}
-function validIso(y: number, m: number, d: number): string | null {
-  if (![y, m, d].every(Number.isInteger)) return null;
-  if (y < 1900 || y > 9999 || m < 1 || m > 12 || d < 1 || d > 31) return null;
-  const iso = isoFromParts(y, m, d);
-  // isoFromParts clamps an out-of-range day; reject rather than silently shift.
-  return iso.endsWith(`-${String(d).padStart(2, "0")}`) ? iso : null;
-}
-
-/** Sniff whether a column of numeric dates is day-first (DD/MM) or month-first
- *  (MM/DD) by finding a component that can ONLY be a day (>12). Returns true
- *  (day-first), false (month-first), or null when every value is ambiguous (both
- *  parts ≤12) or the signals conflict — the caller then keeps the user's choice.
- *  ISO and dd-Mon-yyyy values are unambiguous and ignored here. This lets a US
- *  broker export (Schwab, MM/DD) import correctly without the user flipping a toggle. */
-export function detectDayFirst(samples: string[]): boolean | null {
-  let dayFirst = false; // saw a first component > 12 → must be day-first
-  let monthFirst = false; // saw a second component > 12 → must be month-first
-  for (const raw of samples) {
-    const m = /^(\d{1,2})[-/.](\d{1,2})[-/.]\d{2,4}/.exec((raw ?? "").trim());
-    if (!m) continue;
-    if (Number(m[1]) > 12) dayFirst = true;
-    if (Number(m[2]) > 12) monthFirst = true;
-  }
-  if (dayFirst && !monthFirst) return true;
-  if (monthFirst && !dayFirst) return false;
-  return null; // all ambiguous, or contradictory (bad data) → leave the choice to the user
 }
 
 /** A row that couldn't become an event, with the reason and a few identifying raw
@@ -372,8 +279,8 @@ export interface ImportContext {
   asOf: string;
 }
 
-const NEW = "__new__";
-const norm = (s: string): string => s.trim().toLowerCase();
+const NEW = NEW_ENTITY; // "create a new holding" sentinel (shared across importers)
+const norm = normalise;
 /** A ticker's core with any EXCHANGE prefix ("NSE:", "MUTF_IN:") stripped, normalised.
  *  Lets a stored "NSE:INFY" match a file's raw "INFY" (and vice-versa) when matching.
  *  Only a real exchange-code-shaped prefix (letters/underscore, no spaces) is stripped,

@@ -12,7 +12,7 @@ import {
   toCanonicalRows,
   type CanonicalRow,
   type ImportContext,
-} from "../src/features/portfolio/domain/import-holdings";
+} from "../src/features/portfolio/domain/import/holdings";
 import { createMemoryStorage } from "../src/lib/storage/memory-adapter";
 import { SCHEMA } from "../src/features/portfolio/model/schema";
 import { createPortfolioStore } from "../src/features/portfolio/state/store";

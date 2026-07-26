@@ -9,6 +9,38 @@ import { latestSnapshot, type Codec } from "../../../lib/sync/types";
 import { SyncEngine } from "../../../lib/sync/engine";
 import { diffDatasets, type DatasetDiff } from "../../../lib/sync/diff";
 import {
+  applyChoices,
+  baselineClaim,
+  planMerge,
+  snapshotKey,
+  unincorporatedFiles,
+  type ConflictChoice,
+  type MergePlan,
+} from "../../../lib/sync/merge";
+import type { VersionFingerprint } from "./store";
+
+/** A previewed merge: the plan the user reviews, plus the version bookkeeping the commit
+ *  needs (see previewMerge). Passed back to commitMerge unchanged. */
+export interface MergePreview {
+  doc: SnapshotDoc;
+  plan: MergePlan;
+  /** PERSISTED version bookkeeping when the plan was computed — revalidated inside the write
+   *  lock. Persisted (not in-memory) so a second tab's writes are visible to the check. */
+  base: VersionFingerprint;
+  /** Remote version this merge reconciles, or null when it can't be safely acknowledged.
+   *  Only an OPTIMISATION now (it prunes the seen-log); publishability rests on `seenKey`. */
+  seenRemoteVersion: number | null;
+  /** `<fileId>@<version>` of the snapshot being merged — recorded even when the watermark
+   *  can't move, so successive merges accumulate until nothing is outstanding. */
+  seenKey: string | null;
+  /** Other files still holding data this merge did NOT incorporate. When > 0 the merge stays
+   *  local and the user must reconcile those too — surfaced so the UI can say which. */
+  outstandingOthers: number;
+  /** Why this merge can't be published yet, so the UI explains the RIGHT reason rather than
+   *  blaming the folder listing for every case. `null` = it can be. */
+  ackBlocked: "outstanding" | "unavailable" | null;
+}
+import {
   createDekCodec,
   createEncryptedCodec,
   createPlainCodec,
@@ -86,6 +118,24 @@ export interface RemoteCheck {
   doc: SnapshotDoc;
   version: number;
   diff: DatasetDiff;
+  /** Provider file id of the snapshot that was loaded. A merge needs it: acknowledging a
+   *  version is only safe if the file we actually merged IS the outstanding one, and
+   *  `loadLatest` can hand back THIS device's own file (it picks by version then savedAt). */
+  fileId: string;
+  /** PERSISTED version bookkeeping when the diff was computed, revalidated inside the write lock.
+   *
+   *  Replacing is a full overwrite, and the confirm window is unbounded. The UI's own staleness
+   *  check reads THIS tab's in-memory state, which cannot see a sibling tab — so a second tab's
+   *  never-pushed rows were deleted silently, exactly as they were on the merge path before it
+   *  carried `expect`. */
+  base: VersionFingerprint;
+  /** True when the PERSISTED row shows unsynced work (any tab's), so the dialog warns even when
+   *  this tab's in-memory `dirty` is false. */
+  hasLocalChanges: boolean;
+  /** Other snapshots that would STILL be unincorporated after loading this one. Non-zero means
+   *  loading it must not advance the synced watermark (it would jump those files), and the dialog
+   *  has to say the reconciliation isn't finished — the old wording promised the opposite. */
+  outstandingOthers: number;
 }
 
 export class SyncController {
@@ -531,13 +581,127 @@ export class SyncController {
     // still-v1 folder (it can't Pull without a codec). If we ALSO have unsynced local
     // edits, that's a genuine conflict we can't auto-merge → refuse (recoverable: an
     // up-to-date device migrates the folder, then this one joins via the keyring).
-    if (folderDoc && guardMax > this.store.getState().settings.lastSyncedVersion) {
-      if (this.store.getState().dirty) {
+    let adoptedLatest = false;
+    // The fingerprint AND the data in one lock, so both checks below read the same reality.
+    const { fingerprint: preAdopt } = await this.store.exportWithFingerprint();
+    // Is the folder's newest file simply OUR OWN last push? A crash between a successful push and
+    // `markSynced` leaves exactly that: our file at the folder max, our watermark one behind. Its
+    // content came from this database, so there is nothing to adopt and nothing at risk — but the
+    // "unsynced changes" refusal fired on it and threw on EVERY unlock, so the device could never
+    // migrate and had no way out (the message told a single-device user to "sync on an up-to-date
+    // device first"). Bounded by version, so a file AHEAD of us — a diverged clone, or our own
+    // push followed by further local edits — is not waved through.
+    const latestIsOurOwn =
+      !!latest && latest.deviceId === this.store.getState().settings.deviceId && latest.version <= preAdopt.localVersion;
+    if (folderDoc && guardMax > preAdopt.lastSyncedVersion && !latestIsOurOwn) {
+      // "Unsynced changes" read from the PERSISTED row, not this tab's memory. The app stays
+      // editable while locked and nothing propagates state between tabs, so a second tab can be
+      // recording expenses while this one sits on the unlock screen: in-memory `dirty` was false,
+      // the refusal never fired, and the replace below deleted that tab's rows — then the
+      // baseline superseded them folder-wide.
+      if (preAdopt.localVersion > preAdopt.lastSyncedVersion) {
         throw new Error(
           "This device has unsynced changes and the shared folder has newer data — sync on an up-to-date device first, then unlock here.",
         );
       }
-      await this.store.applyDocument(folderDoc); // adopt the folder's latest v1 data → now current
+      // Record WHICH file we adopted — its data is provably ours now, and without the key it
+      // would stay flagged as unincorporated and block this device's baseline push.
+      //
+      // `expect` for the same reason the union loop below carries one: this is a full replace, so
+      // a write landing between the read and the write (the other tab again, an autopay
+      // reconcile) would be absent from what we adopt and invisible to the check.
+      await this.store.applyDocument(folderDoc, {
+        seenSnapshotKey: latest ? snapshotKey(latest) : undefined,
+        expect: preAdopt,
+      }); // adopt the folder's latest v1 data → now current
+      adoptedLatest = true;
+    }
+
+    // Every file AT `guardMax` must be accounted for before the baseline declares that version
+    // superseded. A version COLLISION means several files share it and none is "the latest" —
+    // each can hold records the others lack — and we still hold the v1 codec, so unioning them
+    // needs no user step.
+    //
+    // `latest` is in this loop too whenever the adopt above did NOT run (we weren't behind, or
+    // the file isn't decodable v1). Claiming its key unconditionally was silent data loss: with
+    // `guardMax === lastSyncedVersion` — a peer's concurrent push landing after our TOCTOU
+    // re-list — or with a latest in a format we can't read at all, the baseline published
+    // straight over a file whose rows were never read, and the claim defeated the very hazard
+    // rule meant to catch it.
+    //
+    // The set is files at `guardMax` PLUS every hazard above our watermark — not just the
+    // collision set. `bumpVersionAbove(guardMax)` moves the watermark to `guardMax`, which
+    // supersedes a peer file sitting BETWEEN our old watermark and it; those rows were never read
+    // and would be lost with no prompt (confirmed by probe, and it happens with a foreign max too,
+    // so it long predates this loop). Unioning such a file can resurrect rows deleted since —
+    // merging never deletes — but that is recoverable by deleting them again, whereas losing a
+    // peer's only copy is not. Files strictly BELOW our watermark are genuinely superseded and are
+    // deliberately NOT unioned, so no ancient deletions come back.
+    //
+    // Anything we cannot decode or fetch is left UNRECORDED, so the ordinary push guard keeps
+    // protecting it — a blocked push beats a silent overwrite.
+    const incorporated: string[] = adoptedLatest && latest ? [snapshotKey(latest)] : [];
+    const unreadable: { key: string; reason: "format" | "error" }[] = [];
+    let mustAccountCount = 0;
+    if (this.provider) {
+      const stored = await this.store.persistedSyncState();
+      const deviceId = stored.deviceId;
+      const seenAlready = new Set(stored.seenSnapshots);
+      const own = { deviceId, version: Math.max(stored.localVersion, stored.lastSyncedVersion) };
+      const hazards = unincorporatedFiles(metas, preAdopt.lastSyncedVersion, seenAlready, own);
+      const mustAccount = [
+        ...new Map(
+          [...metas.filter((m) => m.version === guardMax), ...hazards].map((m) => [m.id, m]),
+        ).values(),
+      ].filter((m) => !(adoptedLatest && m.id === latest?.id));
+      mustAccountCount = mustAccount.length + (adoptedLatest && latest ? 1 : 0);
+      for (const file of mustAccount) {
+        const key = snapshotKey(file);
+        if (baselineClaim(file, { own, seen: seenAlready }) !== "must-read") {
+          incorporated.push(key); // ours (same database), or already incorporated
+          continue;
+        }
+        try {
+          const bytes = await this.provider.download(file.id);
+          if (encryptedFormat(bytes) !== "pfdb-v1") {
+            unreadable.push({ key, reason: "format" }); // not ours to read → leave it guarded
+            continue;
+          }
+          const doc = await v1codec.decode(bytes);
+          // Fingerprint WITH the data, and revalidated inside the write lock: this is a full
+          // replace, so a write landing between the read and the write (another tab, an autopay
+          // reconcile) would otherwise be absent from the plan and invisible to the check —
+          // deleted silently.
+          const { doc: local, fingerprint } = await this.store.exportWithFingerprint();
+          const merged = applyChoices(planMerge(local.data, doc.data), {});
+          await this.store.applyDocument(
+            { schemaVersion: local.schemaVersion, version: Math.max(local.version, doc.version), data: merged },
+            { dirty: true, seenSnapshotKey: key, expect: fingerprint },
+          );
+          incorporated.push(key);
+        } catch {
+          // Undecodable, unreachable, or raced by a concurrent write → don't claim it.
+          unreadable.push({ key, reason: "error" });
+        }
+      }
+    }
+
+    // STOP HERE if anything at the floor is unaccounted for — before minting a keyring.
+    //
+    // Leaving it unclaimed is the right call (a blocked push beats a silent overwrite), but
+    // letting the migration FINISH around it was a trap: the keyring was minted and adopted and
+    // `vaultKdf` cleared, so this device held only a v2 codec while a v1 file blocked its every
+    // push. "Pull latest" cannot decode that file, re-unlocking no longer re-runs the migration
+    // (the keyring is now set), and the error even blamed another device for still upgrading — a
+    // permanently dead sync whose only exit was deleting the file in Drive by hand. One transient
+    // 503 was enough. Refusing instead leaves the device on v1, forks no DEK, and stays
+    // retryable.
+    if (incorporated.length < mustAccountCount) {
+      throw new Error(
+        unreadable.some((u) => u.reason === "format")
+          ? "One of the shared folder's snapshots was written by a different version of this app, so the encryption upgrade was not started here. Update this device (or finish the upgrade on the device that wrote it), then unlock again."
+          : "Couldn't read one of the shared folder's snapshots just now, so the encryption upgrade was not started — nothing has changed. Check the connection and unlock again.",
+      );
     }
 
     // Reuse the legacy salt for the KEK (no need to change it) — the DEK is fresh.
@@ -552,7 +716,11 @@ export class SyncController {
     // Floor the baseline at the version our guard validated (NOT a fresh re-list):
     // if a snapshot landed after the guard, runSync's own pull-before-push guard
     // then catches it instead of us silently superseding it.
-    await this.publishBaseline(guardMax);
+    // Only the keys of files we ACTUALLY incorporated, from the SAME listing the guard validated
+    // (not a fresh one) — so a snapshot that landed afterwards, or a sibling we couldn't decode,
+    // is left to runSync's own guard rather than silently superseded. Our own files, and
+    // everything strictly below the floor, need no key.
+    await this.publishBaseline(guardMax, incorporated);
   }
 
   /** Verify a legacy v1 key against the latest v1 snapshot (or the local sentinel).
@@ -595,12 +763,21 @@ export class SyncController {
    *  migration's current-device guard), pass it so a snapshot that lands AFTER that
    *  check isn't silently marked superseded — runSync's own pull-before-push guard
    *  then catches it. Omit (deliberate reset) to supersede everything now present. */
-  private async publishBaseline(floor?: number): Promise<void> {
+  private async publishBaseline(floor?: number, supersededKeys?: readonly string[]): Promise<void> {
     this.refreshPhase(); // engine now seals with the (new) DEK; new dekId → fresh session file
     if (!this.engine || !this.provider) return; // no folder → local IS the source of truth
     this.sessionVerified = true; // our DEK is authoritative for this new baseline
-    const max = floor ?? (await this.engine.list()).reduce((m, x) => Math.max(m, x.version), 0);
-    await this.store.bumpVersionAbove(max);
+    let max = floor;
+    let keys = supersededKeys;
+    if (max === undefined) {
+      // No caller-validated floor → this listing defines both the floor AND what is superseded.
+      const metas = await this.engine.list();
+      max = metas.reduce((m, x) => Math.max(m, x.version), 0);
+      keys = metas.map(snapshotKey);
+    }
+    // The keys matter as much as the floor: since a file AT the watermark counts as a hazard,
+    // a baseline that recorded only the number could never be published.
+    await this.store.bumpVersionAbove(max, keys ?? []);
     await this.syncNow();
   }
 
@@ -759,7 +936,9 @@ export class SyncController {
     // propagate (never reset blind).
     if (this.provider) {
       const folderMax = (await this.provider.list()).reduce((m, x) => Math.max(m, x.version), 0);
-      if (folderMax > this.store.getState().settings.lastSyncedVersion) {
+      // Stored watermark: a sibling tab may have pulled since this tab loaded, and refusing a
+      // reset on a stale reading sends the user down a recovery path they don't need.
+      if (folderMax > (await this.store.persistedSyncState()).lastSyncedVersion) {
         throw new Error(
           "This device's data is behind the shared folder, so resetting here would lose the newer changes. " +
             "Reset from a device that's up to date, or use “Change password” on a device that's still unlocked (keeps everything). " +
@@ -994,18 +1173,39 @@ export class SyncController {
           sessionFileId = null;
         }
       }
-      // Everything EXCEPT this session's own file. A file written by any other
-      // session — another device, OR another TAB on this same browser profile
-      // (which shares this device's id via persisted settings but is a genuinely
-      // independent writer) — is a potential concurrent edit. We deliberately do
-      // NOT narrow this to other-device files: doing so let two tabs on one profile
-      // overwrite each other silently (each invisible to the other's guard). In
-      // normal operation our own prior-session files sit at version <= lastSynced
-      // (we wrote them), so they don't trip the guard below. The one exception — a
-      // crash BETWEEN a successful push and markSynced can leave an own file ABOVE
-      // lastSynced — trips a benign, REVIEWED "Pull latest" that loads our own data
-      // and converges. The guard never silently overwrites, so that is safe.
+      // Everything EXCEPT this session's own file. Which of those count as HAZARDS is decided by
+      // `unincorporatedFiles`, which also excuses files bearing THIS deviceId — so this comment
+      // no longer says what it used to ("we deliberately do NOT narrow this to other-device
+      // files"); that rule is gone and the reasoning has changed:
+      //
+      //  - For real tabs the exemption is sound: tabs share one IndexedDB and `exportDocument`
+      //    reads the DATABASE, so any tab's push already carries every tab's rows — and the
+      //    cross-tab write lock closes the interleaving window that once let two tabs clobber
+      //    each other. It also drops a false alarm: a crash between a successful push and
+      //    `markSynced` leaves our own file above the watermark, which used to demand a
+      //    pointless "review" of our own data and now simply re-publishes.
+      //  - It is NOT sound for a CLONED profile (a copied IndexedDB keeps the deviceId while the
+      //    data diverges), so the exemption is BOUNDED BY VERSION: a file carrying our deviceId is
+      //    excused only up to the version this database has actually reached. A twin that edited
+      //    and pushed past us sits above that, so the guard still fires and its rows get reviewed.
       const others = metas.filter((m) => m.id !== sessionFileId);
+
+      // Was the vault ROTATED under us by another tab? Tabs share the settings row, and a
+      // settings write now (correctly) reads that row — so this tab's `state.settings` can hold
+      // ANOTHER tab's freshly rotated keyring while `this.codec` still seals with our OLD DEK.
+      // Both keyring checks compare against those same settings, so neither can notice, and
+      // `sessionVerified`/`keyringEnsured` were latched true earlier in the session. Left alone,
+      // this tab publishes a snapshot nobody — including itself after a reload — can decode,
+      // taking the whole shared folder down with no in-app recovery.
+      //
+      // `engineDekId` is the DEK id our codec was actually built for, so a mismatch means the
+      // row moved on without us: force the verification below to run, which fails against the
+      // folder's new baseline and asks for the passphrase instead of publishing.
+      const storedDekId = this.store.getState().settings.vaultKeyring?.dekId ?? null;
+      if (this.codec && storedDekId !== null && storedDekId !== this.engineDekId) {
+        this.sessionVerified = false;
+        this.keyringEnsured = false;
+      }
 
       // Backstop: never push under a key that can't decrypt the folder's
       // existing data (guards against any stale/mismatched codec slipping
@@ -1066,8 +1266,23 @@ export class SyncController {
       // it; the lone exception is a post-push/pre-markSynced crash leaving an own
       // file above lastSynced, which here fires a benign reviewed Pull of our own
       // data (no silent overwrite either way).
-      const lastSynced = this.store.getState().settings.lastSyncedVersion;
-      if (remoteMax > lastSynced) {
+      // Not `remoteMax > lastSynced`: a scalar watermark can't express "I merged that file",
+      // so a device holding two files above our mark could never be cleared and the merge was
+      // unpublishable forever, with the destructive replace as the only exit. A file is a
+      // hazard only if it is unincorporated — see unincorporatedFiles for the three
+      // subsumption rules.
+      // EVERY input from the PERSISTED row, not this tab's memory. A sibling tab's merge or pull
+      // updates the shared database and the stored log; judging from stale memory re-flags a file
+      // that tab already incorporated, the guard refuses, and since that path returns without
+      // scheduling a retry (autosave is gated on `phase === "ready"`) this tab silently stops
+      // syncing until a reload. The same staleness once made our OWN file look like a clone.
+      const sync = await this.store.persistedSyncState();
+      const lastSynced = sync.lastSyncedVersion;
+      const unmerged = unincorporatedFiles(others, lastSynced, new Set(sync.seenSnapshots), {
+        deviceId: sync.deviceId,
+        version: Math.max(sync.localVersion, sync.lastSyncedVersion),
+      });
+      if (unmerged.length > 0) {
         this.set({
           phase: "error",
           message: "Remote has newer changes — Pull latest and review before syncing.",
@@ -1102,7 +1317,10 @@ export class SyncController {
         return;
       }
 
-      await this.store.markSynced(meta.version);
+      // Prune the acknowledgement log to files the folder still holds — otherwise it is bounded
+      // only by a cap, and past the cap the oldest acknowledgement is dropped and the guard can
+      // never clear. `after` is the post-push listing (our own files are exempt by deviceId).
+      await this.store.markSynced(meta.version, after.map(snapshotKey));
       // Record this session's file id (only now, on confirmed success) so a
       // refresh resumes it rather than minting a new file.
       this.persistSession();
@@ -1148,8 +1366,32 @@ export class SyncController {
   async checkRemote(): Promise<RemoteCheck | null> {
     if (!this.engine) throw new Error("sync not ready");
     let loaded;
+    let outstandingOthers = 0;
     try {
-      loaded = await this.engine.loadLatest();
+      // Target the newest file that still needs reconciling, NOT unconditionally the folder's
+      // max. Versions are monotonic per device, so a device can hold an unmerged file BELOW
+      // the max; always loading the max made that file unreachable — merging the max changed
+      // nothing, it stayed outstanding, and the guard refused forever. Falls back to the max
+      // once nothing is outstanding (the plain catch-up / acknowledge case).
+      const metas = await this.engine.list();
+      const sync = await this.store.persistedSyncState(); // stored, not this tab's memory
+      const others = metas.filter((m) => m.id !== this.engine?.getSessionFileId());
+      const own = {
+        deviceId: sync.deviceId,
+        version: Math.max(sync.localVersion, sync.lastSyncedVersion),
+      };
+      const unmerged = unincorporatedFiles(others, sync.lastSyncedVersion, new Set(sync.seenSnapshots), own);
+      const target = latestSnapshot(unmerged.length > 0 ? unmerged : metas);
+      loaded = target ? await this.engine.loadFile(target) : null;
+      // Everything that would remain unread after loading `target`.
+      outstandingOthers = target
+        ? unincorporatedFiles(
+            others.filter((m) => m.id !== target.id),
+            sync.lastSyncedVersion,
+            new Set(sync.seenSnapshots),
+            own,
+          ).length
+        : 0;
     } catch (e) {
       // If the latest is a legacy v1 file, another device hasn't finished the
       // encryption upgrade — our DEK-only codec can't decode it. Its edit isn't lost
@@ -1166,20 +1408,196 @@ export class SyncController {
       throw e;
     }
     if (!loaded) return null;
-    const local = await this.store.exportDocument();
+    // Data AND fingerprint in one lock, so the diff the user approves and the check that gates
+    // the write describe the same reality.
+    const { doc: local, fingerprint } = await this.store.exportWithFingerprint();
     return {
       doc: loaded.doc,
       version: loaded.meta.version,
       diff: diffDatasets(local.data, loaded.doc.data),
+      fileId: loaded.meta.id,
+      outstandingOthers,
+      base: fingerprint,
+      hasLocalChanges: fingerprint.localVersion > fingerprint.lastSyncedVersion,
     };
   }
 
-  async applyRemote(doc: SnapshotDoc): Promise<void> {
+  /**
+   * PLAN a merge of the remote snapshot into local data — pure, nothing is written. The
+   * caller shows `conflicts` (records both devices changed differently) for the user to
+   * decide on, then passes this SAME preview to `commitMerge`. Splitting preview from
+   * commit is what lets the UI ask about conflicts instead of resolving them silently.
+   *
+   * The preview also captures the version bookkeeping the commit needs:
+   *  - `base`: local version/lastSynced when the plan was computed. `commitMerge`
+   *    re-verifies these INSIDE its lock, because the plan is committed after an unbounded
+   *    user-interaction window and the write is a full replace — anything written locally
+   *    in between (a second tab, the hourly FX refresh triggering autopay reconcile) would
+   *    otherwise be silently deleted rather than merged.
+   *  - `seenRemoteVersion`: the remote version this merge reconciles, recorded so the push
+   *    guard stops refusing. It is null when ANOTHER remote file shares the folder's max
+   *    version: that sibling has NOT been merged, so claiming to have seen its version
+   *    would silently supersede it — the guard must keep firing until it's merged too.
+   */
+  async previewMerge(doc: SnapshotDoc, docFileId?: string): Promise<MergePreview> {
+    // Data AND its fingerprint together, in one lock. Captured separately, a write landing
+    // between them would be both absent from the plan and invisible to the commit-time check,
+    // so committing the plan would delete it silently.
+    const { doc: local, fingerprint: base } = await this.store.exportWithFingerprint();
+    const plan = planMerge(local.data, doc.data);
+    const watermark = base.lastSyncedVersion;
+    const seenKey = docFileId ? snapshotKey({ id: docFileId, version: doc.version }) : null;
+
+    // Can this merge be PUBLISHED once committed? The push guard refuses while any file may
+    // still hold records we've never read, so the honest condition is "nothing unincorporated
+    // is left once this file is recorded".
+    //
+    // Recording the FILE (`seenKey`) rather than only a version is what makes this converge:
+    //  - three devices, files A@4 and B@5, our mark at 3 — merging B@5 can't move a scalar
+    //    watermark past A@4, so the old code left the merge unpublishable forever; now each
+    //    merge records its own file and the second one clears the guard;
+    //  - a version COLLISION can't be misread: `loadLatest` picks by version then savedAt and
+    //    doesn't skip our own file, so a device is sometimes handed ITS OWN snapshot. Keying by
+    //    file id means acknowledging that says nothing about a sibling's unmerged rows at the
+    //    same version number.
+    let seenRemoteVersion: number | null = null;
+    let outstandingOthers = 0;
+    let ackBlocked: MergePreview["ackBlocked"] = null;
+    if (!this.engine) {
+      // No folder configured/reachable at all: we cannot see what else exists, so we make no
+      // claim. (An engine that lists an EMPTY folder is different — that IS evidence.)
+      ackBlocked = "unavailable";
+      return { doc, plan, base, seenRemoteVersion, seenKey, outstandingOthers, ackBlocked };
+    }
+    try {
+      const sessionFileId = this.engine.getSessionFileId();
+      const files = await this.engine.list();
+      const others = files.filter((f) => f.id !== sessionFileId);
+      // The acknowledgement log from STORAGE too: `base` is persisted, but a sibling tab's merge
+      // records a key that this tab's memory would not have.
+      const sync = await this.store.persistedSyncState();
+      const seen = new Set(sync.seenSnapshots);
+      if (seenKey) seen.add(seenKey); // what this merge is about to incorporate
+      const outstanding = unincorporatedFiles(others, watermark, seen, {
+        deviceId: sync.deviceId,
+        version: Math.max(local.version, sync.localVersion, sync.lastSyncedVersion),
+      });
+      outstandingOthers = outstanding.length;
+      if (outstanding.length > 0) {
+        ackBlocked = "outstanding";
+      } else {
+        // Nothing can hold unseen data any more, so the watermark may move up to the folder's
+        // max — but only to a version the folder ACTUALLY contains. Advancing it to the merged
+        // doc's own number (a backup file's, say) would claim to have superseded remote
+        // versions that were never there, and a later push at a lower number would then slip
+        // past the guard. Purely an optimisation: it prunes the seen-log, and publishability
+        // rests on `outstanding` either way.
+        const folderMax = files.reduce((m, f) => Math.max(m, f.version), 0);
+        seenRemoteVersion = folderMax > watermark ? folderMax : null;
+      }
+    } catch {
+      // Listing failed: we can't tell what else is out there. The merge is still saved
+      // locally, and the push guard re-checks the folder when it next succeeds — so this is
+      // "unknown", not "refused", and must not be reported as another device's doing.
+      seenRemoteVersion = null;
+      ackBlocked = "unavailable";
+    }
+    return {
+      doc,
+      plan,
+      base,
+      seenRemoteVersion,
+      seenKey,
+      outstandingOthers,
+      ackBlocked,
+    };
+  }
+
+  /**
+   * Commit a previewed merge with the user's per-conflict choices. Everything that didn't
+   * clash is already unioned in the plan; `choices` only redirects the conflicts.
+   *
+   * The result is DIRTY (nobody has this combination yet) AND marked as having seen the
+   * remote it reconciled — both halves are required, or the push guard refuses forever and
+   * the merged data can never leave this device.
+   */
+  async commitMerge(
+    preview: MergePreview,
+    choices: Record<string, ConflictChoice> = {},
+  ): Promise<{ publishable: boolean }> {
+    return this.serialize(async () => {
+      const data = applyChoices(preview.plan, choices);
+      const local = await this.store.exportDocument();
+      await this.store.applyDocument(
+        {
+          // Our OWN schema version: `data` is a mix of local and remote records written by
+          // this build, so labelling it with the remote's would be a lie.
+          schemaVersion: local.schemaVersion,
+          version: Math.max(preview.doc.version, local.version),
+          data,
+        },
+        {
+          dirty: true,
+          seenRemoteVersion: preview.seenRemoteVersion ?? undefined,
+          seenSnapshotKey: preview.seenKey ?? undefined,
+          // Compare-and-apply against PERSISTED state, inside the same lock as the write.
+          // Checking here rather than out in this method is what makes it airtight: the write
+          // is a full replace, and a check performed before `exportDocument` can't see a write
+          // that lands during it, nor anything a SECOND TAB wrote (shared DB, separate state).
+          expect: preview.base,
+        },
+      );
+      this.refreshPhase(); // clear the conflict phase so autosave resumes
+      this.set({ message: "merged" });
+      // Honest about what happens next: with another unincorporated file still out there the
+      // push guard WILL refuse, so the UI must not promise "tap Sync now". A failed listing is
+      // reported separately — the merge is saved and the guard re-checks on the next attempt.
+      return { publishable: preview.ackBlocked === null };
+    });
+  }
+
+  async applyRemote(
+    doc: SnapshotDoc,
+    docFileId?: string,
+    outstandingOthers = 0,
+    expect?: VersionFingerprint,
+  ): Promise<void> {
     // Serialized against syncNow so a push can't be mid-flight when we replace
     // local data (which would otherwise interleave the controller's push
     // bookkeeping with applyDocument).
     await this.serialize(async () => {
-      await this.store.applyDocument(doc); // also records the synced version
+      // Record WHICH file this was, not just its version: a pull sets the watermark to
+      // `doc.version`, and another device's concurrent push can sit at exactly that number.
+      // Without the key, that sibling would look already-incorporated and we'd publish over it.
+      // L1: re-derive the outstanding count INSIDE the operation rather than trusting the one
+      // computed before the dialog opened. A peer file landing during the confirm window at a
+      // version between our watermark and this doc's would otherwise be subsumed with no merge
+      // ever offered. A failed listing keeps the conservative answer (hold the watermark).
+      let holdWatermark = outstandingOthers > 0;
+      if (this.engine) {
+        try {
+          const sync = await this.store.persistedSyncState();
+          const metas = await this.engine.list();
+          const others = metas.filter(
+            (m) => m.id !== this.engine?.getSessionFileId() && m.id !== docFileId,
+          );
+          holdWatermark =
+            unincorporatedFiles(others, sync.lastSyncedVersion, new Set(sync.seenSnapshots), {
+              deviceId: sync.deviceId,
+              version: Math.max(sync.localVersion, sync.lastSyncedVersion),
+            }).length > 0;
+        } catch {
+          holdWatermark = true;
+        }
+      }
+      await this.store.applyDocument(doc, {
+        seenSnapshotKey: docFileId ? snapshotKey({ id: docFileId, version: doc.version }) : undefined,
+        // With other files still unread, the watermark must stay put — the seen-key clears the one
+        // file we actually loaded, and nothing else.
+        holdWatermark,
+        // Compare-and-apply: this is a full replace and the review window is unbounded.
+        expect,
+      }); // also records the synced version
       // Re-derive the phase: a prior conflict / data-loss-guard / vault-mismatch
       // left phase="error", which gates out scheduleAutosave — so without this a
       // Pull that RESOLVES the conflict would leave autosave wedged forever and

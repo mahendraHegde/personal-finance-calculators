@@ -1,17 +1,22 @@
 // Settings: display currency, FX refresh + overrides, vault passphrase, local
 // encrypted backup/restore, and Google Drive shared-folder sync.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { fetchUsdRates } from "../../../lib/fx/fx-service";
 import { diffDatasets, type DatasetDiff } from "../../../lib/sync/diff";
+import { conflictKey } from "../../../lib/sync/merge";
+import type { Keyed } from "../../../lib/sync/diff";
+import { makeNameResolver, type DisplayContext, type RecordResolver } from "./merge-labels";
 import { isEncryptedFile } from "../../../lib/crypto/codec";
 import { formatDate, todayIso } from "../../../lib/util/format";
 import { usePortfolio, useSyncStatus } from "../state/context";
-import type { SyncPhase } from "../state/sync-controller";
+import type { PortfolioState } from "../state/store";
+import type { MergePreview, SyncPhase } from "../state/sync-controller";
 import type { ImportBatch, SnapshotDoc } from "../model/types";
 import { Badge, Button, Card, Field, Modal, NumberInput, Select, SectionTitle, TextInput } from "./components";
 import { CURRENCY_CHOICES } from "./helpers";
 import { DiffModal } from "./DiffModal";
+import { MergeModal } from "./MergeModal";
 
 // Plain-language labels for the internal sync phases (the user shouldn't see
 // raw ids like "no-vault" / "no-folder").
@@ -29,15 +34,62 @@ interface PendingLoad {
   version: number;
   diff: DatasetDiff;
   apply: () => Promise<void>;
+  /** Keep BOTH sides instead of replacing local. Absent for a backup restore (there the
+   *  user is deliberately rolling back to a file, not reconciling two live devices). */
+  merge?: () => Promise<void>;
+  /** From the backup-restore flow — changes the wording (a roll-back, not a catch-up). */
+  isRestore?: boolean;
+  /** Snapshots that will STILL be unreconciled after loading this one. The dialog must not call
+   *  that "bringing this device up to date". */
+  outstandingOthers?: number;
+  /** From the PERSISTED row, so a sibling tab's unsynced work is visible here too. */
+  hasLocalChanges?: boolean;
+}
+
+/** Name/value formatter for the diff dialog: looks records up in LOCAL state first, then in
+ *  the incoming snapshot, so ids from either side resolve to something readable. */
+function makeDisplay(state: PortfolioState, doc: SnapshotDoc): DisplayContext {
+  // Indexed, like MergeModal's resolver: a diff of a few thousand rows asks for many ids, and a
+  // pair of linear scans per lookup (local, then the snapshot) is quadratic in the diff size.
+  const index = new Map<string, Map<string, Keyed>>();
+  const add = (collection: string, records: readonly Keyed[]): void => {
+    let byId = index.get(collection);
+    if (!byId) {
+      byId = new Map();
+      index.set(collection, byId);
+    }
+    for (const r of records) if (!byId.has(r.id)) byId.set(r.id, r); // local wins over the snapshot
+  };
+  add("accounts", state.accounts);
+  add("categories", state.categories);
+  add("people", state.people);
+  add("holdings", state.holdings);
+  // `?? []` because the old resolver coerced a null/absent collection to an empty list, and
+  // `diffDatasets` tolerates one — so a snapshot with `{accounts: null}` would stage a diff and
+  // then throw at render time.
+  for (const [collection, records] of Object.entries(doc.data)) add(collection, (records ?? []) as Keyed[]);
+  const record: RecordResolver = (collection, id) => index.get(collection)?.get(id);
+  return { record, name: makeNameResolver(record) };
 }
 
 export function Settings() {
   const { state, store, sync } = usePortfolio();
   const status = useSyncStatus();
   const [busy, setBusy] = useState<string | null>(null);
-  const [msg, setMsg] = useState<string | null>(null);
+  // Messages carry a tone: a merge SUCCESS must not appear in the same amber banner used
+  // for thrown errors (it read as a warning).
+  const [msg, setMsg] = useState<{ text: string; tone: "info" | "error" } | null>(null);
   const [pending, setPending] = useState<PendingLoad | null>(null);
   const [restoreBytes, setRestoreBytes] = useState<Uint8Array | null>(null);
+  /** A previewed merge awaiting the user's conflict choices. Carries the version
+   *  bookkeeping commitMerge revalidates, so a stale plan can never be written. */
+  const [mergePlan, setMergePlan] = useState<MergePreview | null>(null);
+  // Built once per staged snapshot, not on every render (it indexes every account/category/
+  // person/holding on both sides).
+  const display = useMemo(
+    () => (pending ? makeDisplay(state, pending.doc) : undefined),
+    [pending, state],
+  );
 
   const run = async (label: string, fn: () => Promise<void>): Promise<void> => {
     setBusy(label);
@@ -45,7 +97,7 @@ export function Settings() {
     try {
       await fn();
     } catch (e) {
-      setMsg(String(e));
+      setMsg({ text: String(e), tone: "error" });
     } finally {
       setBusy(null);
     }
@@ -79,6 +131,7 @@ export function Settings() {
         doc,
         version: doc.version,
         diff: diffDatasets(local.data, doc.data),
+        isRestore: true,
         apply: async () => {
           // Restored state should be publishable, so keep it dirty.
           await store.applyDocument(doc, { dirty: true });
@@ -101,7 +154,15 @@ export function Settings() {
 
   return (
     <div className="space-y-6">
-      {msg && <div className="rounded-lg bg-amber-50 p-3 text-sm text-amber-800">{msg}</div>}
+      {msg && (
+        <div
+          className={`rounded-lg p-3 text-sm ${
+            msg.tone === "error" ? "bg-amber-50 text-amber-800" : "bg-blue-50 text-slate-700"
+          }`}
+        >
+          {msg.text}
+        </div>
+      )}
 
       <Card>
         <SectionTitle>Display currency</SectionTitle>
@@ -198,7 +259,7 @@ export function Settings() {
                 if (!drive.apiKey) throw new Error("enter the API key first");
                 sync.configureDrive(drive.clientId);
                 const folder = await sync.connectFolder(drive.apiKey);
-                if (folder) setMsg(`Connected folder: ${folder.name}`);
+                if (folder) setMsg({ text: `Connected folder: ${folder.name}`, tone: "info" });
               })
             }
           >
@@ -252,13 +313,15 @@ export function Settings() {
                   const baseSynced = b.settings.lastSyncedVersion;
                   const remote = await sync.checkRemote();
                   if (!remote) {
-                    setMsg("No snapshot in the folder yet.");
+                    setMsg({ text: "No snapshot in the folder yet.", tone: "info" });
                     return;
                   }
                   setPending({
                     doc: remote.doc,
                     version: remote.version,
                     diff: remote.diff,
+                    outstandingOthers: remote.outstandingOthers,
+                    hasLocalChanges: remote.hasLocalChanges,
                     apply: async () => {
                       const now = store.getState();
                       if (now.version !== baseV || now.settings.lastSyncedVersion !== baseSynced) {
@@ -266,7 +329,20 @@ export function Settings() {
                           "Your data changed since this preview — tap Pull latest again to review the current diff.",
                         );
                       }
-                      await sync.applyRemote(remote.doc);
+                      // `remote.base` is the real guard (persisted, revalidated in the write
+                      // lock); the in-memory check above is just a fast early exit.
+                      await sync.applyRemote(remote.doc, remote.fileId, remote.outstandingOthers, remote.base);
+                    },
+                    // Same staleness guard: the merge is computed from live local data, so a
+                    // local change while this modal sat open must invalidate the preview too.
+                    merge: async () => {
+                      const now = store.getState();
+                      if (now.version !== baseV || now.settings.lastSyncedVersion !== baseSynced) {
+                        throw new Error(
+                          "Your data changed since this preview — tap Pull latest again to review the current diff.",
+                        );
+                      }
+                      setMergePlan(await sync.previewMerge(remote.doc, remote.fileId));
                     },
                   });
                 })
@@ -282,11 +358,65 @@ export function Settings() {
         <DiffModal
           diff={pending.diff}
           remoteVersion={pending.version}
+          // Whether THIS device has edits it hasn't pushed. Decides whether replacing is a
+          // safe fast-forward or would discard local work.
+          hasLocalChanges={pending.hasLocalChanges ?? state.dirty}
+          isRestore={pending.isRestore}
+          // Resolve ids from BOTH sides: a category that exists only in the incoming snapshot
+          // must still render as a name, not a UUID.
+          display={display}
+          outstandingOthers={pending.outstandingOthers ?? 0}
           onCancel={() => setPending(null)}
           onConfirm={() => {
             const p = pending;
             setPending(null);
             void run("apply", () => p.apply());
+          }}
+          onMerge={
+            pending.merge
+              ? () => {
+                  const p = pending;
+                  setPending(null);
+                  void run("merge-preview", () => p.merge!());
+                }
+              : undefined
+          }
+        />
+      )}
+
+      {mergePlan && (
+        <MergeModal
+          plan={mergePlan.plan}
+          outstandingOthers={mergePlan.outstandingOthers}
+          ackUnavailable={mergePlan.ackBlocked === "unavailable"}
+          busy={busy === "merge"}
+          onCancel={() => setMergePlan(null)}
+          onConfirm={(choices) => {
+            const m = mergePlan;
+            void run("merge", async () => {
+              const { publishable } = await sync.commitMerge(m, choices);
+              setMergePlan(null);
+              const s = m.plan.summary;
+              const theirsChosen = m.plan.conflicts.filter(
+                (c) => (choices[conflictKey(c)] ?? c.suggestion) === "theirs",
+              ).length;
+              // State the OUTCOME in totals the user can verify against the app, and be
+              // explicit about how each conflict went — a merge must never be a black box.
+              setMsg({
+                tone: "info",
+                text:
+                  `Merged: ${s.totalAfter} items now, including ${s.onlyOther} added from the other device.` +
+                  (s.conflicts > 0
+                    ? ` ${s.conflicts} differed between the devices — you kept ${s.conflicts - theirsChosen} from this one and ${theirsChosen} from the other.`
+                    : "") +
+                  " Nothing was deleted (anything you'd deleted here but still on the other device has come back)." +
+                  (publishable
+                    ? " Tap Sync now to send the combined data to your other devices."
+                    : m.ackBlocked === "outstanding"
+                      ? ` It's saved on this device, but ${m.outstandingOthers} other snapshot${m.outstandingOthers === 1 ? "" : "s"} also ${m.outstandingOthers === 1 ? "holds" : "hold"} changes this merge didn't include, so it can't be published yet. Tap Pull latest and merge again to bring ${m.outstandingOthers === 1 ? "that one" : "those"} in too.`
+                      : " It's saved on this device. We couldn't check the shared folder just now, so Sync now will publish it as soon as the folder is reachable."),
+              });
+            });
           }}
         />
       )}
@@ -303,6 +433,7 @@ export function Settings() {
               doc,
               version: doc.version,
               diff: diffDatasets(local.data, doc.data),
+              isRestore: true, // same roll-back as doRestore — the wording must match
               apply: async () => {
                 await store.applyDocument(doc, { dirty: true });
                 if (adopt) await adopt();
@@ -669,8 +800,34 @@ function ImportHistoryCard() {
     void store.listImportBatches().then(setBatches);
   }, [store]);
 
+  // One history list covers both importers, so describe each batch by its own kind.
+  const summarise = (b: ImportBatch): string =>
+    b.kind === "transactions"
+      ? [
+          `${b.counts.transactions ?? 0} transaction${(b.counts.transactions ?? 0) === 1 ? "" : "s"}`,
+          (b.counts.accounts ?? 0) > 0 ? `${b.counts.accounts} new account${b.counts.accounts === 1 ? "" : "s"}` : "",
+          (b.counts.categories ?? 0) > 0 ? `${b.counts.categories} new categor${b.counts.categories === 1 ? "y" : "ies"}` : "",
+          (b.counts.people ?? 0) > 0 ? `${b.counts.people} new person/people` : "",
+        ]
+          .filter(Boolean)
+          .join(" · ")
+      : [
+          `${b.counts.events} investment transaction${b.counts.events === 1 ? "" : "s"}`,
+          b.counts.holdings > 0 ? `${b.counts.holdings} new holding${b.counts.holdings === 1 ? "" : "s"}` : "",
+        ]
+          .filter(Boolean)
+          .join(" · ");
+
   const undo = (b: ImportBatch): void => {
-    if (!window.confirm(`Undo this import? It removes the ${b.counts.events} transaction(s) it added and any holdings it created.`)) return;
+    // Be exact: undo removes every row the import added — INCLUDING ones you have since
+    // edited or re-categorised (they're still that import's rows). Only records the import
+    // never created, and accounts/categories something else still uses, are kept.
+    if (
+      !window.confirm(
+        `Undo this import? It removes everything it added (${summarise(b)}), including rows you've edited since. Records you created yourself are untouched.`,
+      )
+    )
+      return;
     setBusy(b.id);
     setErr(null);
     void store
@@ -707,8 +864,7 @@ function ImportHistoryCard() {
                   {b.label}
                 </div>
                 <div className="text-xs text-slate-400">
-                  {formatDate(localDay(b.createdAt))} · {b.counts.events} transaction{b.counts.events === 1 ? "" : "s"}
-                  {b.counts.holdings > 0 ? ` · ${b.counts.holdings} new holding${b.counts.holdings === 1 ? "" : "s"}` : ""}
+                  {formatDate(localDay(b.createdAt))} · {summarise(b)}
                 </div>
               </div>
               <Button variant="ghost" disabled={busy !== null} onClick={() => undo(b)}>

@@ -18,6 +18,7 @@ import type {
   Holding,
   HoldingEvent,
   ImportBatch,
+  Owner,
   Person,
   SnapshotDoc,
   Transaction,
@@ -26,7 +27,9 @@ import { createPortfolioRepo, type PortfolioRepo } from "../repo/portfolio-repo"
 import { netUnits } from "../domain/holdings";
 import { AUTO_VALUATION_NOTE } from "../domain/prices";
 import { desiredAutopayTransfers, isAutopayTransaction, planAutopayReconcile } from "../domain/autopay";
-import { importEventIdPrefix, type ImportPlan } from "../domain/import-holdings";
+import { importEventIdPrefix, type ImportPlan } from "../domain/import/holdings";
+import { importTxnIdPrefix, type TxnImportPlan } from "../domain/import/transactions";
+import { SHARED } from "../model/types";
 
 export interface PortfolioState {
   ready: boolean;
@@ -46,10 +49,86 @@ export interface PortfolioState {
 
 const USD_ONLY: FxTable = { base: "USD", rates: { USD: 1 } };
 
+/** The PERSISTED version bookkeeping — the only fingerprint that a second tab's writes are
+ *  visible in (tabs share the database, not in-memory state). Used for compare-and-apply. */
+export interface VersionFingerprint {
+  localVersion: number;
+  lastSyncedVersion: number;
+  /** Bumped on every write to SYNCED data, so the fingerprint moves even when the version
+   *  numbers legitimately don't (merging a file numbered below ours). Version numbers alone let a
+   *  committed merge stay invisible to a plan captured before it. Device-local writes are
+   *  excluded: a merge preserves those collections, so a plan can't lose them — and counting
+   *  them meant an unattended FX refresh discarded an open merge. */
+  dataSeq: number;
+}
+
+/** What an undo reverted. `holdings`/`events` are always present (0 for a transaction
+ *  import) so existing callers keep working; the rest are set by a transaction undo. */
+export interface UndoResult {
+  holdings: number;
+  events: number;
+  transactions?: number;
+  accounts?: number;
+  categories?: number;
+  people?: number;
+}
+
 // Import-undo log retention — undo is a short-term convenience, so the local record is
 // bounded by BOTH age and count and never kept forever.
 const IMPORT_BATCH_TTL_DAYS = 30;
 const IMPORT_BATCH_KEEP = 25;
+
+/** Keep the seen-snapshot log small and truthful: drop what the watermark strictly supersedes,
+ *  add the newly incorporated file, and cap it so a long-lived device can't grow it without
+ *  bound. Entries AT the watermark are KEPT — a concurrent push from another device can sit at
+ *  exactly that number, and only the key proves which of the two we actually read. */
+const SEEN_SNAPSHOT_KEEP = 200;
+/** `add` may be several keys (a new baseline supersedes every file it validated). `present`, when
+ *  given, is the set of keys the folder still holds — dropping the rest is what bounds the log by
+ *  the FOLDER rather than by age. Age-capping alone re-created the very deadlock this log exists
+ *  to remove: past the cap the oldest acknowledgement was discarded, so with more distinct
+ *  writers than the cap the guard could never clear. */
+export function pruneSeen(
+  seen: string[] | undefined,
+  watermark: number,
+  add?: string | readonly string[],
+  present?: ReadonlySet<string>,
+): string[] {
+  const version = (k: string): number => Number(k.slice(k.lastIndexOf("@") + 1));
+  const fileId = (k: string): string => k.slice(0, k.lastIndexOf("@"));
+  const relevant = (k: string): boolean => Number.isFinite(version(k)) && version(k) >= watermark;
+  const kept = [...new Set(seen ?? [])].filter((k) => relevant(k) && (!present || present.has(k)));
+  const added = (typeof add === "string" ? [add] : (add ?? [])).filter(relevant);
+  // One key per FILE, highest version. A peer's session file is updated IN PLACE, so a
+  // long-lived peer tab mints unboundedly many keys for a single file — and since a file's newer
+  // version subsumes its older one (the same rule `unincorporatedFiles` relies on), those are
+  // dead weight. Left in, they filled the cap and evicted the key that was actually load-bearing,
+  // making a file we had merged look unread again and re-arming the guard.
+  const top = new Map<string, string>();
+  for (const k of [...kept, ...added]) {
+    const cur = top.get(fileId(k));
+    if (!cur || version(k) > version(cur)) top.set(fileId(k), k);
+  }
+  return [...top.values()].slice(-SEEN_SNAPSHOT_KEEP);
+}
+
+/** Web Locks name — one writer at a time across every tab of this origin. */
+const STORE_WRITE_LOCK = "portfolio-store-write";
+
+/** Serialise a write against OTHER TABS as well as this one.
+ *
+ *  `writeChain` only orders writes made through this store instance. Tabs share the database
+ *  but not the chain, so two read-modify-write cycles could interleave and both persist the
+ *  same `dataSeq` — leaving the fingerprint non-injective and letting one tab's replace-write
+ *  drop the other's rows. The Web Locks API gives real cross-tab exclusion; where it isn't
+ *  available (older browsers, Node tests) we fall back to the in-process chain, which is the
+ *  behaviour we had. */
+function withCrossTabLock<T>(fn: () => Promise<T>): Promise<T> {
+  const locks = (globalThis as { navigator?: { locks?: { request?: (name: string, cb: () => Promise<T>) => Promise<T> } } })
+    .navigator?.locks;
+  if (!locks?.request) return fn();
+  return locks.request(STORE_WRITE_LOCK, fn);
+}
 
 function defaultSettings(): AppSettings {
   return {
@@ -80,6 +159,12 @@ export class PortfolioStore {
   private readonly repo: PortfolioRepo;
   private state: PortfolioState;
   private listeners = new Set<() => void>();
+  /** Newest import-batch timestamp written//seen this session. Undo records are ordered
+   *  (and pruned) by `createdAt` alone, so two batches landing in the SAME millisecond
+   *  would be unorderable — the keep-cap could then drop the newest instead of the
+   *  oldest, silently losing the undo for the import just made. `nextBatchAt` keeps the
+   *  stamps strictly increasing so the ordering is always total. */
+  private lastBatchAt = "";
 
   constructor(adapter: StorageAdapter) {
     this.adapter = adapter;
@@ -119,7 +204,8 @@ export class PortfolioStore {
   // this promise chain = no lost updates.
   private writeChain: Promise<unknown> = Promise.resolve();
   private exclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.writeChain.then(fn, fn);
+    const guarded = (): Promise<T> => withCrossTabLock(fn);
+    const run = this.writeChain.then(guarded, guarded);
     this.writeChain = run.then(
       () => {},
       () => {},
@@ -191,17 +277,24 @@ export class PortfolioStore {
    * inside the thunk, never close over a pre-read snapshot.
    */
   private commit(
-    build: () => { ops: BatchOp[]; patch: Partial<PortfolioState> },
+    build: () =>
+      | { ops: BatchOp[]; patch: Partial<PortfolioState> }
+      | Promise<{ ops: BatchOp[]; patch: Partial<PortfolioState> }>,
   ): Promise<void> {
     return this.exclusive(async () => {
-      const { ops, patch } = build();
+      // `await` so a thunk MAY read storage inside the lock. Sync thunks (all the small writes)
+      // are unaffected; the import's validation needs it, because checking against this tab's
+      // memory let a sibling tab's delete or re-denomination slip past.
+      const { ops, patch } = await build();
       // A build that resolves to NO data ops (e.g. a price refresh whose target
       // holdings were all deleted/closed during the fetch await-gap) must not bump
       // the version or mark the document dirty — there is nothing to persist or
       // sync. Every other caller always produces at least one op.
       if (ops.length === 0) return;
-      const version = this.state.version + 1;
-      const settings: AppSettings = { ...this.state.settings, localVersion: version, id: "app" };
+      // One read of the settings row for the whole write (floor + next row), not two.
+      const stored = await this.settingsRow();
+      const version = this.versionFloorFrom(stored) + 1;
+      const settings = await this.nextSettings({ localVersion: version }, { dataWrite: true, stored });
       await this.adapter.batch([
         ...ops,
         { collection: Collections.settings, op: "put", value: settings },
@@ -727,8 +820,9 @@ export class PortfolioStore {
       if (written.holdings + written.events > 0) {
         batch = {
           id: newId(),
-          createdAt: now,
+          createdAt: this.nextBatchAt(),
           label: opts.label?.trim() || "CSV import",
+          kind: "holdings",
           createdHoldingIds: newHoldings.map((h) => h.id),
           addedEventIds,
           replacedOpenings,
@@ -741,6 +835,248 @@ export class PortfolioStore {
     // Best-effort retention: keep the undo log small (local-only, no long-term value).
     if (batch) await this.pruneImportBatches();
     return { ...written, batch };
+  }
+
+  /** Apply a reviewed TRANSACTION-import plan in ONE atomic commit: create the accounts /
+   *  categories / people the plan invented for unknown banks, categories and owners, then
+   *  insert the transactions (deterministic ids → re-applying the same file is a no-op).
+   *  Re-validated against post-serialization state inside the lock: a row whose account
+   *  was deleted while the preview was open is skipped rather than orphaned, and a
+   *  transaction id that already exists is never overwritten. Returns what was written
+   *  plus the undo batch. */
+  async applyTransactionImport(
+    plan: TxnImportPlan,
+    opts: { label?: string } = {},
+  ): Promise<{
+    transactions: number;
+    accounts: number;
+    categories: number;
+    people: number;
+    /** Reasons for rows the review accepted but the write could not apply (the world
+     *  changed meanwhile) — surfaced so the count is never silently short. */
+    dropped: string[];
+    batch: ImportBatch | null;
+  }> {
+    let written = { transactions: 0, accounts: 0, categories: 0, people: 0 };
+    let batch: ImportBatch | null = null;
+    let dropped: string[] = [];
+    await this.commit(async () => {
+      const now = new Date().toISOString();
+      const author = this.state.settings.author;
+      const ops: BatchOp[] = [];
+      // VALIDATE against storage, not this tab's memory. Tabs share the database and get no
+      // cross-tab refresh, so a sibling tab can delete the target account or re-denominate it
+      // while the review sits open — and validating from memory then wrote a transaction pointing
+      // at an account that no longer exists, or an INR amount into a now-USD account, instead of
+      // dropping the row as this method promises. (The in-memory patch below is still built from
+      // `this.state`: it is this tab's VIEW, which may lag until a reload. The DATA written, and
+      // every decision about what to write, comes from storage.)
+      const [storedAccounts, storedPeople, storedCategories, storedTxns] = await Promise.all([
+        this.repo.accounts.getAll(),
+        this.repo.people.getAll(),
+        this.repo.categories.getAll(),
+        this.repo.transactions.getAll(),
+      ]);
+
+      // --- entities the plan creates (skip any a concurrent tab already created) ---
+      // Convergence identity for an account is name + CURRENCY + OWNER, not the name alone.
+      // Same display names are legal and normal here — each person can have an "IBKR" — so a
+      // name-only match let a row planned for Meera's new account be posted into Ravi's existing
+      // one whenever a concurrent tab had created that name first. The ids are then re-keyed to
+      // that account, so a later re-import dedups against the wrong one and never repairs it.
+      // A person, by contrast, IS identified by name, so that map stays as it was.
+      const accountKey = (a: { name: string; currency: string; personId: string }): string =>
+        `${a.name.trim().toLowerCase()}\u0000${a.currency}\u0000${a.personId}`;
+      const liveAccountsByKey = new Map<string, Account>();
+      for (const a of storedAccounts) {
+        if (!liveAccountsByKey.has(accountKey(a))) liveAccountsByKey.set(accountKey(a), a); // first wins
+      }
+      const livePeopleByName = new Map<string, Person>();
+      for (const p of storedPeople) {
+        const k = p.name.trim().toLowerCase();
+        if (!livePeopleByName.has(k)) livePeopleByName.set(k, p); // first wins, as the planner does
+      }
+      const liveCategoryIds = new Set(storedCategories.map((c) => c.id));
+      /** planned id -> the id actually used (an existing same-named entity wins). */
+      const accountIdMap = new Map<string, string>();
+      const personIdMap = new Map<string, string>();
+      const newAccounts: Account[] = [];
+      const newPeople: Person[] = [];
+      const newCategories: Category[] = [];
+
+      // PEOPLE FIRST: a created account can be owned by a person this same import creates,
+      // so that person must already be resolvable when the account is validated below
+      // (checking only `state.people` downgraded every such account to SHARED).
+      for (const p of plan.newPeople) {
+        const existing = livePeopleByName.get(p.name.trim().toLowerCase());
+        if (existing) {
+          personIdMap.set(p.id, existing.id);
+          continue;
+        }
+        newPeople.push(p);
+        livePeopleByName.set(p.name.trim().toLowerCase(), p);
+        ops.push({ collection: Collections.people, op: "put", value: p });
+      }
+      /** Owners that will exist after this commit: already-stored + created here. */
+      const ownerExists = (id: Owner): boolean =>
+        id === SHARED || storedPeople.some((p) => p.id === id) || newPeople.some((p) => p.id === id);
+      for (const a of plan.newAccounts) {
+        // Resolve the owner FIRST: convergence must compare the account's real owner (a
+        // same-named person created by a concurrent tab is the SAME owner), or an account would
+        // look different from an identical one purely because the person row is new.
+        const owner = personIdMap.get(a.personId) ?? a.personId;
+        const existing = liveAccountsByKey.get(accountKey({ ...a, personId: owner }));
+        if (existing) {
+          accountIdMap.set(a.id, existing.id); // converge on the account that already exists
+          continue;
+        }
+        // Fall back to SHARED only if that owner genuinely won't exist after this commit.
+        const rec: Account = { ...a, personId: ownerExists(owner) ? owner : SHARED };
+        newAccounts.push(rec);
+        // Keyed the same way, and first-wins, so two planned accounts differing only by owner both
+        // get created instead of the second silently folding into the first.
+        if (!liveAccountsByKey.has(accountKey(rec))) liveAccountsByKey.set(accountKey(rec), rec);
+        ops.push({ collection: Collections.accounts, op: "put", value: rec });
+      }
+      // Categories: keep the plan's ids (they're referenced by the transactions) but drop a
+      // subcategory whose parent vanished mid-preview to top-level rather than orphaning it.
+      const plannedCategoryIds = new Set(plan.newCategories.map((c) => c.id));
+      for (const c of plan.newCategories) {
+        if (liveCategoryIds.has(c.id)) continue; // already applied
+        const parentOk = !c.parentId || liveCategoryIds.has(c.parentId) || plannedCategoryIds.has(c.parentId);
+        const rec: Category = parentOk ? c : { ...c, parentId: undefined };
+        newCategories.push(rec);
+        ops.push({ collection: Collections.categories, op: "put", value: rec });
+      }
+
+      // --- transactions ---
+      const liveAccountIds = new Set([...storedAccounts.map((a) => a.id), ...newAccounts.map((a) => a.id)]);
+      const livePersonIds = new Set([...storedPeople.map((p) => p.id), ...newPeople.map((p) => p.id)]);
+      const validCategoryIds = new Set([...liveCategoryIds, ...newCategories.map((c) => c.id)]);
+      const existingTxnIds = new Set(storedTxns.map((t) => t.id));
+      // Every account the rows can land in, by id — the currency check below runs per ROW, and a
+      // linear scan there made a large import quadratic inside the write lock.
+      const accountsForWrite = new Map<string, Account>();
+      for (const a of storedAccounts) accountsForWrite.set(a.id, a);
+      for (const a of newAccounts) accountsForWrite.set(a.id, a);
+      const addedTransactionIds: string[] = [];
+      const records: Transaction[] = [];
+      // Rows the PLAN accepted but this commit cannot write (the world changed while the
+      // preview was open). Counted and returned so the UI can report them instead of
+      // silently writing fewer transactions than the review promised.
+      const droppedAtWrite: string[] = [];
+      for (const t of plan.transactions) {
+        // Re-point to the converged account/person (an existing same-named entity).
+        const accountId = accountIdMap.get(t.accountId) ?? t.accountId;
+        if (!liveAccountIds.has(accountId)) {
+          droppedAtWrite.push(`${t.date}: its account was deleted while the import was open`);
+          continue; // don't orphan the row onto a dead account
+        }
+        const account = accountsForWrite.get(accountId);
+        // A transaction posts in its ACCOUNT's currency. If convergence landed this row in
+        // an account of a DIFFERENT currency than the plan assumed, the amount is no longer
+        // meaningful (INR 50,000 must never be written as USD 50,000) — skip it, exactly as
+        // the plan's own currency guard would have.
+        if (account && account.currency !== t.currency) {
+          droppedAtWrite.push(
+            `${t.date}: "${account.name}" is ${account.currency}, but the row is ${t.currency}`,
+          );
+          continue;
+        }
+        const personId = personIdMap.get(t.personId) ?? t.personId;
+        // The id encodes the ORIGINAL account; re-point it too so dedup keys off the
+        // account the row actually lands in (matching importTxnIdPrefix).
+        const id =
+          accountId === t.accountId
+            ? t.id
+            : t.id.replace(importTxnIdPrefix(t.accountId), importTxnIdPrefix(accountId));
+        if (existingTxnIds.has(id)) continue; // idempotent: a previous import already wrote this row
+        existingTxnIds.add(id);
+        const rec: Transaction = {
+          ...t,
+          id,
+          accountId,
+          personId: personId === SHARED || livePersonIds.has(personId) ? personId : SHARED,
+          currency: account?.currency ?? t.currency,
+          categoryId: t.categoryId && validCategoryIds.has(t.categoryId) ? t.categoryId : undefined,
+          updatedAt: now,
+          author,
+        };
+        records.push(rec);
+        addedTransactionIds.push(rec.id);
+        ops.push({ collection: Collections.transactions, op: "put", value: rec });
+      }
+      dropped = droppedAtWrite;
+
+      // No transaction survived (everything was already imported, or dropped above)? Then
+      // the accounts/categories/people existed only to host those rows — writing them would
+      // leave empty records behind while the UI truthfully reports "nothing new". Make the
+      // whole thing a real no-op instead: no writes, no batch, no version bump.
+      if (records.length === 0) {
+        dropped = droppedAtWrite;
+        return { ops: [], patch: {} };
+      }
+      written = {
+        transactions: records.length,
+        accounts: newAccounts.length,
+        categories: newCategories.length,
+        people: newPeople.length,
+      };
+      // Record the undo batch in the SAME atomic write, so it can never desync from the
+      // data it describes. Device-local: stripped from backup/sync.
+      batch = {
+        id: newId(),
+        createdAt: this.nextBatchAt(),
+        label: opts.label?.trim() || "CSV import",
+        kind: "transactions",
+        createdHoldingIds: [],
+        addedEventIds: [],
+        replacedOpenings: [],
+        addedTransactionIds,
+        createdAccountIds: newAccounts.map((a) => a.id),
+        createdCategoryIds: newCategories.map((c) => c.id),
+        createdPersonIds: newPeople.map((p) => p.id),
+        counts: {
+          holdings: 0,
+          events: 0,
+          transactions: written.transactions,
+          accounts: written.accounts,
+          categories: written.categories,
+          people: written.people,
+        },
+      };
+      ops.push({ collection: Collections.importBatches, op: "put", value: batch });
+
+      return {
+        ops,
+        patch: {
+          accounts: [...this.state.accounts, ...newAccounts],
+          people: [...this.state.people, ...newPeople],
+          categories: [...this.state.categories, ...newCategories],
+          transactions: [...this.state.transactions, ...records],
+        },
+      };
+    });
+    if (batch) await this.pruneImportBatches();
+    return { ...written, dropped, batch };
+  }
+
+  /** A strictly-increasing `createdAt` for a new import batch: real time, unless a batch
+   *  already exists at that millisecond (or later), in which case the previous stamp + 1ms.
+   *  Undo records are ordered and keep-capped by `createdAt` alone, so equal stamps would
+   *  make "newest" arbitrary — and prune could then delete the newest batch instead of the
+   *  oldest, silently dropping the undo for the import just made. */
+  private nextBatchAt(): string {
+    const now = new Date().toISOString();
+    let at = now;
+    if (now <= this.lastBatchAt) {
+      // Bump by 1ms. A corrupted/non-ISO stored stamp would make Date() NaN and throw on
+      // toISOString(), which would take BOTH importers down — fall back to real time.
+      const prev = new Date(this.lastBatchAt).getTime();
+      at = Number.isFinite(prev) ? new Date(prev + 1).toISOString() : now;
+    }
+    this.lastBatchAt = at;
+    return at;
   }
 
   /** Recent, still-valid CSV imports, newest first (device-local; never synced/backed
@@ -764,6 +1100,9 @@ export class PortfolioStore {
     const all = (await this.adapter.collection<ImportBatch>(Collections.importBatches).getAll()).sort((a, b) =>
       a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
     ); // newest first
+    // Seed the monotonic stamp from persistence (this runs on init) so a batch created
+    // right after a reload still sorts after the ones already stored.
+    if (all[0] && all[0].createdAt > this.lastBatchAt) this.lastBatchAt = all[0].createdAt;
     const stale = all.filter((b, i) => b.createdAt < cutoff || i >= IMPORT_BATCH_KEEP);
     if (stale.length > 0) {
       await this.adapter.batch(stale.map((b) => ({ collection: Collections.importBatches, op: "delete", id: b.id })));
@@ -774,9 +1113,12 @@ export class PortfolioStore {
    *  CREATED that have no other events left (a holding you've since added your own
    *  transactions to is kept — just its imported rows go), and restore any opening
    *  estimate it replaced. Atomic. Returns what was reverted, or null if the batch is gone. */
-  async undoImportBatch(batchId: string): Promise<{ holdings: number; events: number } | null> {
+  async undoImportBatch(batchId: string): Promise<UndoResult | null> {
     const batch = await this.adapter.collection<ImportBatch>(Collections.importBatches).get(batchId);
     if (!batch) return null;
+    // A transaction import reverts different collections — same contract (null = nothing
+    // left to revert), same atomicity, so it gets its own focused path.
+    if (batch.kind === "transactions") return this.undoTransactionBatch(batch);
     let reverted: { holdings: number; events: number } | null = null;
     await this.commit(() => {
       const addedSet = new Set(batch.addedEventIds);
@@ -833,23 +1175,145 @@ export class PortfolioStore {
     return reverted;
   }
 
+  /** Undo one TRANSACTION import: remove the transactions it added, then delete the
+   *  accounts / categories / people it created — but ONLY those nothing else references
+   *  any more (an account you've since recorded your own transactions in, or a category
+   *  you've reused, is KEPT; just the imported rows go). Atomic; returns null when
+   *  there's nothing left to revert (e.g. a concurrent double-undo). */
+  private async undoTransactionBatch(batch: ImportBatch): Promise<UndoResult | null> {
+    let reverted: UndoResult | null = null;
+    await this.commit(() => {
+      const addedIds = new Set(batch.addedTransactionIds ?? []);
+      const liveTxnIds = new Set(this.state.transactions.map((t) => t.id));
+      const removeTxnIds = new Set([...addedIds].filter((id) => liveTxnIds.has(id)));
+      // What SURVIVES the undo decides whether a created entity can go.
+      const remaining = this.state.transactions.filter((t) => !removeTxnIds.has(t.id));
+
+      // Reference sets built in ONE pass over the survivors, not one scan per created id: an
+      // import that creates 20 accounts against 50k transactions was ~1M comparisons inside the
+      // write lock, all of it re-deriving the same answer.
+      const referencedAccountIds = new Set<string>();
+      const referencedPersonIds = new Set<string>();
+      const referencedCategoryIds = new Set<string>();
+      for (const t of remaining) {
+        referencedAccountIds.add(t.accountId);
+        if (t.transferToAccountId) referencedAccountIds.add(t.transferToAccountId);
+        referencedPersonIds.add(t.personId);
+        if (t.categoryId) referencedCategoryIds.add(t.categoryId);
+      }
+      for (const h of this.state.holdings) {
+        if (h.accountId) referencedAccountIds.add(h.accountId);
+        referencedPersonIds.add(h.personId);
+      }
+      for (const a of this.state.accounts) {
+        if (a.autopay?.fromAccountId) referencedAccountIds.add(a.autopay.fromAccountId);
+      }
+      const liveAccountIdSet = new Set(this.state.accounts.map((a) => a.id));
+      const accountsToDelete = new Set(
+        (batch.createdAccountIds ?? []).filter(
+          (id) => liveAccountIdSet.has(id) && !referencedAccountIds.has(id),
+        ),
+      );
+      // A created category goes only if NOTHING surviving needs it:
+      //  (a) no surviving transaction is tagged with it, and
+      //  (b) no child of it survives — otherwise that child would be left with a dangling
+      //      parentId (it happens when another import's rows use a SUBcategory of a parent
+      //      this batch created: the sub is referenced, the parent isn't, but the parent
+      //      must stay). Resolved to a fixpoint so a whole surviving branch is protected.
+      const liveCategoryIdSet = new Set(this.state.categories.map((c) => c.id));
+      const createdCats = (batch.createdCategoryIds ?? []).filter((id) => liveCategoryIdSet.has(id));
+      const categoriesToDelete = new Set(createdCats.filter((id) => !referencedCategoryIds.has(id)));
+      const childrenByParent = new Map<string, string[]>();
+      for (const c of this.state.categories) {
+        if (!c.parentId) continue;
+        const kids = childrenByParent.get(c.parentId);
+        if (kids) kids.push(c.id);
+        else childrenByParent.set(c.parentId, [c.id]);
+      }
+      for (let changed = true; changed; ) {
+        changed = false;
+        for (const id of [...categoriesToDelete]) {
+          const survivingChild = (childrenByParent.get(id) ?? []).some((kid) => !categoriesToDelete.has(kid));
+          if (survivingChild) {
+            categoriesToDelete.delete(id); // keep the parent so its child never dangles
+            changed = true;
+          }
+        }
+      }
+      // Owners of accounts that SURVIVE this undo still count as referenced (an owner of an
+      // account we're about to delete does not) — so this one narrowing needs the delete set.
+      for (const a of this.state.accounts) {
+        if (!accountsToDelete.has(a.id)) referencedPersonIds.add(a.personId);
+      }
+      const livePersonIdSet = new Set(this.state.people.map((p) => p.id));
+      const peopleToDelete = new Set(
+        (batch.createdPersonIds ?? []).filter(
+          (id) => livePersonIdSet.has(id) && !referencedPersonIds.has(id),
+        ),
+      );
+
+      // Nothing left to revert → true no-op (no version bump). The stale batch record is
+      // swept by the caller with a direct write, so it doesn't dirty the synced document.
+      if (
+        removeTxnIds.size === 0 &&
+        accountsToDelete.size === 0 &&
+        categoriesToDelete.size === 0 &&
+        peopleToDelete.size === 0
+      ) {
+        return { ops: [], patch: {} };
+      }
+
+      const ops: BatchOp[] = [];
+      for (const id of removeTxnIds) ops.push({ collection: Collections.transactions, op: "delete", id });
+      for (const id of accountsToDelete) ops.push({ collection: Collections.accounts, op: "delete", id });
+      for (const id of categoriesToDelete) ops.push({ collection: Collections.categories, op: "delete", id });
+      for (const id of peopleToDelete) ops.push({ collection: Collections.people, op: "delete", id });
+      ops.push({ collection: Collections.importBatches, op: "delete", id: batch.id });
+
+      reverted = {
+        holdings: 0,
+        events: 0,
+        transactions: removeTxnIds.size,
+        accounts: accountsToDelete.size,
+        categories: categoriesToDelete.size,
+        people: peopleToDelete.size,
+      };
+      return {
+        ops,
+        patch: {
+          transactions: remaining,
+          accounts: this.state.accounts.filter((a) => !accountsToDelete.has(a.id)),
+          categories: this.state.categories.filter((c) => !categoriesToDelete.has(c.id)),
+          people: this.state.people.filter((p) => !peopleToDelete.has(p.id)),
+        },
+      };
+    });
+    if (reverted === null) {
+      await this.adapter.batch([{ collection: Collections.importBatches, op: "delete", id: batch.id }]);
+    }
+    return reverted;
+  }
+
   // -- settings & FX -------------------------------------------------------
   // Settings are device-local and excluded from snapshots, so changing them
   // does NOT bump the sync version or mark the document dirty.
   async saveSettings(patch: Partial<AppSettings>): Promise<void> {
     return this.exclusive(async () => {
-      const cur = this.state.settings;
-      // Deep-merge the nested `drive` object so a partial update (e.g. just the
-      // API key) doesn't drop sibling fields (the client id) — rapid paste of
-      // both fields would otherwise clobber the first. To CLEAR `drive`, pass it
-      // explicitly as undefined.
-      const drive =
+      // Deep-merge the nested `drive` object so a partial update (e.g. just the API key)
+      // doesn't drop sibling fields (the client id) — rapid paste of both fields would
+      // otherwise clobber the first. To CLEAR `drive`, pass it explicitly as undefined.
+      //
+      // Merged onto the STORED row, and OMITTED from the patch when the caller didn't mention
+      // it. Rebuilding it from `this.state.settings` re-asserted a stale copy on every
+      // unrelated settings change, so a second tab's folder pick was silently reverted — or
+      // the whole Drive config erased, leaving the device quietly local-only after a reload.
+      const stored = await this.settingsRow();
+      const base = stored ?? this.state.settings;
+      const drivePatch: Partial<AppSettings> =
         "drive" in patch
-          ? patch.drive === undefined
-            ? undefined
-            : { ...cur.drive, ...patch.drive }
-          : cur.drive;
-      const next: AppSettings = { ...cur, ...patch, drive, id: "app" };
+          ? { drive: patch.drive === undefined ? undefined : { ...base.drive, ...patch.drive } }
+          : {};
+      const next = await this.nextSettings({ ...patch, ...drivePatch }, { stored });
       await this.adapter.collection<AppSettings>(Collections.settings).put(next);
       this.emit({ settings: next, fx: this.computeFx(this.state.fxRates, next) });
     });
@@ -860,10 +1324,11 @@ export class PortfolioStore {
    *  each other. `rate <= 0`/null clears the override (back to the live rate). */
   async setFxOverride(code: CurrencyCode, rate: number | null): Promise<void> {
     return this.exclusive(async () => {
-      const fxOverrides = { ...this.state.settings.fxOverrides };
+      const stored = await this.settingsRow();
+      const fxOverrides = { ...(stored?.fxOverrides ?? this.state.settings.fxOverrides) };
       if (rate === null || !Number.isFinite(rate) || rate <= 0) delete fxOverrides[code];
       else fxOverrides[code] = rate;
-      const next: AppSettings = { ...this.state.settings, fxOverrides, id: "app" };
+      const next = await this.nextSettings({ fxOverrides }, { stored });
       await this.adapter.collection<AppSettings>(Collections.settings).put(next);
       this.emit({ settings: next, fx: this.computeFx(this.state.fxRates, next) });
     });
@@ -879,7 +1344,7 @@ export class PortfolioStore {
         this.state.fxRates.filter((r) => r.date !== snap.date),
         snap,
       );
-      const settings = { ...this.state.settings, fxUpdatedAt: new Date().toISOString() };
+      const settings = await this.nextSettings({ fxUpdatedAt: new Date().toISOString() });
       // Write the rate snapshot AND the settings touch in one atomic batch.
       await this.adapter.batch([
         { collection: Collections.fxRates, op: "put", value: snap },
@@ -911,7 +1376,9 @@ export class PortfolioStore {
     // no re-entrancy.)
     return this.exclusive(async () => {
       const data = this.stripLocal(await this.adapter.exportAll());
-      return { schemaVersion: SCHEMA.version, version: this.state.version, data };
+      // Version from STORAGE, not just memory: a second tab may have written since, and a
+      // snapshot labelled below the database's version could collide on the next push.
+      return { schemaVersion: SCHEMA.version, version: await this.versionFloor(), data };
     });
   }
 
@@ -924,27 +1391,105 @@ export class PortfolioStore {
    *     mark it synced (lastSyncedVersion = doc.version), clean.
    *   - true (a BACKUP restore): the user wants this state PUBLISHED → keep it
    *     dirty (and strictly ahead of lastSyncedVersion) so `Sync now` uploads it
-   *     instead of taking the "nothing to sync" path. */
-  async applyDocument(doc: SnapshotDoc, opts: { dirty?: boolean } = {}): Promise<void> {
+   *     instead of taking the "nothing to sync" path.
+   *
+   *  `opts.seenRemoteVersion` (a MERGE): the state is a combination of local data and a
+   *  remote snapshot, so it must be BOTH dirty (nobody has it yet) AND recorded as having
+   *  SEEN the remote up to that version. Without the second half, the push path's
+   *  data-loss guard (`remoteMax > lastSyncedVersion`) keeps refusing forever: the merged
+   *  document could never be published and autosave would stay wedged in "error". Pass the
+   *  remote version actually reconciled — never a higher one, or an unmerged sibling file
+   *  at that version would be silently treated as seen. */
+  async applyDocument(
+    doc: SnapshotDoc,
+    opts: {
+      dirty?: boolean;
+      seenRemoteVersion?: number;
+      /** `<fileId>@<version>` of the snapshot this merge incorporated. Recorded even when the
+       *  watermark can't move, which is what makes successive merges converge instead of
+       *  deadlocking. Safe to record whether or not that file still exists remotely — it
+       *  states what OUR data now contains, not what the folder looks like. */
+      seenSnapshotKey?: string;
+      /** PULL only: other snapshots are still unincorporated, so the watermark must NOT move.
+       *
+       *  `lastSyncedVersion = doc.version` is another device's counter and says nothing about what
+       *  we hold. Because a file is subsumed at `version >= watermark`, jumping to a higher
+       *  version silently un-flagged every LOWER foreign file — and the pull deliberately targets
+       *  the newest unincorporated one, so this was reachable by an ordinary "Pull latest →
+       *  replace" on a clean device with two other devices in play. The seen-KEY still records
+       *  the file we loaded, which is what clears that file (and only that file). */
+      holdWatermark?: boolean;
+      /** COMPARE-AND-APPLY. When given, the write is abandoned unless the PERSISTED version
+       *  bookkeeping still matches — checked here, inside the same lock as the write, and
+       *  read from storage rather than memory.
+       *
+       *  Both halves matter for a merge: this is a full `replace`, so anything written since
+       *  the merge was planned would be deleted. An in-memory check performed by the caller
+       *  can't see (a) writes that land during this method's own multi-transaction export, or
+       *  (b) ANY write from a second tab, which shares the database but not this tab's state. */
+      expect?: VersionFingerprint;
+    } = {},
+  ): Promise<void> {
     return this.exclusive(async () => {
-      const priorVersion = this.state.version;
-      const priorLastSynced = this.state.settings.lastSyncedVersion;
+      const storedRow = await this.settingsRow();
+      if (opts.expect) {
+        // Compare PERSISTED-to-PERSISTED. The in-memory `state.version` is derived and can
+        // legitimately differ from the stored row (e.g. `saveSettings` moves the synced
+        // watermark without bumping it), so mixing the two would false-positive.
+        const live = this.fingerprintFrom(storedRow);
+        if (
+          live.localVersion !== opts.expect.localVersion ||
+          live.lastSyncedVersion !== opts.expect.lastSyncedVersion ||
+          live.dataSeq !== opts.expect.dataSeq
+        ) {
+          throw new Error(
+            "Your data changed while you were reviewing — nothing was written. Tap Pull latest again to redo it with the current data.",
+          );
+        }
+      }
+      // The floor is read from STORAGE, so a stale tab can't write a version BELOW what the
+      // database already holds (which would let a later write reproduce an earlier
+      // fingerprint — see versionFloor).
+      const priorVersion = this.versionFloorFrom(storedRow);
+      // From the ROW, not memory: a second tab may have advanced the watermark or recorded a
+      // merge since this tab loaded, and rewriting either from a stale copy loses it.
+      const priorLastSynced = storedRow?.lastSyncedVersion ?? this.state.settings.lastSyncedVersion;
       // Compute the version bookkeeping BEFORE the write so it can be persisted
       // atomically WITH the data.
       let version = Math.max(doc.version, priorVersion);
       let lastSyncedVersion: number;
       if (opts.dirty) {
-        lastSyncedVersion = priorLastSynced; // unchanged — we didn't pull from Drive
+        // A merge additionally acknowledges the remote it reconciled; a plain restore
+        // acknowledges nothing. Never regress an already-higher watermark.
+        lastSyncedVersion = Math.max(priorLastSynced, opts.seenRemoteVersion ?? 0);
+        // This is a data change, so the working version must MOVE — merging a file numbered
+        // below our own left it untouched, and then a plan captured before this merge still
+        // matched and deleted everything the merge had adopted.
+        version = Math.max(version, priorVersion + 1);
         if (version <= lastSyncedVersion) version = lastSyncedVersion + 1; // ensure publishable
       } else {
-        lastSyncedVersion = doc.version;
+        // Never regress, and never leap over a file we haven't read (see holdWatermark).
+        lastSyncedVersion = opts.holdWatermark ? priorLastSynced : Math.max(priorLastSynced, doc.version);
       }
-      const settings: AppSettings = {
-        ...this.state.settings,
-        lastSyncedVersion,
-        localVersion: version,
-        id: "app",
-      };
+      const settings = await this.nextSettings(
+        {
+          lastSyncedVersion,
+          localVersion: version,
+          // Remember the exact file this snapshot came from, so several merges in a row can add
+          // up to "nothing outstanding" even when no single one clears the high-water mark.
+          //
+          // A REPLACE (the non-dirty pull path) makes our data exactly this snapshot, which
+          // FALSIFIES every earlier acknowledgement — those rows are gone. Keeping the ones above
+          // the new watermark let "Replace with snapshot" on an older file leave a merged sibling
+          // still marked seen, and the next push then went over it with no merge ever offered.
+          seenSnapshots: opts.dirty
+            ? pruneSeen(storedRow?.seenSnapshots, lastSyncedVersion, opts.seenSnapshotKey)
+            : opts.seenSnapshotKey
+              ? [opts.seenSnapshotKey]
+              : [],
+        },
+        { dataWrite: true, stored: storedRow },
+      );
       // ONE transaction: replace synced collections (clearing any the snapshot
       // omits) while PRESERVING device-local ones, AND write the version
       // bookkeeping (settings) — so a crash can't leave new data with stale
@@ -958,14 +1503,121 @@ export class PortfolioStore {
     });
   }
 
+  /** A snapshot AND the version fingerprint that describes it, taken in ONE lock.
+   *
+   *  Anything that plans a write from exported data must use this: taking the fingerprint
+   *  separately (before or after) leaves a window in which a write is both absent from the
+   *  plan and invisible to the compare-and-apply check, so committing the plan deletes it
+   *  silently. Atomic capture makes the pair provably consistent. */
+  async exportWithFingerprint(): Promise<{ doc: SnapshotDoc; fingerprint: VersionFingerprint }> {
+    return this.exclusive(async () => {
+      const data = this.stripLocal(await this.adapter.exportAll());
+      const row = await this.settingsRow();
+      return {
+        doc: { schemaVersion: SCHEMA.version, version: this.versionFloorFrom(row), data },
+        fingerprint: this.fingerprintFrom(row),
+      };
+    });
+  }
+
+  /** The settings row AS STORED. Tabs share this row but each keeps its own in-memory copy,
+   *  so anything that persists settings must start from here. */
+  private async settingsRow(): Promise<AppSettings | undefined> {
+    return (await this.adapter.collection<AppSettings>(Collections.settings).getAll())[0];
+  }
+
+  /** The next settings row to persist: the STORED row plus this call's patch, with the write
+   *  counter bumped.
+   *
+   *  Every settings write must go through here. Spreading `this.state.settings` instead — which
+   *  is what `saveSettings`, `setFxOverride`, `cacheFxRates` and `markSynced` all used to do —
+   *  writes back a second tab's fields from a stale snapshot: it rolled `localVersion` and
+   *  `lastSyncedVersion` BACKWARDS (so a merge's compare-and-apply saw its old fingerprint
+   *  again and silently deleted the other tab's rows), marked never-pushed edits as already
+   *  synced, and erased `seenSnapshots`. The FX refresh runs hourly and unattended, so this
+   *  needed no user action at all. */
+  private async nextSettings(
+    patch: Partial<AppSettings> = {},
+    opts: { dataWrite?: boolean; stored?: AppSettings } = {},
+  ): Promise<AppSettings> {
+    const stored = opts.stored ?? (await this.settingsRow());
+    const base = stored ?? this.state.settings;
+    if (opts.dataWrite) {
+      return { ...base, ...patch, dataSeq: (base.dataSeq ?? 0) + 1, id: "app" };
+    }
+    return { ...base, ...patch, id: "app" };
+  }
+
+  /** The lowest version a NEW write may take, read from STORAGE.
+   *
+   *  Every version bump goes through here, and that is what makes `localVersion` strictly
+   *  increasing per DATABASE rather than per tab. It has to be: the compare-and-apply
+   *  fingerprint is `(localVersion, lastSyncedVersion)`, so if a second tab — same database,
+   *  its own in-memory state, no cross-tab notification anywhere in the app — derived its
+   *  next version from its own stale `state.version`, its writes would walk back up to the
+   *  value a merge recorded and the K-th one would REPRODUCE it exactly. The check would then
+   *  pass and the merge's full-replace write would delete that tab's rows silently.
+   *  Monotonic-per-database means any write from any tab always moves the fingerprint. */
+  private async versionFloor(): Promise<number> {
+    return this.versionFloorFrom(await this.settingsRow());
+  }
+
+  /** Same rule, from a row the caller has already read — settings reads are on the write path of
+   *  every edit, so each lock body reads the row ONCE and threads it through. */
+  private versionFloorFrom(row: AppSettings | undefined): number {
+    return Math.max(this.state.version, row?.localVersion ?? 0, row?.lastSyncedVersion ?? 0);
+  }
+
+  /** ALL the sync bookkeeping as STORED: both version halves, the acknowledgement log and the
+   *  device id.
+   *
+   *  Every rule that decides "could this file hold records I've never read" must read this rather
+   *  than `state.settings`. Tabs share the row but not memory, so after a sibling tab merges or
+   *  pulls a snapshot the database holds that data and the row records its key — while this tab
+   *  still has the old log and watermark. Judging from memory then re-flags an already
+   *  incorporated file, the push guard refuses, and because that path returns without scheduling a
+   *  retry (autosave is gated on `phase === "ready"`) the tab silently stops syncing until a
+   *  reload. */
+  async persistedSyncState(): Promise<{
+    localVersion: number;
+    lastSyncedVersion: number;
+    seenSnapshots: string[];
+    deviceId: string;
+  }> {
+    const row = await this.settingsRow();
+    const mem = this.state.settings;
+    return {
+      localVersion: row?.localVersion ?? mem.localVersion,
+      lastSyncedVersion: row?.lastSyncedVersion ?? mem.lastSyncedVersion,
+      seenSnapshots: row?.seenSnapshots ?? mem.seenSnapshots ?? [],
+      deviceId: row?.deviceId ?? mem.deviceId,
+    };
+  }
+
+  /** The version bookkeeping as STORED (not as held in memory). Reading it from the database
+   *  is what lets a caller detect a write made by another tab, which shares the database but
+   *  has its own in-memory state. Falls back to memory only if the row is somehow absent. */
+  async versionFingerprint(): Promise<VersionFingerprint> {
+    return this.fingerprintFrom(await this.settingsRow());
+  }
+
+  private fingerprintFrom(row: AppSettings | undefined): VersionFingerprint {
+    return {
+      localVersion: row?.localVersion ?? this.state.settings.localVersion,
+      lastSyncedVersion: row?.lastSyncedVersion ?? this.state.settings.lastSyncedVersion,
+      dataSeq: row?.dataSeq ?? this.state.settings.dataSeq ?? 0,
+    };
+  }
+
   /** Ensure the working version is strictly above what's already on the remote,
    *  so a push from a device that forked at the same version doesn't reuse an
    *  already-used version number (which latestSnapshot can't disambiguate). */
   async reconcileVersion(remoteMaxVersion: number): Promise<void> {
     return this.exclusive(async () => {
-      if (this.state.version > remoteMaxVersion) return;
+      const stored = await this.settingsRow();
+      if (this.versionFloorFrom(stored) > remoteMaxVersion) return;
       const version = remoteMaxVersion + 1;
-      const settings: AppSettings = { ...this.state.settings, localVersion: version, id: "app" };
+      const settings = await this.nextSettings({ localVersion: version }, { stored });
       await this.adapter.collection<AppSettings>(Collections.settings).put(settings);
       this.emit({ version, dirty: true, settings });
     });
@@ -982,15 +1634,19 @@ export class PortfolioStore {
    *  local data — either a current device (migration: nothing unseen is dropped) or
    *  a deliberate forgotten-password reset (old-key snapshots are unrecoverable
    *  anyway). It is NOT a normal sync path. */
-  async bumpVersionAbove(floor: number): Promise<void> {
+  async bumpVersionAbove(floor: number, supersededKeys: readonly string[] = []): Promise<void> {
     return this.exclusive(async () => {
-      const version = Math.max(this.state.version, floor) + 1;
-      const settings: AppSettings = {
-        ...this.state.settings,
-        localVersion: version,
-        lastSyncedVersion: floor,
-        id: "app",
-      };
+      const stored = await this.settingsRow();
+      const version = Math.max(this.versionFloorFrom(stored), floor) + 1;
+      // Record the files this baseline supersedes. Setting only the watermark isn't enough any
+      // more: a file AT the watermark is a hazard unless it's ours or recorded, so a migrated
+      // device could never publish its baseline while the folder's newest file belonged to
+      // another device — and the offered recovery (Pull latest) can't decode a v1 file, so the
+      // user had no action at all.
+      const settings = await this.nextSettings(
+        { localVersion: version, lastSyncedVersion: floor, seenSnapshots: pruneSeen(stored?.seenSnapshots, floor, supersededKeys) },
+        { stored },
+      );
       await this.adapter.collection<AppSettings>(Collections.settings).put(settings);
       this.emit({ version, dirty: true, settings });
     });
@@ -999,13 +1655,20 @@ export class PortfolioStore {
   /** Record that `pushedVersion` was uploaded. We do NOT regress the working
    *  version, and we only clear `dirty` if no edit raced ahead during the push
    *  — otherwise autosave reschedules and the latest edit still gets pushed. */
-  async markSynced(pushedVersion: number): Promise<void> {
+  async markSynced(pushedVersion: number, presentKeys?: readonly string[]): Promise<void> {
     return this.exclusive(async () => {
-      const settings: AppSettings = {
-        ...this.state.settings,
+      const stored = await this.settingsRow();
+      const settings = await this.nextSettings({
         lastSyncedVersion: pushedVersion,
-        id: "app",
-      };
+        // Everything BELOW the version we just published is subsumed by it. Entries AT it are
+        // kept: a colliding file from another device sits at that number and is not ours.
+        seenSnapshots: pruneSeen(
+          stored?.seenSnapshots,
+          pushedVersion,
+          undefined,
+          presentKeys ? new Set(presentKeys) : undefined,
+        ),
+      }, { stored });
       await this.adapter.collection<AppSettings>(Collections.settings).put(settings);
       this.emit({ settings, dirty: this.state.version !== pushedVersion });
     });

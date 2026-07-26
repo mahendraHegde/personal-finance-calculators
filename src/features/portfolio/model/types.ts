@@ -207,22 +207,46 @@ export interface HoldingEvent {
   createdAt?: string;
 }
 
-/** A record of one CSV import, kept DEVICE-LOCAL (never backed up or synced) so the
- *  import can be undone. Undo = delete `addedEventIds`, delete the `createdHoldingIds`
- *  that have no other events left, and re-insert `replacedOpenings`. */
+/** What a CSV import brought in — one undo record covers either kind. */
+export type ImportKind = "holdings" | "transactions";
+
+/** A record of one CSV import, kept DEVICE-LOCAL (never backed up or synced) so the import
+ *  can be undone. Undo removes exactly what that import added:
+ *   - holdings: delete `addedEventIds`, delete the `createdHoldingIds` with no other events
+ *     left, and re-insert `replacedOpenings`;
+ *   - transactions: delete `addedTransactionIds`, then delete the created accounts /
+ *     categories / people that nothing surviving still references. */
 export interface ImportBatch {
   id: ID;
   createdAt: string; // ISO
   /** Human label for the history list, e.g. "schwab-trans.csv". */
   label: string;
+  /** Which importer wrote this batch. Absent on records written before transaction
+   *  imports existed — treat as "holdings". */
+  kind?: ImportKind;
   /** Holdings the import CREATED (not merge targets). */
   createdHoldingIds: ID[];
   /** Event ids the import INSERTED. */
   addedEventIds: ID[];
   /** Full opening-estimate events the import DELETED (estimate-replace), to restore on undo. */
   replacedOpenings: HoldingEvent[];
-  /** For the history UI. */
-  counts: { holdings: number; events: number };
+  /** Transaction ids a TRANSACTION import inserted. */
+  addedTransactionIds?: ID[];
+  /** Accounts / categories / people a TRANSACTION import created for unknown banks,
+   *  categories and owners — removed again on undo when nothing else references them. */
+  createdAccountIds?: ID[];
+  createdCategoryIds?: ID[];
+  createdPersonIds?: ID[];
+  /** For the history UI. `holdings`/`events` stay required so existing records read
+   *  unchanged; the transaction counts are optional. */
+  counts: {
+    holdings: number;
+    events: number;
+    transactions?: number;
+    accounts?: number;
+    categories?: number;
+    people?: number;
+  };
 }
 
 export interface FxRateSnapshot {
@@ -279,6 +303,30 @@ export interface AppSettings {
   /** Working version counter, PERSISTED on every edit so a reload before a push
    *  rehydrates the unsynced version/dirty state instead of resetting to synced. */
   localVersion: number;
+  /** Strictly increasing count of writes to THIS DATABASE's SYNCED data.
+   *
+   *  The merge's compare-and-apply needs a witness that moves whenever something a merge could
+   *  overwrite has changed, and the version numbers can't be it: merging a low-numbered file
+   *  leaves `localVersion` untouched, and version semantics differ per path.
+   *
+   *  Deliberately NOT bumped by device-local writes (display currency, FX cache, Drive config):
+   *  a merge PRESERVES those collections, so they can't be lost — and counting them made an
+   *  unattended hourly FX refresh throw away an open merge review, blaming the user's own data
+   *  for it. Bumped by `commit` and `applyDocument` only. */
+  dataSeq?: number;
+  /** Individual remote snapshots this device has INCORPORATED, as `<fileId>@<version>`.
+   *
+   *  `lastSyncedVersion` alone is one high-water mark, but snapshot versions are only
+   *  monotonic per device — two devices routinely hold versions the other lacks. Merging the
+   *  newest file then left the older sibling permanently "unseen", so the push guard refused
+   *  forever and the only escape was the destructive replace. Recording each merged file lets
+   *  successive merges add up until nothing is outstanding, and it stays PRECISE where a
+   *  scalar cannot: merging our own file at a colliding version acknowledges that file only,
+   *  never a sibling's unmerged rows sharing the number.
+   *
+   *  Device-local (stripped from snapshots, preserved across imports); pruned to entries above
+   *  `lastSyncedVersion`, which subsumes everything below it. */
+  seenSnapshots?: string[];
 }
 
 /** The full document serialised into a snapshot/backup file. */

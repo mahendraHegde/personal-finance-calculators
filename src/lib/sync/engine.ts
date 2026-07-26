@@ -39,12 +39,18 @@ export class SyncEngine<TDoc> {
 
   /** Fetch and decode the highest-version snapshot, or null if the folder is empty. */
   async loadLatest(): Promise<LoadedSnapshot<TDoc> | null> {
-    const metas = await this.opts.provider.list();
-    const latest = latestSnapshot(metas);
-    if (!latest) return null;
-    const bytes = await this.opts.provider.download(latest.id);
-    const doc = await this.opts.codec.decode(bytes);
-    return { doc, meta: latest };
+    const latest = latestSnapshot(await this.opts.provider.list());
+    return latest ? this.loadFile(latest) : null;
+  }
+
+  /** Fetch and decode ONE named snapshot.
+   *
+   *  "Latest" isn't always the file that needs reconciling: versions are monotonic per device,
+   *  so a device can hold an unmerged file BELOW the folder max. Merging only the max would
+   *  leave that one permanently unreachable — the caller picks the target and loads it here. */
+  async loadFile(meta: SnapshotMeta): Promise<LoadedSnapshot<TDoc>> {
+    const bytes = await this.opts.provider.download(meta.id);
+    return { doc: await this.opts.codec.decode(bytes), meta };
   }
 
   /** List snapshot metadata without downloading bodies (cheap "is there newer?"). */
