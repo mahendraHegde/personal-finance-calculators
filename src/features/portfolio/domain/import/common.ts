@@ -15,8 +15,32 @@ export const IGNORE_VALUE = "__ignore__";
 /** Sentinel for "skip every row carrying this value" — the row is not imported at all
  *  (e.g. transfer narrations you don't want as expenses). Always reported as skipped. */
 export const SKIP_ROWS = "__skip__";
+/** Prefix for "create it, but under THIS name" — `__new__:Arecanut (Chali)`.
+ *
+ *  `NEW_ENTITY` creates the record named exactly as the file spells it, which is often not how
+ *  you want it filed ("CM-Groceries", "chali suldid"). Carrying the chosen name in the mapping
+ *  VALUE keeps the whole mapping a plain `raw -> string` map, so nothing else in the pipeline
+ *  changes. Import ids are derived from the file's own text, never from a category or account
+ *  name, so renaming here cannot break duplicate detection on a later re-import. */
+export const NEW_NAMED_PREFIX = "__new__:";
+/** The mapping value that says "create it, named `name`". */
+export const newNamed = (name: string): string => `${NEW_NAMED_PREFIX}${name}`;
+/** The chosen name from such a value, or undefined when it isn't one. Trimmed; an all-blank
+ *  name is treated as absent so the caller falls back to the file's own text. */
+export function namedFrom(value: string | undefined): string | undefined {
+  if (!value || !value.startsWith(NEW_NAMED_PREFIX)) return undefined;
+  const name = value.slice(NEW_NAMED_PREFIX.length).trim();
+  return name || undefined;
+}
+/** True for either flavour of "create": the plain sentinel or a named one. */
+export const isCreate = (value: string | undefined): boolean =>
+  value === NEW_ENTITY || (!!value && value.startsWith(NEW_NAMED_PREFIX));
 
 export const norm = (s: string): string => s.trim().toLowerCase();
+
+/** Key for `settings.importAliases` — what a file's own spelling was filed under last time. */
+export const aliasKey = (kind: "account" | "person" | "category" | "sub", raw: string): string =>
+  `${kind}:${norm(raw)}`;
 
 /** First header containing any of `keywords` (case-insensitive), or "" — used to
  *  pre-fill a column-mapping dropdown from the file's own header names. */

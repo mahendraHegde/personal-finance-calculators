@@ -6,14 +6,18 @@
 // engine in domain/import/transactions, and the write is one atomic store commit
 // (undoable from Settings → Import history).
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { parseCsvTable, type CsvTable } from "../../../lib/util/csv";
 import {
   bestNameMatch,
   detectDayFirst,
+  aliasKey,
   guessColumn,
   IGNORE_VALUE,
+  isCreate,
+  namedFrom,
   NEW_ENTITY,
+  norm,
   parseImportNumber,
   SKIP_ROWS,
   type SkippedImportRow,
@@ -250,12 +254,44 @@ export function ImportTransactions({ onClose }: { onClose: () => void }) {
   // Pre-fill each value with the best existing match — EXACT name first, then fuzzy
   // ("HDFC-BANK Ltd" → "HDFC Bank") — else "create it". Only a suggestion: every row is
   // shown here and can be changed, so a wrong guess costs a click, never data.
-  const prefill = <T extends { id: string; name: string }>(values: string[], list: T[], current: ValueMap): ValueMap => {
+  /** Resolve a remembered alias to exactly one record, or nothing.
+   *
+   *  Never "the first one with that name": duplicate display names are legal here (two "IBKR"
+   *  accounts under different owners, a "Misc" subcategory under two parents), and silently
+   *  picking one changes which record a repeat import targets — for accounts that changes the
+   *  `imptxn:<accountId>` prefix, so the same statement imports again instead of deduping. */
+  const resolveAlias = <T extends { id: string; name: string }>(
+    alias: { id?: string; name: string; parent?: string } | undefined,
+    list: T[],
+    parentNameOf?: (rec: T) => string | undefined,
+  ): T | undefined => {
+    if (!alias) return undefined;
+    if (alias.id) {
+      const byId = list.find((e) => e.id === alias.id);
+      if (byId) return byId; // exact identity — survives renames
+    }
+    const matches = list.filter(
+      (e) =>
+        norm(e.name) === norm(alias.name) &&
+        (!alias.parent || norm(parentNameOf?.(e) ?? "") === norm(alias.parent)),
+    );
+    return matches.length === 1 ? matches[0] : undefined; // ambiguous → fall back to matching
+  };
+
+  const prefill = <T extends { id: string; name: string }>(
+    values: string[],
+    list: T[],
+    current: ValueMap,
+    kind?: "account" | "person" | "category",
+  ): ValueMap => {
     const next = { ...current };
+    const aliases = state.settings.importAliases ?? {};
     for (const v of values) {
       if (v in next) continue;
-      const exact = list.find((e) => e.name.trim().toLowerCase() === v.trim().toLowerCase());
-      const match = exact ?? bestNameMatch(v, list, (e) => e.name);
+      // What you filed this spelling under LAST time beats re-guessing from the file's own text.
+      const aliased = kind ? resolveAlias(aliases[aliasKey(kind, v)], list) : undefined;
+      const exact = list.find((e) => norm(e.name) === norm(v));
+      const match = aliased ?? exact ?? bestNameMatch(v, list, (e) => e.name);
       next[v] = match ? match.id : NEW_ENTITY;
     }
     return next;
@@ -265,8 +301,16 @@ export function ImportTransactions({ onClose }: { onClose: () => void }) {
   const prefillSubs = (current: ValueMap, parentMap: ValueMap): ValueMap => {
     const next = { ...current };
     const subs = state.categories.filter((c) => c.parentId);
+    const aliases = state.settings.importAliases ?? {};
     for (const p of valueSets.subPairs) {
       if (p.key in next) continue;
+      const parentNameOf = (c: Category): string | undefined =>
+        state.categories.find((x) => x.id === c.parentId)?.name;
+      const aliased = resolveAlias(aliases[aliasKey("sub", p.key)], subs, parentNameOf);
+      if (aliased) {
+        next[p.key] = aliased.id;
+        continue;
+      }
       const parentId = p.category ? parentMap[p.category] : undefined;
       const parentIsExisting = !!parentId && parentId !== NEW_ENTITY && parentId !== IGNORE_VALUE && parentId !== SKIP_ROWS;
       const exact = (list: Category[]): Category | undefined =>
@@ -288,16 +332,16 @@ export function ImportTransactions({ onClose }: { onClose: () => void }) {
     return next;
   };
   const goToValues = (): void => {
-    const nextAccounts = prefill(valueSets.accounts, state.accounts, accountMap);
+    const nextAccounts = prefill(valueSets.accounts, state.accounts, accountMap, "account");
     // With no subcategory column, a category value can legitimately BE one of your
     // subcategories, so match against both levels (top-level first — a value that names a
     // parent should map to the parent, not to one of its children).
     const categoryCandidates = col.subcategory
       ? state.categories.filter((c) => !c.parentId)
       : [...state.categories.filter((c) => !c.parentId), ...state.categories.filter((c) => c.parentId)];
-    const nextCategories = prefill(valueSets.categories, categoryCandidates, categoryMap);
+    const nextCategories = prefill(valueSets.categories, categoryCandidates, categoryMap, "category");
     setAccountMap(nextAccounts);
-    setPersonMap((m) => prefill(valueSets.people, state.people, m));
+    setPersonMap((m) => prefill(valueSets.people, state.people, m, "person"));
     setCategoryMap(nextCategories);
     setSubcategoryMap((m) => prefillSubs(m, nextCategories));
     const anythingToMap =
@@ -362,6 +406,133 @@ export function ImportTransactions({ onClose }: { onClose: () => void }) {
   // YOUR subcategories ("Flight Charges" is a sub of Travel), so offer subcategories too —
   // labelled "Parent › Sub" — and let it be stored as the leaf. When the file DOES have a
   // subcategory column the parent must stay top-level, or the sub would need a third level.
+  /** Where each subcategory pair will END UP, and whether the category choice matters for it.
+   *
+   *  The subcategory DRIVES the outcome: mapped to an existing sub, it carries its own parent and
+   *  the category pick plays no part. That used to be invisible — you could map the category to
+   *  Housing, the sub to Petrol (a child of Utilities), and the row would file under Utilities
+   *  with nothing on screen saying your Housing pick had been dropped. */
+  const subDestinations = useMemo(() => {
+    const byId = new Map(state.categories.map((c) => [c.id, c]));
+    const nameOf = (id: string | undefined): string | undefined => (id ? byId.get(id)?.name : undefined);
+    /** What the CATEGORY choice resolves to, mirroring the engine exactly. Reading only existing
+     *  ids here made the hint contradict the importer in the cases it exists to explain: a
+     *  category mapped to Create/Leave-uncategorised/Skip left the name undefined, so the row
+     *  claimed "top level" while the engine was creating under the new parent, dropping the
+     *  subcategory, or skipping the row entirely. */
+    const catTarget = (raw: string | undefined): { kind: "existing" | "create" | "ignore" | "skip" | "none"; name?: string; isSub?: boolean } => {
+      if (!raw) return { kind: "none" };
+      const choice = categoryMap[raw];
+      if (choice === SKIP_ROWS) return { kind: "skip" };
+      if (choice === IGNORE_VALUE) return { kind: "ignore" };
+      if (isCreate(choice)) return { kind: "create", name: namedFrom(choice) ?? raw };
+      const existing = choice ? byId.get(choice) : undefined;
+      if (existing) return { kind: "existing", name: existing.name, isSub: !!existing.parentId };
+      return { kind: "none" };
+    };
+    const hints: Record<string, ReactNode> = {};
+    const catDriven = new Set<string>();
+    const catUsed = new Set<string>();
+    for (const p of valueSets.subPairs) {
+      const choice = subcategoryMap[p.key];
+      const cat = catTarget(p.category || undefined);
+      const existing = choice && !isCreate(choice) && choice !== IGNORE_VALUE && choice !== SKIP_ROWS
+        ? byId.get(choice)
+        : undefined;
+      if (cat.kind === "skip") {
+        // The category's own choice wins over everything: those rows never reach the engine.
+        hints[p.key] = <>these rows aren't imported — the category above is set to skip</>;
+        if (p.category) catUsed.add(p.category);
+        continue;
+      }
+      if (existing) {
+        const parent = nameOf(existing.parentId);
+        const path = parent ? `${parent} › ${existing.name}` : existing.name;
+        const overridden = cat.kind === "existing" && !!parent && parent !== cat.name;
+        hints[p.key] = overridden ? (
+          <>
+            files under <b>{path}</b> — this subcategory brings its own category, so the “{cat.name}”
+            choice below isn't used for these rows
+          </>
+        ) : (
+          <>
+            files under <b>{path}</b>
+          </>
+        );
+        if (p.category) catDriven.add(p.category);
+      } else if (choice === SKIP_ROWS) {
+        hints[p.key] = <>these rows aren't imported</>;
+      } else if (choice === IGNORE_VALUE) {
+        hints[p.key] =
+          cat.kind === "existing" || cat.kind === "create" ? (
+            <>
+              files under <b>{cat.name}</b> only
+            </>
+          ) : (
+            <>left uncategorised</>
+          );
+        if (p.category) catUsed.add(p.category);
+      } else {
+        // Creating (or falling back to creating) the subcategory: the parent comes from the
+        // category choice, so every one of its outcomes has to be spelled out.
+        const named = namedFrom(choice) ?? p.subcategory;
+        if (cat.kind === "existing" && cat.isSub) {
+          hints[p.key] = (
+            <>
+              files under <b>{cat.name}</b> — that category choice is itself a subcategory, so it stays
+              the leaf and “{p.subcategory}” isn't recorded
+            </>
+          );
+        } else if (cat.kind === "existing" || cat.kind === "create") {
+          hints[p.key] = (
+            <>
+              creates <b>{cat.name} › {named}</b>
+              {cat.kind === "create" ? " (both new)" : ""}
+            </>
+          );
+        } else if (cat.kind === "ignore") {
+          hints[p.key] = (
+            <>
+              left uncategorised — the category above is set to “leave uncategorised”, so “{named}” isn't
+              created either
+            </>
+          );
+        } else {
+          hints[p.key] = (
+            <>
+              creates <b>{named}</b> as a top-level category (nothing is mapped for these rows'
+              category)
+            </>
+          );
+        }
+        if (p.category) catUsed.add(p.category);
+      }
+    }
+    // A category's pick is unused only when EVERY row under it is decided by its own subcategory —
+    // including rows whose subcategory cell is BLANK, which have nothing but the category to go on.
+    const withBlankSub = new Set<string>();
+    if (table && col.category && col.subcategory) {
+      for (const r of table.rows) {
+        const c = (r[col.category] ?? "").trim();
+        if (c && !(r[col.subcategory] ?? "").trim()) withBlankSub.add(c);
+      }
+    }
+    const unused = new Set(
+      [...catDriven].filter((c) => !catUsed.has(c) && !withBlankSub.has(c)),
+    );
+    return { hints, unused };
+  }, [state.categories, valueSets.subPairs, subcategoryMap, categoryMap, table, col.category, col.subcategory]);
+
+  const categoryHints = useMemo(() => {
+    const out: Record<string, ReactNode> = {};
+    for (const v of valueSets.categories) {
+      if (subDestinations.unused.has(v)) {
+        out[v] = <>not used — every row with this category has a subcategory that carries its own</>;
+      }
+    }
+    return out;
+  }, [valueSets.categories, subDestinations.unused]);
+
   const categoryOpts = useMemo(() => {
     const hasSubColumn = !!col.subcategory;
     const parentName = (id: string | undefined): string => state.categories.find((c) => c.id === id)?.name ?? "?";
@@ -422,6 +593,46 @@ export function ImportTransactions({ onClose }: { onClose: () => void }) {
     setError(null);
     try {
       const res = await store.applyTransactionImport(plan, { label: fileName });
+      // Remember how each of the file's own spellings was filed. Names, not ids, so an alias
+      // survives a later merge/rename and just falls back to a suggestion if it stops resolving.
+      const aliases: Record<string, { id?: string; name: string; parent?: string }> = {};
+      const catById = new Map(state.categories.map((c) => [c.id, c]));
+      const remember = (
+        kind: "account" | "person" | "category" | "sub",
+        raw: string,
+        choice: string | undefined,
+        fallbackName: string,
+        byId: Map<string, string>,
+        parent?: string,
+      ): void => {
+        if (!raw || !choice) return;
+        // An existing pick keeps its ID (exact identity); a create can only be remembered by the
+        // name it was given, resolved uniquely next time or not at all.
+        if (isCreate(choice)) {
+          const name = namedFrom(choice) ?? fallbackName;
+          if (name && norm(name) !== norm(raw)) aliases[aliasKey(kind, raw)] = { name, parent };
+          return;
+        }
+        const name = byId.get(choice);
+        if (name) aliases[aliasKey(kind, raw)] = { id: choice, name, parent };
+      };
+      const accountNames = new Map(state.accounts.map((a) => [a.id, a.name]));
+      const personNames = new Map(state.people.map((p) => [p.id, p.name]));
+      const categoryNames = new Map(state.categories.map((c) => [c.id, c.name]));
+      for (const raw of valueSets.accounts) remember("account", raw, accountMap[raw], raw, accountNames);
+      for (const raw of valueSets.people) remember("person", raw, personMap[raw], raw, personNames);
+      for (const raw of valueSets.categories) remember("category", raw, categoryMap[raw], raw, categoryNames);
+      for (const p of valueSets.subPairs) {
+        const choice = subcategoryMap[p.key];
+        // The parent a subcategory alias belongs to: its own parent when an existing sub was
+        // chosen, otherwise the category this pair maps to (that's where a create would land).
+        const chosen = choice && !isCreate(choice) ? catById.get(choice) : undefined;
+        const parentName = chosen
+          ? catById.get(chosen.parentId ?? "")?.name
+          : catById.get(p.category ? (categoryMap[p.category] ?? "") : "")?.name;
+        remember("sub", p.key, choice, p.subcategory, categoryNames, parentName);
+      }
+      if (Object.keys(aliases).length > 0) await store.saveSettings({ importAliases: aliases });
       setDone({
         transactions: res.transactions,
         accounts: res.accounts,
@@ -741,23 +952,49 @@ export function ImportTransactions({ onClose }: { onClose: () => void }) {
                 {valueSets.accounts.length > 0 && (
                   <div>
                     <p className="mb-1 text-sm font-medium text-slate-600">Banks / accounts</p>
-                    <ValueMapRows values={valueSets.accounts} counts={counts.accounts} options={accountOpts} value={accountMap} onChange={(raw, v) => setAccountMap((m) => ({ ...m, [raw]: v }))} />
+                    <ValueMapRows values={valueSets.accounts} counts={counts.accounts} options={accountOpts} value={accountMap} allowRename onChange={(raw, v) => setAccountMap((m) => ({ ...m, [raw]: v }))} />
                   </div>
                 )}
                 {valueSets.people.length > 0 && (
                   <div>
                     <p className="mb-1 text-sm font-medium text-slate-600">Owners</p>
-                    <ValueMapRows values={valueSets.people} counts={counts.people} options={personOpts} value={personMap} onChange={(raw, v) => setPersonMap((m) => ({ ...m, [raw]: v }))} />
+                    <ValueMapRows values={valueSets.people} counts={counts.people} options={personOpts} value={personMap} allowRename onChange={(raw, v) => setPersonMap((m) => ({ ...m, [raw]: v }))} />
+                  </div>
+                )}
+                {valueSets.subPairs.length > 0 && (
+                  <div>
+                    <p className="mb-1 text-sm font-medium text-slate-600">
+                      Subcategories <span className="font-normal text-xs text-slate-400">— these decide where a row files</span>
+                    </p>
+                    <ValueMapRows
+                      values={valueSets.subPairs.map((p) => p.key)}
+                      labels={subLabels}
+                      counts={subCounts}
+                      options={subcategoryOpts}
+                      value={subcategoryMap}
+                      hints={subDestinations.hints}
+                      allowRename
+                      onChange={(key, v) => setSubcategoryMap((m) => ({ ...m, [key]: v }))}
+                    />
                   </div>
                 )}
                 {valueSets.categories.length > 0 && (
                   <div>
-                    <p className="mb-1 text-sm font-medium text-slate-600">Categories</p>
+                    <p className="mb-1 text-sm font-medium text-slate-600">
+                      Categories{" "}
+                      <span className="font-normal text-xs text-slate-400">
+                        {valueSets.subPairs.length > 0
+                          ? "— the parent for subcategories being created, and the category for rows with no subcategory"
+                          : ""}
+                      </span>
+                    </p>
                     <ValueMapRows
                       values={valueSets.categories}
                       counts={counts.categories}
                       options={categoryOpts}
                       value={categoryMap}
+                      hints={categoryHints}
+                      allowRename
                       onChange={(raw, v) => {
                         setCategoryMap((m) => ({ ...m, [raw]: v }));
                         // The parent changed → re-suggest its subcategories against the new parent.
@@ -767,19 +1004,6 @@ export function ImportTransactions({ onClose }: { onClose: () => void }) {
                           return prefillSubs(next, { ...categoryMap, [raw]: v });
                         });
                       }}
-                    />
-                  </div>
-                )}
-                {valueSets.subPairs.length > 0 && (
-                  <div>
-                    <p className="mb-1 text-sm font-medium text-slate-600">Subcategories</p>
-                    <ValueMapRows
-                      values={valueSets.subPairs.map((p) => p.key)}
-                      labels={subLabels}
-                      counts={subCounts}
-                      options={subcategoryOpts}
-                      value={subcategoryMap}
-                      onChange={(key, v) => setSubcategoryMap((m) => ({ ...m, [key]: v }))}
                     />
                   </div>
                 )}

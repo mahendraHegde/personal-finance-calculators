@@ -2,8 +2,9 @@
 // mean", and "here's what we couldn't use". Shared by the holdings and transaction
 // importers so the mapping experience (and its accessibility/layout fixes) lives once.
 
+import type { ReactNode } from "react";
 import { Badge, Field, Select } from "./components";
-import type { SkippedImportRow } from "../domain/import/common";
+import { isCreate, namedFrom, newNamed, NEW_ENTITY, type SkippedImportRow } from "../domain/import/common";
 
 export interface ColumnSpec<K extends string> {
   key: K;
@@ -48,6 +49,8 @@ export function ValueMapRows({
   onChange,
   counts,
   labels,
+  hints,
+  allowRename,
   emptyLabel = "Nothing to map.",
 }: {
   /** The mapping KEYS (usually the raw file values; for pairs, a composite key). */
@@ -59,6 +62,13 @@ export function ValueMapRows({
   /** Optional display text per key, when the key isn't what the user should read
    *  (e.g. a "category › subcategory" pair keyed by a composite string). */
   labels?: Record<string, string>;
+  /** Per-key note under the row, saying where this value will actually end up. The mapping
+   *  choices interact (a subcategory carries its own parent), so the outcome has to be visible
+   *  rather than inferred. */
+  hints?: Record<string, ReactNode>;
+  /** Offer a name field whenever the choice is "create": the file's own spelling
+   *  ("CM-Groceries", "chali suldid") is often not how you want the record named. */
+  allowRename?: boolean;
   emptyLabel?: string;
 }) {
   if (values.length === 0) return <p className="text-xs text-slate-400">{emptyLabel}</p>;
@@ -66,14 +76,37 @@ export function ValueMapRows({
     <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200">
       {values.map((raw) => (
         // Stacked on a phone (a full-width select is tappable); side-by-side from `sm`.
-        <li key={raw} className="flex flex-col gap-1 p-2 sm:flex-row sm:items-center sm:gap-3">
-          <span className="min-w-0 flex-1 break-words text-sm text-slate-700 sm:truncate" title={raw}>
-            {labels?.[raw] ?? raw}
-            {counts?.[raw] ? <span className="ml-1 text-xs text-slate-400">({counts[raw]})</span> : null}
-          </span>
-          <div className="w-full sm:w-48 sm:shrink-0">
-            <Select value={value[raw] ?? ""} onChange={(v) => onChange(raw, v)} options={options} />
+        <li key={raw} className="p-2">
+          {/* Stacked on a phone (a full-width select is tappable); side-by-side from `sm`. */}
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
+            <span className="min-w-0 flex-1 break-words text-sm text-slate-700 sm:truncate" title={raw}>
+              {labels?.[raw] ?? raw}
+              {counts?.[raw] ? <span className="ml-1 text-xs text-slate-400">({counts[raw]})</span> : null}
+            </span>
+            <div className="w-full sm:w-48 sm:shrink-0">
+              {/* A renamed "create" is stored as `__new__:<name>`, so show it as "create". */}
+              <Select
+                value={isCreate(value[raw]) ? NEW_ENTITY : (value[raw] ?? "")}
+                onChange={(v) => onChange(raw, v)}
+                options={options}
+              />
+            </div>
           </div>
+          {allowRename && isCreate(value[raw]) && (
+            <div className="mt-1 flex items-center gap-2 sm:justify-end">
+              <label className="text-xs text-slate-500" htmlFor={`name-${raw}`}>
+                name it
+              </label>
+              <input
+                id={`name-${raw}`}
+                className="w-full rounded-md border border-slate-200 px-2 py-1 text-sm sm:w-48"
+                value={namedFrom(value[raw]) ?? ""}
+                placeholder={labels?.[raw] ?? raw}
+                onChange={(e) => onChange(raw, e.target.value.trim() ? newNamed(e.target.value) : NEW_ENTITY)}
+              />
+            </div>
+          )}
+          {hints?.[raw] ? <p className="mt-1 text-xs text-slate-500 sm:text-right">{hints[raw]}</p> : null}
         </li>
       ))}
     </ul>

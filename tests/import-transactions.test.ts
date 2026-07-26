@@ -11,6 +11,7 @@ import {
   importTxnIdPrefix,
   isImportedTransaction,
   NEW_ENTITY,
+  newNamed,
   planTransactionImport,
   SKIP_ROWS,
   subMapKey,
@@ -907,6 +908,61 @@ section("[store] the import write path validates against STORAGE, not this tab's
     !((await adapter2.exportAll()).transactions ?? []).length,
     "nothing was persisted, so no dangling accountId exists",
   );
+}
+
+section("[import] a mapping can CREATE a record under a name of your choosing");
+{
+  // The file's own spelling ("chali suldid", "CM-Groceries") is often not how you want things
+  // named. `newNamed(x)` in place of NEW_ENTITY creates the record as x instead of as the raw text.
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.savePerson(person("p1", "Ravi"));
+  await store.saveAccount(bank("A1", "HDFC", "INR"));
+  const s0 = store.getState();
+  const { rows } = parse("Date,Amount,Bank,Cat,Sub\n2026-01-05,500,HDFC,Adike,Chali\n", {
+    account: "Bank", category: "Cat", subcategory: "Sub",
+  });
+  const plan = planTransactionImport(rows, ctx({
+    accounts: s0.accounts, people: s0.people, accountMap: { HDFC: "A1" },
+    categoryMap: { Adike: newNamed("Agriculture") },
+    subcategoryMap: { [subMapKey("Adike", "Chali")]: newNamed("Arecanut - Chali") },
+  }));
+  const parentNames = plan.newCategories.filter((c) => !c.parentId).map((c) => c.name);
+  const subNames = plan.newCategories.filter((c) => c.parentId).map((c) => c.name);
+  eq(parentNames.join(","), "Agriculture", "the category is created under the chosen name, not 'Adike'");
+  eq(subNames.join(","), "Arecanut - Chali", "…and the subcategory under its chosen name, not 'Chali'");
+  const leaf = plan.newCategories.find((c) => c.id === plan.transactions[0]!.categoryId)!;
+  eq(leaf.name, "Arecanut - Chali", "the row files against the renamed subcategory");
+  eq(leaf.parentId, plan.newCategories.find((c) => c.name === "Agriculture")!.id, "…under the renamed parent");
+  // A blank/whitespace name falls back to the file's text rather than creating an unnamed record.
+  const blank = planTransactionImport(rows, ctx({
+    accounts: s0.accounts, people: s0.people, accountMap: { HDFC: "A1" },
+    categoryMap: { Adike: newNamed("   ") },
+  }));
+  eq(blank.newCategories.filter((c) => !c.parentId)[0]!.name, "Adike", "an all-blank name falls back to the raw value");
+}
+
+section("[import] an explicitly mapped subcategory carries its OWN parent");
+{
+  // This is what the UI now states per row: the subcategory drives the outcome, so mapping the
+  // category to Housing and the sub to a child of Utilities files under Utilities — the category
+  // pick is not used for those rows (and can never produce an incoherent Housing › Petrol).
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.savePerson(person("p1", "Ravi"));
+  await store.saveAccount(bank("A1", "HDFC", "INR"));
+  await store.saveCategory({ id: "housing", name: "Housing" });
+  await store.saveCategory({ id: "utilities", name: "Utilities" });
+  await store.saveCategory({ id: "petrol", name: "Petrol", parentId: "utilities" });
+  const s0 = store.getState();
+  const { rows } = parse("Date,Amount,Bank,Cat,Sub\n2026-01-05,500,HDFC,HouseStuff,Fuel\n", {
+    account: "Bank", category: "Cat", subcategory: "Sub",
+  });
+  const plan = planTransactionImport(rows, ctx({
+    accounts: s0.accounts, people: s0.people, categories: s0.categories, accountMap: { HDFC: "A1" },
+    categoryMap: { HouseStuff: "housing" },
+    subcategoryMap: { [subMapKey("HouseStuff", "Fuel")]: "petrol" },
+  }));
+  eq(plan.transactions[0]!.categoryId, "petrol", "the row is filed against the mapped subcategory");
+  eq(plan.newCategories.length, 0, "nothing is created — no 'Housing › Petrol' duplicate");
 }
 
 done();

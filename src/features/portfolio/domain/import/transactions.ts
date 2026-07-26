@@ -26,15 +26,18 @@ import type { Account, AccountType, Category, Owner, Person, Transaction } from 
 import { SHARED } from "../../model/types";
 import {
   IGNORE_VALUE,
+  isCreate,
+  namedFrom,
   NEW_ENTITY,
   norm,
   parseImportDate,
   parseImportNumber,
+  newNamed,
   SKIP_ROWS,
   type SkippedImportRow,
 } from "./common";
 
-export { IGNORE_VALUE, NEW_ENTITY, SKIP_ROWS };
+export { IGNORE_VALUE, NEW_ENTITY, newNamed, SKIP_ROWS };
 
 /** The transaction kinds an import can produce. Transfers are deliberately excluded:
  *  they need a second (destination) account and a paired amount, which a single
@@ -385,13 +388,16 @@ function rowContentKey(r: TxnCanonicalRow): string {
  * Resolve a raw value through its mapping to a concrete target:
  *  - an explicit id from the mapping (the user's choice in the review step)
  *  - NEW_ENTITY   → create one named after the raw value
+ *  - `__new__:X`  → create one named X (the user renamed it in the mapping step)
  *  - IGNORE_VALUE → attach nothing (for a category: import uncategorised)
  *  - SKIP_ROWS    → don't import rows carrying this value at all
  *  - no mapping   → the caller falls back to an EXACT name match (never fuzzy: see matchByName)
  */
 type Resolution =
   | { kind: "id"; id: string }
-  | { kind: "new" }
+  /** `name` is set when the user renamed it in the mapping step; otherwise create it named
+   *  exactly as the file spells it. */
+  | { kind: "new"; name?: string }
   | { kind: "ignore" }
   | { kind: "skip" }
   | { kind: "fallback" };
@@ -400,7 +406,10 @@ function resolve(raw: string | undefined, map: ValueMap | undefined, key = raw):
   const choice = key === undefined ? undefined : map?.[key];
   if (choice === SKIP_ROWS) return { kind: "skip" };
   if (choice === IGNORE_VALUE) return { kind: "ignore" };
-  if (choice === NEW_ENTITY) return { kind: "new" };
+  // BOTH create forms before the id branch: a malformed or blank-named create
+  // ("__new__:   ") must never be read as a record id — that made it a lookup miss, which
+  // silently degraded to "no category" and filed the row somewhere else entirely.
+  if (isCreate(choice)) return { kind: "new", name: namedFrom(choice) };
   if (choice) return { kind: "id", id: choice };
   return { kind: "fallback" };
 }
@@ -508,11 +517,12 @@ export function planTransactionImport(rows: TxnCanonicalRow[], ctx: TxnImportCon
     } else if (perRes.kind === "id") {
       personId = perRes.id === SHARED || peopleById.has(perRes.id) ? perRes.id : ctx.defaultPersonId;
     } else if (perRes.kind === "new" && r.personRaw) {
-      const existing = peopleByName.get(norm(r.personRaw));
+      const wantName = perRes.name ?? r.personRaw;
+      const existing = peopleByName.get(norm(wantName));
       if (existing) {
         personId = existing.id;
       } else {
-        const person: Person = { id: newId(), name: r.personRaw.trim() };
+        const person: Person = { id: newId(), name: wantName.trim() };
         addPerson(person);
         newPeople.push(person);
         personId = person.id;
@@ -552,11 +562,12 @@ export function planTransactionImport(rows: TxnCanonicalRow[], ctx: TxnImportCon
       // from yielding duplicates, while a same-named account belonging to someone else, or held in
       // another currency, no longer swallows the choice.
       const wantCurrency = rowCcy ?? ctx.defaultCurrency;
-      account = accountsByTriple.get(acctTriple(r.accountRaw, wantCurrency, personId));
+      const wantName = accRes.name ?? r.accountRaw;
+      account = accountsByTriple.get(acctTriple(wantName, wantCurrency, personId));
       if (!account) {
         account = {
           id: newId(),
-          name: r.accountRaw.trim(),
+          name: wantName.trim(),
           type: ctx.newAccountType,
           currency: wantCurrency,
           personId, // the owner THIS row names — not a blanket default
@@ -603,7 +614,7 @@ export function planTransactionImport(rows: TxnCanonicalRow[], ctx: TxnImportCon
     } else if (catRes.kind === "id") {
       categoryId = categoriesById.has(catRes.id) ? catRes.id : undefined;
     } else if (catRes.kind === "new" && r.categoryRaw) {
-      categoryId = ensureCategory(r.categoryRaw, undefined);
+      categoryId = ensureCategory(catRes.name ?? r.categoryRaw, undefined);
     } else if (r.categoryRaw) {
       // No explicit mapping: reuse a matching top-level category, else create it.
       const match = categoriesByKey.get(catKey(r.categoryRaw, undefined));
@@ -626,15 +637,18 @@ export function planTransactionImport(rows: TxnCanonicalRow[], ctx: TxnImportCon
         // mapped onto one). Only two levels exist, so keep that sub as the leaf rather than
         // trying to nest a third level under it.
       } else if (categoryId) {
-        // Create/reuse under the resolved parent (exact name within that parent).
-        const match = categoriesByKey.get(catKey(r.subcategoryRaw, categoryId));
-        categoryId = match ? match.id : ensureCategory(r.subcategoryRaw, categoryId);
+        // Create/reuse under the resolved parent (exact name within that parent), using the name
+        // the user chose in the mapping step when they renamed it.
+        const wantSub = subRes.kind === "new" ? (subRes.name ?? r.subcategoryRaw) : r.subcategoryRaw;
+        const match = categoriesByKey.get(catKey(wantSub, categoryId));
+        categoryId = match ? match.id : ensureCategory(wantSub, categoryId);
       } else if (!categoryIgnored) {
         // No category context at all (no column, or an unresolvable value) → keep the sub as a
         // top-level category rather than losing it. NOT done when the user explicitly mapped the
         // category to "leave uncategorised": there, uncategorised is the requested outcome.
-        const match = categoriesByKey.get(catKey(r.subcategoryRaw, undefined));
-        categoryId = match ? match.id : ensureCategory(r.subcategoryRaw, undefined);
+        const wantSub = subRes.kind === "new" ? (subRes.name ?? r.subcategoryRaw) : r.subcategoryRaw;
+        const match = categoriesByKey.get(catKey(wantSub, undefined));
+        categoryId = match ? match.id : ensureCategory(wantSub, undefined);
       }
     }
 

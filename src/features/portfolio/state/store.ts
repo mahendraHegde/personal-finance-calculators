@@ -1313,7 +1313,13 @@ export class PortfolioStore {
         "drive" in patch
           ? { drive: patch.drive === undefined ? undefined : { ...base.drive, ...patch.drive } }
           : {};
-      const next = await this.nextSettings({ ...patch, ...drivePatch }, { stored });
+      // `importAliases` accumulates across imports, so a patch MERGES into the stored map rather
+      // than replacing it (same reasoning as `drive` above).
+      const aliasPatch: Partial<AppSettings> =
+        "importAliases" in patch
+          ? { importAliases: { ...base.importAliases, ...patch.importAliases } }
+          : {};
+      const next = await this.nextSettings({ ...patch, ...drivePatch, ...aliasPatch }, { stored });
       await this.adapter.collection<AppSettings>(Collections.settings).put(next);
       this.emit({ settings: next, fx: this.computeFx(this.state.fxRates, next) });
     });

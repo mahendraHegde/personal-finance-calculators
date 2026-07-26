@@ -314,6 +314,22 @@ export interface AppSettings {
    *  unattended hourly FX refresh throw away an open merge review, blaming the user's own data
    *  for it. Bumped by `commit` and `applyDocument` only. */
   dataSeq?: number;
+  /** What a CSV's own spelling was filed under, keyed `<kind>:<normalised raw value>`
+   *  (`account:cm-groceries` → the "Groceries" account).
+   *
+   *  Without it, a rename made in the mapping step lived only for that import: a later import of
+   *  the same export re-ran the name matching, found nothing called "CM-Groceries", and fell back
+   *  to "create" — fragmenting the taxonomy into duplicates. For ACCOUNTS that also breaks
+   *  duplicate detection, since imported transaction ids embed the account id, so the same rows
+   *  would import twice.
+   *
+   *  Records the `id` when one is known (you picked an existing record) AND the `name`, because
+   *  neither alone is enough: an id doesn't survive a merge or a re-create, while a name is
+   *  ambiguous exactly where it matters — two "IBKR" accounts under different owners, or a "Misc"
+   *  subcategory under two parents. `parent` scopes a subcategory to its own branch. Resolution
+   *  prefers the id, then a UNIQUE name match, and otherwise declines to guess and falls back to
+   *  the normal suggestion. Device-local (settings are stripped from snapshots). */
+  importAliases?: Record<string, { id?: string; name: string; parent?: string }>;
   /** Individual remote snapshots this device has INCORPORATED, as `<fileId>@<version>`.
    *
    *  `lastSyncedVersion` alone is one high-water mark, but snapshot versions are only
