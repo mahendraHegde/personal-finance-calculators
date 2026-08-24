@@ -1,6 +1,7 @@
 // Expenses/income ledger: filters, client-paginated list, and an add/edit form.
 
 import { useMemo, useState } from "react";
+import type { BadgeTone } from "./components";
 import { formatDate, formatMoney, todayIso } from "../../../lib/util/format";
 import { tryConvert } from "../../../lib/money/currency";
 import { newId } from "../../../lib/util/id";
@@ -24,7 +25,7 @@ import {
 } from "./helpers";
 
 const PAGE = 25;
-const TYPE_TONE: Record<TxnType, string> = { income: "green", expense: "red", transfer: "blue" };
+const TYPE_TONE: Record<TxnType, BadgeTone> = { income: "green", expense: "red", transfer: "blue" };
 const MONTH_OPTIONS: { value: string; label: string }[] = [
   ["01", "January"], ["02", "February"], ["03", "March"], ["04", "April"],
   ["05", "May"], ["06", "June"], ["07", "July"], ["08", "August"],

@@ -126,16 +126,31 @@ export function SectionTitle({ children }: { children: ReactNode }) {
   return <h2 className="mb-3 text-lg font-semibold text-slate-800">{children}</h2>;
 }
 
-export function Badge({ children, tone = "slate" }: { children: ReactNode; tone?: string }) {
-  const tones: Record<string, string> = {
-    slate: "bg-slate-100 text-slate-600",
-    green: "bg-green-100 text-green-700",
-    amber: "bg-amber-100 text-amber-700",
-    red: "bg-red-100 text-red-700",
-    blue: "bg-blue-100 text-blue-700",
-  };
+const BADGE_TONES = {
+  slate: "bg-slate-100 text-slate-600",
+  green: "bg-green-100 text-green-700",
+  amber: "bg-amber-100 text-amber-700",
+  red: "bg-red-100 text-red-700",
+  blue: "bg-blue-100 text-blue-700",
+} as const;
+
+/** The tones a `Badge` can be painted. Exported so the tables that FEED it are checked against
+ *  the same list — as `Record<K, string>` they were checked against nothing. */
+export type BadgeTone = keyof typeof BADGE_TONES;
+
+/** Typed rather than `tone?: string`: as a plain string a caller's table of tones was checked
+ *  against nothing, and an unknown one fell back to slate in silence. */
+export function Badge({
+  children,
+  tone = "slate",
+  title,
+}: {
+  children: ReactNode;
+  tone?: BadgeTone;
+  title?: string;
+}) {
   return (
-    <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${tones[tone] ?? tones.slate}`}>
+    <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${BADGE_TONES[tone]}`} title={title}>
       {children}
     </span>
   );

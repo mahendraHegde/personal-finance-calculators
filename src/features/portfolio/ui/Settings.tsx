@@ -1,7 +1,8 @@
 // Settings: display currency, FX refresh + overrides, vault passphrase, local
 // encrypted backup/restore, and Google Drive shared-folder sync.
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { humanError, syncSituation, SYNC_TONE_COLOR } from "./sync-readings";
 import { fetchUsdRates } from "../../../lib/fx/fx-service";
 import { diffDatasets, type DatasetDiff } from "../../../lib/sync/diff";
 import { conflictKey } from "../../../lib/sync/merge";
@@ -11,7 +12,7 @@ import { isEncryptedFile } from "../../../lib/crypto/codec";
 import { formatDate, todayIso } from "../../../lib/util/format";
 import { usePortfolio, useSyncStatus } from "../state/context";
 import type { PortfolioState } from "../state/store";
-import type { MergePreview, SyncPhase } from "../state/sync-controller";
+import type { MergePreview } from "../state/sync-controller";
 import type { ImportBatch, SnapshotDoc } from "../model/types";
 import { Badge, Button, Card, Field, Modal, NumberInput, Select, SectionTitle, TextInput } from "./components";
 import { CURRENCY_CHOICES } from "./helpers";
@@ -20,14 +21,6 @@ import { MergeModal } from "./MergeModal";
 
 // Plain-language labels for the internal sync phases (the user shouldn't see
 // raw ids like "no-vault" / "no-folder").
-const PHASE_LABEL: Record<SyncPhase, string> = {
-  "no-vault": "No password",
-  locked: "Locked",
-  "no-folder": "No folder picked",
-  ready: "Connected",
-  syncing: "Syncing…",
-  error: "Sync error",
-};
 
 interface PendingLoad {
   doc: SnapshotDoc;
@@ -72,9 +65,13 @@ function makeDisplay(state: PortfolioState, doc: SnapshotDoc): DisplayContext {
   return { record, name: makeNameResolver(record) };
 }
 
-export function Settings() {
+export function Settings({
+  reviewRequest = 0,
+  onReviewHandled,
+}: { reviewRequest?: number; onReviewHandled?: () => void } = {}) {
   const { state, store, sync } = usePortfolio();
   const status = useSyncStatus();
+  const { pill } = syncSituation(status);
   const [busy, setBusy] = useState<string | null>(null);
   // Messages carry a tone: a merge SUCCESS must not appear in the same amber banner used
   // for thrown errors (it read as a warning).
@@ -84,6 +81,72 @@ export function Settings() {
   /** A previewed merge awaiting the user's conflict choices. Carries the version
    *  bookkeeping commitMerge revalidates, so a stale plan can never be written. */
   const [mergePlan, setMergePlan] = useState<MergePreview | null>(null);
+  // The startup gate (or the "Review now" notice) asks for the review by bumping a counter the
+  // SHELL owns. Consuming it there — not in a ref here — is what stops the dialog re-opening
+  // every time this tab is revisited, since this component unmounts on tab change.
+  useEffect(() => {
+    if (reviewRequest > 0) {
+      openPullReview();
+      onReviewHandled?.();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fires per request, by design
+  }, [reviewRequest]);
+
+  /** Stage the folder's newest unreconciled snapshot for review. Shared by the "Pull latest"
+   *  button and the startup gate, so both go through the same staleness guard. */
+  const openPullReview = useCallback(
+    () =>
+      run("pull", async () => {
+        // Baseline = local state the diff was computed against. If local
+        // changes while the preview modal is open — an edit (bumps
+        // version) or an autosave push (bumps lastSyncedVersion) — the
+        // diff is stale; abort the apply rather than overwriting newer
+        // data with the previewed snapshot. (Stops a lost-update.)
+        const b = store.getState();
+        const baseV = b.version;
+        const baseSynced = b.settings.lastSyncedVersion;
+        // Both actions below are computed from data as it was WHEN THE DIFF WAS TAKEN,
+        // and the modal can sit open indefinitely. One guard, so the two paths cannot
+        // come to disagree about what "stale" means.
+        const assertFresh = (): void => {
+          const now = store.getState();
+          if (now.version !== baseV || now.settings.lastSyncedVersion !== baseSynced) {
+            throw new Error(
+              "Your data changed since this preview — tap Pull latest again to review the current diff.",
+            );
+          }
+        };
+        const remote = await sync.checkRemote();
+        if (!remote) {
+          setMsg({ text: "No snapshot in the folder yet.", tone: "info" });
+          return;
+        }
+        setPending({
+          doc: remote.doc,
+          version: remote.version,
+          diff: remote.diff,
+          outstandingOthers: remote.outstandingOthers,
+          hasLocalChanges: remote.hasLocalChanges,
+          apply: async () => {
+            assertFresh();
+            // `remote.base` is the real guard (persisted, revalidated in the write
+            // lock); the in-memory check above is just a fast early exit.
+            // Hand over the listing this diff was chosen from, so the post-write recount
+            // has something to count even if its own re-listing fails.
+            await sync.applyRemote(remote.doc, remote.fileId, remote.outstandingOthers, remote.base, {
+              listing: remote.listing,
+            });
+          },
+          // The merge is computed from live local data too, so the same guard applies.
+          merge: async () => {
+            assertFresh();
+            setMergePlan(await sync.previewMerge(remote.doc, remote.fileId));
+          },
+        });
+      }),
+    [store, sync],
+  );
+
   // Built once per staged snapshot, not on every render (it indexes every account/category/
   // person/holding on both sides).
   const display = useMemo(
@@ -97,7 +160,7 @@ export function Settings() {
     try {
       await fn();
     } catch (e) {
-      setMsg({ text: String(e), tone: "error" });
+      setMsg({ text: humanError(e), tone: "error" });
     } finally {
       setBusy(null);
     }
@@ -226,10 +289,12 @@ export function Settings() {
           shared, multi-device copy.
         </p>
         <div className="mb-2">
-          <Badge tone={status.phase === "ready" ? "green" : status.phase === "error" ? "red" : "slate"}>
-            {PHASE_LABEL[status.phase]}
+          {/* The header pill, verbatim — one reading, not a second one alongside it. This row
+              used to pair a PHASE badge with raw `status.message` ("synced v4", "merged"), which
+              could read green "Connected" beside an amber "Behind — 2 to load" in the header. */}
+          <Badge tone={SYNC_TONE_COLOR[pill.tone]} title={pill.title}>
+            {pill.label}
           </Badge>
-          {status.message && <span className="ml-2 text-xs text-slate-500">{status.message}</span>}
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="OAuth client ID">
@@ -301,52 +366,7 @@ export function Settings() {
             <Button
               variant="ghost"
               disabled={busy !== null}
-              onClick={() =>
-                run("pull", async () => {
-                  // Baseline = local state the diff was computed against. If local
-                  // changes while the preview modal is open — an edit (bumps
-                  // version) or an autosave push (bumps lastSyncedVersion) — the
-                  // diff is stale; abort the apply rather than overwriting newer
-                  // data with the previewed snapshot. (Stops a lost-update.)
-                  const b = store.getState();
-                  const baseV = b.version;
-                  const baseSynced = b.settings.lastSyncedVersion;
-                  const remote = await sync.checkRemote();
-                  if (!remote) {
-                    setMsg({ text: "No snapshot in the folder yet.", tone: "info" });
-                    return;
-                  }
-                  setPending({
-                    doc: remote.doc,
-                    version: remote.version,
-                    diff: remote.diff,
-                    outstandingOthers: remote.outstandingOthers,
-                    hasLocalChanges: remote.hasLocalChanges,
-                    apply: async () => {
-                      const now = store.getState();
-                      if (now.version !== baseV || now.settings.lastSyncedVersion !== baseSynced) {
-                        throw new Error(
-                          "Your data changed since this preview — tap Pull latest again to review the current diff.",
-                        );
-                      }
-                      // `remote.base` is the real guard (persisted, revalidated in the write
-                      // lock); the in-memory check above is just a fast early exit.
-                      await sync.applyRemote(remote.doc, remote.fileId, remote.outstandingOthers, remote.base);
-                    },
-                    // Same staleness guard: the merge is computed from live local data, so a
-                    // local change while this modal sat open must invalidate the preview too.
-                    merge: async () => {
-                      const now = store.getState();
-                      if (now.version !== baseV || now.settings.lastSyncedVersion !== baseSynced) {
-                        throw new Error(
-                          "Your data changed since this preview — tap Pull latest again to review the current diff.",
-                        );
-                      }
-                      setMergePlan(await sync.previewMerge(remote.doc, remote.fileId));
-                    },
-                  });
-                })
-              }
+              onClick={openPullReview}
             >
               Pull latest
             </Button>
@@ -464,7 +484,7 @@ function RestorePassphraseModal({
     try {
       await onSubmit(pass); // on success the caller unmounts this modal (no need to reset busy)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(humanError(e));
       setBusy(false);
     }
   };
@@ -517,7 +537,7 @@ function PasswordChangeModal({
       await onSubmit(pass);
       onClose();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(humanError(e));
     } finally {
       setBusy(false);
     }
@@ -628,7 +648,7 @@ function VaultSection() {
       setPass("");
     } catch (e) {
       // Show just the message (no techy "Error:" prefix) for end users.
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(humanError(e));
     } finally {
       setBusy(false);
     }

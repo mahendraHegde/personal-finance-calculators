@@ -5,7 +5,7 @@
 // Flow: setup/unlock vault → configure Drive (client id + api key) → pick the
 // shared folder → push session snapshots (autosave) / pull-and-diff on demand.
 
-import { latestSnapshot, type Codec } from "../../../lib/sync/types";
+import { latestSnapshot, type Codec, type SnapshotMeta } from "../../../lib/sync/types";
 import { SyncEngine } from "../../../lib/sync/engine";
 import { diffDatasets, type DatasetDiff } from "../../../lib/sync/diff";
 import {
@@ -39,6 +39,9 @@ export interface MergePreview {
   /** Why this merge can't be published yet, so the UI explains the RIGHT reason rather than
    *  blaming the folder listing for every case. `null` = it can be. */
   ackBlocked: "outstanding" | "unavailable" | null;
+  /** The listing this preview was computed from, and when — so `commitMerge` can recount it after
+   *  the write instead of republishing a pre-merge number under a fresh timestamp. */
+  listing: Listing | null;
 }
 import {
   createDekCodec,
@@ -104,15 +107,111 @@ function writeSessionResume(s: SessionResume): void {
 
 export type SyncPhase = "no-vault" | "locked" | "no-folder" | "ready" | "syncing" | "error";
 
+/** The CLAUSE for each recurring failure, in one place. The surfaces compose it differently (a
+ *  banner explains what happens next, a tooltip is a fragment), but a user who hits the same
+ *  problem twice in a session must not be given two different names for it. */
+export const SYNC_TEXT = {
+  authExpired: "Google sign-in expired",
+  unreachable: "Couldn't reach the shared folder",
+} as const;
+
 export interface SyncStatus {
   phase: SyncPhase;
   message?: string;
-  remoteVersion?: number;
   /** True only when the error is specifically a sign-in/token failure — the UI
    *  shows "Reconnect Google" for this, NOT for a conflict / data-loss / vault
    *  error (those need "Pull latest", and Reconnect can't resolve them). */
   needsAuth?: boolean;
+  /** The last time we LOOKED at the folder, as one indivisible fact: when, and either how many
+   *  snapshots were unincorporated or that we couldn't see it.
+   *
+   *  Deliberately not three fields. As `behind` / `lastCheckedAt` / `unreachable` they were three
+   *  projections of a single observation, written from five call sites — and two of them published
+   *  one projection from an observation that didn't support the others (a fresh timestamp on a
+   *  stale count; a count measured against state the write then destroyed). Every bug in this area
+   *  had that shape. Written only by `observed()`, which recomputes the count itself. */
+  lastCheck?: { at: string; behind: number } | { at: string; unreachable: true };
+  /** Version of a snapshot applied WITHOUT the user asking (the startup gate's automatic lane),
+   *  so the UI can acknowledge it. Live status rather than the gate's one-shot result, because the
+   *  write can land after the gate has already given up waiting. */
+  appliedVersion?: number;
+  /** The raw error text, for the pill's tooltip and debugging — never the banner, which needs a
+   *  sentence a person can act on. Cleared whenever a new `message` is set, so a stale error can't
+   *  be mis-attributed to a later, unrelated one. */
+  detail?: string;
+  /** A problem the STARTUP CHECK found. Separate from `message` because the check deliberately
+   *  leaves `phase` alone (a failed read must not gate autosave), and the notice's error branch is
+   *  keyed on `phase === "error"` — so anything written to `message` here reached a tooltip and
+   *  nowhere else. Cleared by the next successful check.
+   *
+   *  It CARRIES its own `detail` rather than borrowing the top-level one: clearing the sentence
+   *  and leaving the diagnostic behind re-attached "decrypt failed: bad MAC" to whatever notice
+   *  showed next. A diagnostic that can outlive its sentence will. */
+  problem?: { text: string; detail?: string };
 }
+
+/** Outcome of the startup check, so the shell knows whether to let the user in.
+ *
+ *  The shell acts on the `kind` alone: `review` opens the diff, and `refundsCheckSlot` (in
+ *  `sync-readings.ts`, where it is tested) decides which outcomes give back the one-check-per-start
+ *  slot. The rest are informational — everything the UI SHOWS comes from
+ *  live `SyncStatus`, never from this result, so the two can't drift.
+ *
+ *  Deliberately read-only apart from ONE narrow write (`applied`): a device that has just been
+ *  opened is the most likely to be stale, and finding that out after an edit turns a free
+ *  fast-forward into a merge the user has to reason about. */
+export type StartupCheck =
+  /** Looked, and nothing in the folder is newer. */
+  | { kind: "up-to-date" }
+  /** No folder configured, so there was nothing to look at. Distinct from `up-to-date` because
+   *  the shell spends its one check per app start on the answer: a session that STARTS without a
+   *  folder and picks one a minute later must still get a gate for it — that is the moment a
+   *  folder is most likely to hold family data this device has never seen. */
+  | { kind: "no-folder" }
+  /** A pure addition was applied automatically (local was clean, nothing removed or modified). */
+  | { kind: "applied" }
+  /** Needs a human: something would be removed or rewritten, or this device has unsynced work. */
+  | { kind: "review" }
+  /** Behind, but the vault is locked so snapshots can't be decoded — only listed. */
+  | { kind: "locked-behind" }
+  /** Couldn't reach the folder (offline, sign-in expired, timeout). Work continues locally. */
+  | { kind: "unavailable" };
+
+/** The persisted bookkeeping the hazard rule reads. */
+type SyncFacts = { lastSyncedVersion: number; localVersion: number; seenSnapshots: string[]; deviceId: string };
+
+/** How far our OWN deviceId is excused. A file carrying our id is ours unless it sits above the
+ *  version this database has actually reached — a cloned profile keeps the id while the data
+ *  diverges, so the exemption has to be bounded. Written once: the hazard rule and the v1 adopt
+ *  path both ask for it, and a bound that differs between them is a guard that stops guarding. */
+function ownBound(sync: SyncFacts): { deviceId: string; version: number } {
+  return { deviceId: sync.deviceId, version: Math.max(sync.localVersion, sync.lastSyncedVersion) };
+}
+
+/** A folder listing AND the moment it was taken. One value, never two fields: as `listing` +
+ *  `listedAt` the write site chose the files with `??` and the timestamp with `?:` — two
+ *  predicates that agreed only by coincidence — and an omitted timestamp silently defaulted to
+ *  "now", which is exactly the false-freshness bug this pair was introduced to fix. */
+export interface Listing {
+  files: SnapshotMeta[];
+  /** Which listing this device saw LATER. Ordering by wall clock instead cost four review rounds
+   *  in a row: a stamp is written by the same clock that says what "now" is, so while the clock is
+   *  wrong the two agree and nothing looks amiss — the impossibility only appears after a
+   *  correction, by which point the bad stamp is stored and out-ranks every later look. A counter
+   *  has no such failure mode, and it is the ACTUAL question being asked. */
+  seq: number;
+  /** When the folder answered — for display only ("Synced · 14:20"), never for ordering. Stamped
+   *  as the listing RETURNS, not after the work that follows it, so it doesn't claim a freshness
+   *  the folder was never asked about. */
+  at: string;
+}
+
+/** How a listing is published. See `checkRemote`. */
+type Recorder = (
+  listing: Listing,
+  sync: SyncFacts,
+  ignoreIds?: readonly (string | null | undefined)[],
+) => void;
 
 export interface RemoteCheck {
   doc: SnapshotDoc;
@@ -132,6 +231,10 @@ export interface RemoteCheck {
   /** True when the PERSISTED row shows unsynced work (any tab's), so the dialog warns even when
    *  this tab's in-memory `dirty` is false. */
   hasLocalChanges: boolean;
+  /** The folder listing this check was made from, and when — so a later write can recount it
+   *  instead of republishing a count taken before the write, and dates it from the moment the
+   *  folder was actually looked at rather than the moment the user finally clicked. */
+  listing: Listing | null;
   /** Other snapshots that would STILL be unincorporated after loading this one. Non-zero means
    *  loading it must not advance the synced watermark (it would jump those files), and the dialog
    *  has to say the reconciliation isn't finished — the old wording promised the opposite. */
@@ -218,6 +321,10 @@ export class SyncController {
     // conflict/ready state and show a misleading Reconnect button.
     const next: SyncStatus = { ...this.status, ...status };
     if (status.phase !== undefined && status.needsAuth === undefined) next.needsAuth = false;
+    // `detail` is the raw text behind whatever sentence is CURRENT. A new message that doesn't
+    // bring its own diagnostic clears it, so an old one can never be read as the explanation of a
+    // later, unrelated failure.
+    if (status.message !== undefined && status.detail === undefined) next.detail = undefined;
     this.status = next;
     for (const cb of this.listeners) cb();
   }
@@ -645,10 +752,11 @@ export class SyncController {
     let mustAccountCount = 0;
     if (this.provider) {
       const stored = await this.store.persistedSyncState();
-      const deviceId = stored.deviceId;
       const seenAlready = new Set(stored.seenSnapshots);
-      const own = { deviceId, version: Math.max(stored.localVersion, stored.lastSyncedVersion) };
-      const hazards = unincorporatedFiles(metas, preAdopt.lastSyncedVersion, seenAlready, own);
+      const own = ownBound(stored); // the same bound the hazard rule applies, not a second copy
+      // The SAME rule as the push guard, asked for rather than restated: two copies of "what
+      // counts as unread" is how the migration guard and the push guard came to disagree.
+      const hazards = this.hazards(metas, { ...stored, lastSyncedVersion: preAdopt.lastSyncedVersion });
       const mustAccount = [
         ...new Map(
           [...metas.filter((m) => m.version === guardMax), ...hazards].map((m) => [m.id, m]),
@@ -1112,6 +1220,9 @@ export class SyncController {
   private refreshPhase(): void {
     this.rebuildProvider();
     this.rebuildEngine();
+    // AFTER the rebuild, so the engine is already pointing at the new folder and the switch is
+    // noticed now rather than on the next observation.
+    this.forgetOtherFolder();
     if (!this.codec) {
       // Distinguish a configured-but-LOCKED vault (DEK dropped from this browser,
       // but the cached keyring remains) from a device that has NEVER set a
@@ -1189,6 +1300,9 @@ export class SyncController {
       //    excused only up to the version this database has actually reached. A twin that edited
       //    and pushed past us sits above that, so the guard still fires and its rows get reviewed.
       const others = metas.filter((m) => m.id !== sessionFileId);
+      // Record the listing HERE, immediately: it is the observation, and the checks below (vault
+      // verification, keyring repair) can throw without making it any less true.
+      this.observed(this.newListing(metas), await this.store.persistedSyncState(), [sessionFileId]);
 
       // Was the vault ROTATED under us by another tab? Tabs share the settings row, and a
       // settings write now (correctly) reads that row — so this tab's `state.settings` can hold
@@ -1277,11 +1391,7 @@ export class SyncController {
       // scheduling a retry (autosave is gated on `phase === "ready"`) this tab silently stops
       // syncing until a reload. The same staleness once made our OWN file look like a clone.
       const sync = await this.store.persistedSyncState();
-      const lastSynced = sync.lastSyncedVersion;
-      const unmerged = unincorporatedFiles(others, lastSynced, new Set(sync.seenSnapshots), {
-        deviceId: sync.deviceId,
-        version: Math.max(sync.localVersion, sync.lastSyncedVersion),
-      });
+      const unmerged = this.hazards(others, sync);
       if (unmerged.length > 0) {
         this.set({
           phase: "error",
@@ -1310,6 +1420,9 @@ export class SyncController {
         (m) => m.id !== sessionFileId && m.id !== meta.id,
       );
       if (after.some((m) => m.version >= meta.version)) {
+        // `after` proves another device just published — record it, or the notice stays silent
+        // about a file we now know is unread.
+        this.observed(this.newListing(after), await this.store.persistedSyncState(), [sessionFileId, meta.id]);
         this.set({
           phase: "error",
           message: "Sync conflict — another device synced at the same time. Pull latest to reconcile.",
@@ -1321,6 +1434,8 @@ export class SyncController {
       // only by a cap, and past the cap the oldest acknowledgement is dropped and the guard can
       // never clear. `after` is the post-push listing (our own files are exempt by deviceId).
       await this.store.markSynced(meta.version, after.map(snapshotKey));
+      // Measure the post-push listing rather than asserting "we are level" — same rule, one place.
+      this.observed(this.newListing(after), await this.store.persistedSyncState(), [sessionFileId, meta.id]);
       // Record this session's file id (only now, on confirmed success) so a
       // refresh resumes it rather than minting a new file.
       this.persistSession();
@@ -1338,7 +1453,10 @@ export class SyncController {
       const authNeeded = e instanceof SignInRequiredError;
       this.set({
         phase: "error",
-        message: authNeeded ? "Google sign-in needed — click Reconnect to resume sync." : String(e),
+        message: authNeeded
+          ? `${SYNC_TEXT.authExpired} — click Reconnect to resume sync.`
+          : "Couldn't sync just now — your changes are saved on this device, and syncing will retry.",
+        detail: String(e),
         needsAuth: authNeeded,
       });
       // Retry a TRANSIENT Drive blip so autosave isn't wedged forever (local data
@@ -1362,11 +1480,291 @@ export class SyncController {
     }, SYNC.AUTOSAVE_RETRY_MS);
   }
 
-  /** Download the latest snapshot and diff it against local — for the confirm UI. */
-  async checkRemote(): Promise<RemoteCheck | null> {
+  /** Look at the shared folder ONCE, on app start, before the user can touch anything.
+   *
+   *  A just-opened device is the most likely to be stale, and finding that out only after an edit
+   *  turns a free fast-forward into a merge the user has to reason about. So this runs first and
+   *  the shell blocks on it.
+   *
+   *  Read-only apart from ONE write, and that write is deliberately hard to reach: local must be
+   *  clean AND the incoming snapshot must be a pure addition. Anything removed or modified goes to
+   *  the user, because another device restoring an old backup and publishing it looks exactly like
+   *  "just catch up" — and adopting it silently would drop rows. Composed entirely from the
+   *  existing, reviewed pieces (`hazards`, `checkRemote`, `applyRemote`); it adds no sync rules.
+   *
+   *  Never pushes: publishing local work stays with the guarded autosave path. */
+  async startupCheck(timeoutMs = 8000): Promise<StartupCheck> {
+    const settings = this.store.getState().settings;
+    if (!settings.drive?.folderId || !this.provider) return { kind: "no-folder" }; // local-only
+    /** Record a listing and report what it showed.
+     *
+     *  Two jobs, both load-bearing. It refuses to publish once the run is abandoned — a run we
+     *  stopped waiting for must never write over newer facts. And it sets `listed`, which is what
+     *  makes "we couldn't see the folder" a statement about THIS run rather than a default: a
+     *  listing that succeeded is not retracted just because a later step timed out or the token
+     *  expired mid-download. `behind` is still returned when abandoned so the run can finish its
+     *  own reasoning without publishing. */
+    const note = (
+      listing: Listing,
+      sync: SyncFacts,
+      ignore: readonly (string | null | undefined)[] = [],
+    ): number => {
+      listed = true;
+      return abandoned
+        ? this.hazards(listing.files, sync, ignore).length
+        : this.observed(listing, sync, ignore);
+    };
+    // `Promise.race` cannot cancel work. Without this flag the losing run kept going and applied a
+    // snapshot AFTER we had already reported "unavailable" and dropped the overlay — the user
+    // could be typing into data that was about to be replaced.
+    let abandoned = false;
+    /** Did this run ever get a listing? A failed READ is not an unreachable folder. */
+    let listed = false;
+    /** Did it ever ASK for one? An IndexedDB failure on the first line of the run is not the
+     *  folder's fault, and reporting it as "couldn't reach the shared folder" sends the user to
+     *  check their connection over a problem that has nothing to do with it. With nothing to say,
+     *  we say nothing. */
+    let looked = false;
+
+    const run = async (): Promise<StartupCheck> => {
+      const sync = await this.store.persistedSyncState();
+      // A locked vault can still LIST — file metadata isn't encrypted — so we can tell the user
+      // they're behind even though nothing can be decoded until they unlock.
+      if (!this.codec || !this.engine) {
+        looked = true;
+        const metas = await this.provider!.list();
+        return note(this.newListing(metas), sync) > 0 ? { kind: "locked-behind" } : { kind: "up-to-date" };
+      }
+      looked = true;
+      const metas = await this.engine.list();
+      if (note(this.newListing(metas), sync, [this.engine.getSessionFileId()]) === 0) {
+        return { kind: "up-to-date" };
+      }
+
+      if (abandoned) return { kind: "review" }; // stop working; the caller has moved on
+      let remote;
+      try {
+        // Guarded recorder: this download can outlive the deadline, and its listing must not be
+        // republished over whatever the user has done since.
+        remote = await this.checkRemote(note);
+      } catch (e) {
+        if (e instanceof SignInRequiredError) throw e; // genuinely transport → outer catch
+        // The listing above succeeded, so the folder IS reachable: this is the snapshot's
+        // problem, not the network's. Keep the real message (e.g. "another device is still
+        // finishing the encryption upgrade") and send the user to review rather than claiming
+        // we're offline.
+        if (!abandoned) {
+          // A dropped connection mid-download and an unreadable snapshot are different problems
+          // and deserve different sentences; only the second is the snapshot's fault.
+          const dropped = e instanceof TypeError;
+          this.set({
+            problem: {
+              text: dropped
+                ? "Couldn't finish downloading your other device's latest changes — check your connection and try again."
+                : "Couldn't read the newest snapshot from your other device — it may still be uploading, or was written by a different version of the app.",
+              detail: String(e),
+            },
+          });
+        }
+        return { kind: "review" };
+      }
+      if (!remote) return { kind: "up-to-date" };
+      // Everything past here is a decision about OUR data, not transport — so a failure must fall
+      // through to "a human should look at this", never to "the folder is unreachable".
+      const pureAddition = remote.diff.summary.removed === 0 && remote.diff.summary.modified === 0;
+      // A snapshot can carry collections this build has no store for (a peer on a newer build).
+      // `importAll` SKIPS those, so applying it would drop their rows while recording the file as
+      // incorporated, and our next push would publish without them. The merge path drops them too
+      // — it is not a workaround — but it at least puts a human in front of the decision, and the
+      // peer keeps its own copy either way. So: never automatically.
+      const known = new Set(SCHEMA.collections.map((c) => c.name));
+      const knownSchema =
+        remote.doc.schemaVersion <= SCHEMA.version &&
+        Object.keys(remote.doc.data).every((name) => known.has(name));
+      if (!remote.hasLocalChanges && pureAddition && knownSchema && !abandoned) {
+        try {
+          await this.applyRemote(remote.doc, remote.fileId, remote.outstandingOthers, remote.base, {
+            listing: remote.listing,
+            // The write can still land after the race timed out (nothing can cancel it), so the
+            // acknowledgement has to come from live status — the shell's one-shot result is
+            // already "unavailable" by then and would say nothing at all.
+            announce: true,
+          });
+          // No note here: applyRemote records the observation AFTER its write.
+          return { kind: "applied" };
+        } catch {
+          // A refused write (a sibling tab got there first) is a reconciliation matter.
+          return { kind: "review" };
+        }
+      }
+      return { kind: "review" };
+    };
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    try {
+      const timeout = new Promise<StartupCheck>((resolve) => {
+        timer = setTimeout(() => {
+          if (settled) return; // a dead run must never speak again
+          abandoned = true;
+          // Only if we never saw the folder. A deadline reached while DOWNLOADING says nothing
+          // about reachability — the listing already proved otherwise, and overwriting its count
+          // with "unreachable" both states a falsehood and hides the "you're behind" warning this
+          // whole check exists to give, right as the overlay drops and editing becomes possible.
+          if (looked && !listed) this.observedUnreachable();
+          resolve({ kind: "unavailable" });
+        }, timeoutMs);
+      });
+      return await Promise.race([run(), timeout]);
+    } catch (e) {
+      // Transport only. Deliberately does NOT set `phase`: autosave is gated on phase === "ready",
+      // so failing a read here used to stop this tab syncing for the whole session — with no
+      // retry scheduled — before the user had done anything at all.
+      const needsAuth = e instanceof SignInRequiredError;
+      this.set({ needsAuth });
+      // Same rule as the timeout: a token that expires mid-DOWNLOAD leaves the listing standing.
+      // `needsAuth` still tells the user what to fix; the count tells them what is at stake.
+      if (looked && !listed) this.observedUnreachable();
+      return { kind: "unavailable" };
+    } finally {
+      // MUST be finally: on the reject path the old placement left the timer armed.
+      settled = true;
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Record what a listing showed. The ONLY writer of `lastCheck`.
+   *
+   *  Takes the listing itself — never a pre-computed number — so a count can never be published
+   *  without the observation behind it, and never survive a write that invalidates it (the caller
+   *  passes post-write `sync` state where that matters). `null` means we tried and couldn't see
+   *  the folder. `at` exists so an observation made earlier (a merge preview) keeps its own
+   *  timestamp instead of borrowing the moment it happens to be published. */
+  private observed(
+    listing: Listing,
+    sync: SyncFacts,
+    ignoreIds: readonly (string | null | undefined)[] = [],
+  ): number {
+    // Adopt or forget FIRST: publishing an observation is also the moment we learn which folder
+    // our observations are about, so a switch noticed here can't be missed by a phase refresh that
+    // never happened.
+    this.forgetOtherFolder();
+    // NEWEST FILES × NEWEST STATE. Neither half is optional, and the two arrive separately:
+    //
+    //  - A caller can hold a listing for as long as a dialog stays open, then hand it over after a
+    //    write. Its FILE SET has never heard of anything published since, so recounting it alone
+    //    reported 0 and retired a "2 to load" warning while the file was genuinely unread.
+    //  - But that caller has just CHANGED the state the count depends on (a merge acknowledges a
+    //    file; a replace resets the seen-log), so the standing count is stale too — keeping it
+    //    nagged the user about the very file they had just merged.
+    //
+    // So: the newest FILE SET we have seen, recounted against the state we were just handed. One
+    // rule, in the one writer. "Newest" is by sequence — see `Listing.seq`.
+    const standing = this.lastListing;
+    // `applyRemote({ listing })` is public and `Listing` is exported, so a sequence this controller
+    // never minted can arrive. It is DEMOTED rather than refused — refusing only works when there
+    // is something to compare against, and with nothing remembered yet the impostor would become
+    // the baseline and out-rank every real look from then on. Permanently, where the timestamp
+    // scheme this replaced at least healed as wall time caught up.
+    const incoming: Listing = listing.seq <= this.listingSeq ? listing : { ...listing, seq: 0 };
+    const newest = standing && standing.seq > incoming.seq ? standing : incoming;
+    const behind = this.hazards(newest.files, sync, ignoreIds).length;
+    this.lastListing = newest;
+    // Returns the count so no caller recomputes it with a hand-copied ignore list — two lists that
+    // must agree, written out twice, is how the published count and the returned one diverged in
+    // the first place. The published stamp is display-only, and never claims the future: a clock
+    // that ran fast is the user's problem to fix, not something to render as "synced at 3pm".
+    const now = this.nowIso();
+    this.set({ lastCheck: { at: newest.at > now ? now : newest.at, behind }, problem: undefined });
+    return behind;
+  }
+
+  /** The most recent folder listing we have seen, kept OUT of `SyncStatus` because it is evidence,
+   *  not something the UI renders. Cleared whenever it stops describing the folder we sync with. */
+  private lastListing: Listing | null = null;
+
+  /** The wall clock, as one seam — used for the DISPLAY stamp and nothing else. Kept as a seam so
+   *  tests can prove that a wrong clock changes nothing that matters. */
+  private nowIso(): string {
+    return new Date().toISOString();
+  }
+
+  private listingSeq = 0;
+
+  /** Every listing is created here, by this one controller — which is exactly what makes `seq` a
+   *  total order over "which look happened first". Nothing else may mint one. */
+  private newListing(files: readonly SnapshotMeta[]): Listing {
+    return { files: [...files], seq: ++this.listingSeq, at: this.nowIso() };
+  }
+
+  /** Drop everything we know about the folder's contents. Every observation is a statement about
+   *  ONE folder, so pointing this device at another makes them all false — and the pill would go
+   *  on reporting a count, and a "checked at", for a folder we no longer sync with. */
+  private forgetFolderObservations(): void {
+    this.lastListing = null;
+    this.set({ lastCheck: undefined, problem: undefined });
+  }
+
+  /** The folder our published observations describe, so a change of folder can be NOTICED rather
+   *  than announced. Hanging this off `refreshPhase` covers every route — the folder picker, a
+   *  sibling tab's pick arriving through the settings row, a re-pick after a disconnect — instead
+   *  of the one method that happens to change it today. */
+  private observedFolderId: string | undefined;
+
+  private forgetOtherFolder(): void {
+    // `engineFolderId`, not the settings row: settings change first and then await network work,
+    // so during that window a listing still comes from the OLD folder.
+    const folderId = this.engineFolderId ?? undefined;
+    const previous = this.observedFolderId;
+    this.observedFolderId = folderId;
+    // First sight of a folder ADOPTS it: a fresh controller has published nothing to invalidate,
+    // and a needless clear would still notify every subscriber (a render) to say nothing.
+    if (previous === undefined || previous === folderId) return;
+    this.forgetFolderObservations();
+  }
+
+  /** We tried to look and couldn't. Its own method because "we have no listing to count" is NOT
+   *  the same fact as "the folder is unreachable" — conflating them let a successful pull whose
+   *  bookkeeping listing failed announce that the folder was offline, and suppress the very
+   *  "you're still behind" warning the gate exists to give. */
+  private observedUnreachable(): void {
+    this.set({ lastCheck: { at: this.nowIso(), unreachable: true } });
+  }
+
+  /** Files that may still hold records this device has never read.
+   *
+   *  The push guard, the pull-target choice, the pull's watermark decision and the startup check
+   *  all ask this same question; `ignoreIds` is the only thing that differs (this session's own
+   *  file, or the file being applied). Keeping the rule in one place is what stops four copies of
+   *  the same four arguments from drifting apart. Takes the listing as an argument so no caller
+   *  lists the folder twice. */
+  private hazards(
+    metas: readonly SnapshotMeta[],
+    sync: SyncFacts,
+    ignoreIds: readonly (string | null | undefined)[] = [],
+  ): SnapshotMeta[] {
+    const skip = new Set(ignoreIds.filter((id): id is string => !!id));
+    return unincorporatedFiles(
+      metas.filter((m) => !skip.has(m.id)),
+      sync.lastSyncedVersion,
+      new Set(sync.seenSnapshots),
+      ownBound(sync),
+    );
+  }
+
+  /** Download the latest snapshot and diff it against local — for the confirm UI.
+   *
+   *  `record` is how the listing gets published. It is a parameter because the startup check must
+   *  be able to substitute a guarded recorder: this method publishes from INSIDE the download,
+   *  which for an abandoned run lands after the caller has moved on — a dead run republishing its
+   *  pre-download count over a live one. */
+  async checkRemote(
+    record: Recorder = (l, sync, ignore) => this.observed(l, sync, ignore),
+  ): Promise<RemoteCheck | null> {
     if (!this.engine) throw new Error("sync not ready");
     let loaded;
     let outstandingOthers = 0;
+    let listing: Listing | null = null;
     try {
       // Target the newest file that still needs reconciling, NOT unconditionally the folder's
       // max. Versions are monotonic per device, so a device can hold an unmerged file BELOW
@@ -1374,24 +1772,20 @@ export class SyncController {
       // nothing, it stayed outstanding, and the guard refused forever. Falls back to the max
       // once nothing is outstanding (the plain catch-up / acknowledge case).
       const metas = await this.engine.list();
+      // Created as the folder ANSWERS, not after the download that follows it. A download that
+      // then fails consumes this sequence without recording it — gaps are fine, only the ORDER of
+      // the listings that do get recorded matters.
+      const seen = this.newListing(metas);
       const sync = await this.store.persistedSyncState(); // stored, not this tab's memory
-      const others = metas.filter((m) => m.id !== this.engine?.getSessionFileId());
-      const own = {
-        deviceId: sync.deviceId,
-        version: Math.max(sync.localVersion, sync.lastSyncedVersion),
-      };
-      const unmerged = unincorporatedFiles(others, sync.lastSyncedVersion, new Set(sync.seenSnapshots), own);
+      const unmerged = this.hazards(metas, sync, [this.engine?.getSessionFileId()]);
       const target = latestSnapshot(unmerged.length > 0 ? unmerged : metas);
       loaded = target ? await this.engine.loadFile(target) : null;
       // Everything that would remain unread after loading `target`.
       outstandingOthers = target
-        ? unincorporatedFiles(
-            others.filter((m) => m.id !== target.id),
-            sync.lastSyncedVersion,
-            new Set(sync.seenSnapshots),
-            own,
-          ).length
+        ? this.hazards(metas, sync, [this.engine?.getSessionFileId(), target.id]).length
         : 0;
+      listing = seen;
+      record(seen, sync, [this.engine?.getSessionFileId()]);
     } catch (e) {
       // If the latest is a legacy v1 file, another device hasn't finished the
       // encryption upgrade — our DEK-only codec can't decode it. Its edit isn't lost
@@ -1419,6 +1813,9 @@ export class SyncController {
       outstandingOthers,
       base: fingerprint,
       hasLocalChanges: fingerprint.localVersion > fingerprint.lastSyncedVersion,
+      // The listing this diff was chosen from. `applyRemote` recounts it against POST-write state
+      // rather than trusting a number measured before the write reset the seen-log.
+      listing,
     };
   }
 
@@ -1463,25 +1860,33 @@ export class SyncController {
     let seenRemoteVersion: number | null = null;
     let outstandingOthers = 0;
     let ackBlocked: MergePreview["ackBlocked"] = null;
+    let listing: Listing | null = null;
     if (!this.engine) {
       // No folder configured/reachable at all: we cannot see what else exists, so we make no
       // claim. (An engine that lists an EMPTY folder is different — that IS evidence.)
       ackBlocked = "unavailable";
-      return { doc, plan, base, seenRemoteVersion, seenKey, outstandingOthers, ackBlocked };
+      return { doc, plan, base, seenRemoteVersion, seenKey, outstandingOthers, ackBlocked, listing };
     }
     try {
       const sessionFileId = this.engine.getSessionFileId();
       const files = await this.engine.list();
+      listing = this.newListing(files);
       const others = files.filter((f) => f.id !== sessionFileId);
       // The acknowledgement log from STORAGE too: `base` is persisted, but a sibling tab's merge
       // records a key that this tab's memory would not have.
       const sync = await this.store.persistedSyncState();
       const seen = new Set(sync.seenSnapshots);
       if (seenKey) seen.add(seenKey); // what this merge is about to incorporate
-      const outstanding = unincorporatedFiles(others, watermark, seen, {
-        deviceId: sync.deviceId,
-        version: Math.max(local.version, sync.localVersion, sync.lastSyncedVersion),
-      });
+      // Deliberately NOT `hazards()`: this is the HYPOTHETICAL count after the merge — the
+      // preview's own watermark, `seenKey` already added, and this document's version folded into
+      // the bound. Same own-device rule though, so it asks `ownBound` for the shape rather than
+      // writing a third copy of it.
+      const outstanding = unincorporatedFiles(
+        others,
+        watermark,
+        seen,
+        ownBound({ ...sync, localVersion: Math.max(local.version, sync.localVersion) }),
+      );
       outstandingOthers = outstanding.length;
       if (outstanding.length > 0) {
         ackBlocked = "outstanding";
@@ -1501,8 +1906,10 @@ export class SyncController {
       // "unknown", not "refused", and must not be reported as another device's doing.
       seenRemoteVersion = null;
       ackBlocked = "unavailable";
+      listing = null;
     }
     return {
+      listing,
       doc,
       plan,
       base,
@@ -1548,7 +1955,18 @@ export class SyncController {
         },
       );
       this.refreshPhase(); // clear the conflict phase so autosave resumes
-      this.set({ message: "merged" });
+      // The merge just incorporated one file; what's left is what the preview counted.
+      this.set({
+        message: "merged",
+      });
+      // The preview's listing, recounted against POST-merge state and stamped with the moment it
+      // was actually taken. Publishing `preview.outstandingOthers` under `new Date()` claimed a
+      // freshness no check had — the modal window between them is unbounded.
+      if (preview.listing) {
+        this.observed(preview.listing, await this.store.persistedSyncState(), [
+          this.engine?.getSessionFileId(),
+        ]);
+      }
       // Honest about what happens next: with another unincorporated file still out there the
       // push guard WILL refuse, so the UI must not promise "tap Sync now". A failed listing is
       // reported separately — the merge is saved and the guard re-checks on the next attempt.
@@ -1561,6 +1979,7 @@ export class SyncController {
     docFileId?: string,
     outstandingOthers = 0,
     expect?: VersionFingerprint,
+    opts: { announce?: boolean; listing?: Listing | null } = {},
   ): Promise<void> {
     // Serialized against syncNow so a push can't be mid-flight when we replace
     // local data (which would otherwise interleave the controller's push
@@ -1574,18 +1993,13 @@ export class SyncController {
       // version between our watermark and this doc's would otherwise be subsumed with no merge
       // ever offered. A failed listing keeps the conservative answer (hold the watermark).
       let holdWatermark = outstandingOthers > 0;
+      let listed: Listing | null = null; // our own listing, kept for the post-write recount
       if (this.engine) {
         try {
           const sync = await this.store.persistedSyncState();
           const metas = await this.engine.list();
-          const others = metas.filter(
-            (m) => m.id !== this.engine?.getSessionFileId() && m.id !== docFileId,
-          );
-          holdWatermark =
-            unincorporatedFiles(others, sync.lastSyncedVersion, new Set(sync.seenSnapshots), {
-              deviceId: sync.deviceId,
-              version: Math.max(sync.localVersion, sync.lastSyncedVersion),
-            }).length > 0;
+          listed = this.newListing(metas);
+          holdWatermark = this.hazards(metas, sync, [this.engine.getSessionFileId(), docFileId]).length > 0;
         } catch {
           holdWatermark = true;
         }
@@ -1604,7 +2018,30 @@ export class SyncController {
       // subsequent edits would never reach Drive. refreshPhase restores "ready"
       // (engine+codec present) and reschedules autosave for any pending edits.
       this.refreshPhase();
-      this.set({ message: `loaded v${doc.version}` });
+      this.set({
+        message: `loaded v${doc.version}`,
+        ...(opts.announce ? { appliedVersion: doc.version } : {}),
+      });
+      // AFTER the write, recounted against POST-write state. A replace resets the seen-log, which
+      // resurrects previously acknowledged files — so any number measured before the write is
+      // wrong, including the caller's. What the caller's listing gives us is the FILES; the count
+      // is derived here, from them, afterwards. Falling back to its pre-write figure (as this did)
+      // could report 0 while a resurrected file sat unread.
+      // With no listing at all (engine torn down mid-flow) we simply say nothing: the previous
+      // observation may be stale, but an overstated count nags, whereas claiming the folder is
+      // unreachable is a falsehood that also HIDES the outstanding-file warning.
+      //
+      // The caller's listing keeps the caller's TIMESTAMP. Its window is unbounded — a diff can
+      // sit open on screen for half an hour — so publishing it under `new Date()` claimed a
+      // freshness nothing had: a green "Synced · 14:30" over a 14:05 listing, while a file
+      // published at 14:20 sat unread and unmentioned.
+      const seen = listed ?? opts.listing;
+      if (seen) {
+        this.observed(seen, await this.store.persistedSyncState(), [
+          this.engine?.getSessionFileId(),
+          docFileId,
+        ]);
+      }
     });
   }
 

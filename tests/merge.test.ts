@@ -152,6 +152,9 @@ import { SCHEMA } from "../src/features/portfolio/model/schema";
 import { createPortfolioStore, pruneSeen } from "../src/features/portfolio/state/store";
 import { SyncController } from "../src/features/portfolio/state/sync-controller";
 import type { SnapshotDoc, Transaction } from "../src/features/portfolio/model/types";
+import type { SnapshotMeta } from "../src/lib/sync/types";
+import { readLastCheck, humanError, syncSituation, refundsCheckSlot, SYNC_TONE_COLOR } from "../src/features/portfolio/ui/sync-readings";
+import { SignInRequiredError } from "../src/lib/google/drive-auth";
 
 const tx = (id: string, over: Partial<Transaction> = {}): Transaction => ({
   id, date: "2026-01-01", type: "expense", accountId: "A1", personId: "p1",
@@ -1252,6 +1255,1645 @@ section("[store] the pull-replace path carries a fingerprint, so a sibling tab's
     { seenSnapshotKey: "fileB@9", expect: fresh.fingerprint },
   );
   ok(tab1.getState().transactions.some((t) => t.id === "from-folder"), "an uncontested replace still applies");
+}
+
+// ---------------------------------------------------------------------------
+// The startup gate: what a just-opened device does before the user can touch anything.
+// ---------------------------------------------------------------------------
+
+/** Controller with a stub engine/provider over `files`, serving `docs` by file id. */
+function withFolder(store: Awaited<ReturnType<typeof deviceWith>>, files: SnapshotMeta[], docs: Record<string, SnapshotDoc>, opts: { locked?: boolean } = {}) {
+  const controller = new SyncController(store);
+  const engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async (m: { id: string }) => ({ doc: docs[m.id], meta: files.find((f) => f.id === m.id) }),
+  };
+  const inject = (): void => {
+    const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+    c.engine = opts.locked ? null : engine;
+    c.provider = { list: async () => files };
+    c.codec = opts.locked ? null : {};
+  };
+  inject();
+  return { controller, inject };
+}
+/** The three readings the UI derives from `status.lastCheck`, for assertions. */
+const seen = (c: SyncController): { behind: number | undefined; unreachable: boolean; at: string | undefined } => {
+  const lc = c.getStatus().lastCheck;
+  return {
+    behind: lc && "behind" in lc ? lc.behind : undefined,
+    unreachable: !!lc && "unreachable" in lc,
+    at: lc?.at,
+  };
+};
+const meta = (id: string, version: number, deviceId: string): SnapshotMeta =>
+  ({ id, name: id, version, deviceId, author: "me", savedAt: `2026-01-0${Math.min(version, 9)}T00:00:00Z`, schemaVersion: SCHEMA.version });
+/** A snapshot built FROM this device's own export, so shared rows are byte-identical — which is
+ *  what a real peer snapshot looks like (the store stamps `updatedAt`/`author` on write, so a
+ *  hand-built row would differ on every field and read as "modified"). */
+async function peerDoc(
+  store: Awaited<ReturnType<typeof deviceWith>>,
+  version: number,
+  edit: (txns: Transaction[]) => Transaction[],
+): Promise<SnapshotDoc> {
+  const local = await store.exportDocument();
+  return {
+    schemaVersion: SCHEMA.version,
+    version,
+    data: { ...local.data, transactions: edit((local.data.transactions ?? []) as Transaction[]) } as never,
+  };
+}
+
+section("[startup] a pure addition on a clean device is loaded automatically");
+{
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version); // clean: nothing of ours is unpushed
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("fileB", 9, "tablet")];
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const { controller } = withFolder(store, files, { fileB: doc });
+  const res = await controller.startupCheck();
+  eq(res.kind, "applied", "it applied without asking");
+  ok(store.getState().transactions.some((t) => t.id === "from-B"), "the other device's row is here");
+  ok(store.getState().transactions.some((t) => t.id === "local-1"), "…and ours is untouched");
+  eq(seen(controller).behind, 0, "the pill can now honestly say synced");
+  ok(!!seen(controller).at, "…with a checked-at stamp");
+}
+
+section("[startup] a snapshot that would REMOVE our rows is never applied automatically");
+{
+  // The case that makes silent catch-up unsafe: another device restored an old backup and
+  // published it. It looks like "just newer" but drops rows, so it must reach a human.
+  const store = await deviceWith([tx("local-1"), tx("local-2")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => t.filter((x) => x.id !== "local-2"));
+  const { controller } = withFolder(store, [meta("fileB", 9, "tablet")], { fileB: doc });
+  const res = await controller.startupCheck();
+  eq(res.kind, "review", "it stops for review");
+  eq(store.getState().transactions.length, 2, "and nothing was written — both our rows remain");
+}
+
+section("[startup] a snapshot that MODIFIES a record is not applied automatically either");
+{
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => t.map((x) => (x.id === "local-1" ? { ...x, amount: 999 } : x)));
+  const { controller } = withFolder(store, [meta("fileB", 9, "tablet")], { fileB: doc });
+  eq((await controller.startupCheck()).kind, "review", "a rewrite of an existing row needs a human");
+  eq(store.getState().transactions[0]!.amount, 100, "our value is untouched");
+}
+
+section("[startup] unsynced local work always goes to review, even for a pure addition");
+{
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  await store.saveTransaction(tx("typed-here")); // now dirty
+  const { controller } = withFolder(store, [meta("fileB", 9, "tablet")], { fileB: doc });
+  eq((await controller.startupCheck()).kind, "review", "a dirty device is never auto-replaced");
+  ok(store.getState().transactions.some((t) => t.id === "typed-here"), "our unsynced row survives");
+}
+
+section("[startup] a locked vault reports being behind without decoding anything");
+{
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const { controller } = withFolder(store, [meta("fileB", 9, "tablet")], {}, { locked: true });
+  const res = await controller.startupCheck();
+  eq(res.kind, "locked-behind", "listing works while locked — metadata isn't encrypted");
+  eq(seen(controller).behind, 1, "…and the count it published says how many are waiting");
+}
+
+section("[startup] nothing to check when no folder is configured");
+{
+  const store = await deviceWith([tx("local-1")], 3);
+  let listed = false;
+  const controller = new SyncController(store);
+  (controller as unknown as { provider: unknown }).provider = {
+    list: async () => {
+      listed = true;
+      return [];
+    },
+  };
+  // Not "up-to-date": nothing was looked at, and the shell must be able to tell the difference —
+  // it spends its one check per app start on this answer.
+  eq((await controller.startupCheck()).kind, "no-folder", "a local-only user sees nothing");
+  eq(listed, false, "…and the folder is never listed");
+}
+
+section("[startup] an unreachable folder lets the user work locally");
+{
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.provider = { list: async () => { throw new Error("offline"); } };
+  c.engine = { list: async () => { throw new Error("offline"); }, getSessionFileId: () => null };
+  c.codec = {};
+  const res = await controller.startupCheck();
+  eq(res.kind, "unavailable", "it reports unavailable rather than blocking");
+  eq(store.getState().transactions.length, 1, "local data is untouched");
+}
+
+section("[startup] the behind count stops claiming work that has been done");
+{
+  // The pill and the standing notice read `behind`. It was only ever set by the startup check, so
+  // after the user actually loaded or merged, the app kept telling them they were behind.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const { controller } = withFolder(store, [meta("fileB", 9, "tablet")], { fileB: doc });
+  eq((await controller.startupCheck()).kind, "applied", "the pure addition is applied");
+  eq(seen(controller).behind, 0, "…and nothing is reported as still waiting");
+
+  // A pull of one file while ANOTHER remains unread must leave the count at that other file.
+  const store2 = await deviceWith([tx("local-1")], 3);
+  await store2.markSynced(store2.getState().version);
+  await store2.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const docB = await peerDoc(store2, 9, (t) => [...t, tx("from-B")]);
+  const files = [meta("fileB", 9, "tablet"), meta("fileC", 8, "phone")];
+  const { controller: c2 } = withFolder(store2, files, { fileB: docB, fileC: docB });
+  const remote = await c2.checkRemote();
+  eq(remote?.fileId, "fileB", "the newest unreconciled file is targeted");
+  eq(remote?.outstandingOthers, 1, "one other file is still unreconciled");
+  await c2.applyRemote(remote!.doc, remote!.fileId, remote!.outstandingOthers, remote!.base);
+  eq(seen(c2).behind, 1, "the count reflects the file still waiting, not zero");
+}
+
+section("[startup] a failed check must not wedge autosave for the session");
+{
+  // `phase` gates autosave (`phase !== "ready"` → return). A read-only check that set "error"
+  // stopped every later edit from ever being scheduled, with no retry — before the user had done
+  // anything. The check reports unreachability without touching the phase.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.provider = { list: async () => { throw new Error("offline"); } };
+  c.engine = { list: async () => { throw new Error("offline"); }, getSessionFileId: () => null };
+  c.codec = {};
+  const before = controller.getStatus().phase;
+  eq((await controller.startupCheck()).kind, "unavailable", "it reports unavailable");
+  eq(controller.getStatus().phase, before, "…without changing the phase that gates autosave");
+  eq(seen(controller).unreachable, true, "…flagging unreachable for the UI instead");
+}
+
+section("[startup] a refused apply reports what is really left, not zero");
+{
+  // `behind` was published BEFORE the write it described, so a refusal (a sibling tab got there
+  // first) left the pill saying "Synced" while a peer file was genuinely unread.
+  const adapter = createMemoryStorage(SCHEMA);
+  const tab1 = await createPortfolioStore(adapter);
+  await tab1.savePerson({ id: "p1", name: "Ravi" });
+  await tab1.saveAccount({ id: "A1", name: "HDFC", type: "bank", currency: "INR", personId: "p1" });
+  await tab1.saveTransaction(tx("local-1"));
+  await tab1.markSynced(tab1.getState().version);
+  await tab1.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  // A MODIFYING snapshot, so the gate routes to review and publishes a real count instead of
+  // applying — without that prior value, "behind is not 0" would pass vacuously.
+  const doc = await peerDoc(tab1, 9, (t) => t.map((x) => ({ ...x, amount: 555 })));
+  const { controller, inject } = withFolder(tab1, [meta("fileB", 9, "tablet")], { fileB: doc });
+  eq((await controller.startupCheck()).kind, "review", "the gate stops for review");
+  eq(seen(controller).behind, 1, "…and publishes one file waiting");
+
+  inject(); // refreshPhase() rebuilt the engine from (absent) real config
+  const remote = await controller.checkRemote();
+  // A sibling tab writes during the confirm window → the compare-and-apply must refuse.
+  const tab2 = await createPortfolioStore(adapter);
+  await tab2.saveTransaction(tx("typed-in-tab2"));
+  let refused = false;
+  try {
+    await controller.applyRemote(remote!.doc, remote!.fileId, remote!.outstandingOthers, remote!.base);
+  } catch {
+    refused = true;
+  }
+  ok(refused, "the apply is refused");
+  eq(seen(controller).behind, 1, "…and the count still says one file is unread, not 0");
+  ok(
+    (await adapter.exportAll()).transactions?.some((t) => t.id === "typed-in-tab2"),
+    "the sibling tab's row survives",
+  );
+  eq(tab1.getState().transactions.find((t) => t.id === "local-1")?.amount, 100, "…and ours is unchanged");
+}
+
+section("[startup] a snapshot from a NEWER build is never applied automatically");
+{
+  // `importAll` skips collections this build has no store for, so an automatic apply would drop
+  // the peer's rows while recording the file as incorporated — and the next push would publish
+  // without them. The merge path handles it; the silent lane must not.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const future = { ...doc, schemaVersion: SCHEMA.version + 1 };
+  const { controller } = withFolder(store, [meta("fileB", 9, "tablet")], { fileB: future });
+  eq((await controller.startupCheck()).kind, "review", "a future schema goes to review");
+  ok(!store.getState().transactions.some((t) => t.id === "from-B"), "nothing was applied");
+}
+
+section("[startup] the timeout stops the work, not just the answer");
+{
+  // `Promise.race` can't cancel. The losing run used to keep going and apply a snapshot after
+  // "unavailable" had been reported and the blocking overlay taken down.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const slow = async <T,>(v: T): Promise<T> => {
+    await new Promise((r) => setTimeout(r, 60));
+    return v;
+  };
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = {
+    list: async () => slow(files),
+    getSessionFileId: () => null,
+    loadFile: async () => slow({ doc, meta: files[0] }),
+  };
+  c.provider = { list: async () => slow(files) };
+  c.codec = {};
+  eq((await controller.startupCheck(20)).kind, "unavailable", "it gives up on time");
+  await new Promise((r) => setTimeout(r, 300)); // let the abandoned run finish
+  ok(
+    !store.getState().transactions.some((t) => t.id === "from-B"),
+    "and the abandoned run did NOT write after we stopped waiting",
+  );
+  ok(seen(controller).unreachable, "the user is told why the wait ended");
+}
+
+section("[startup] a write that lands AFTER the timeout is announced, not silent");
+{
+  // Nothing can cancel an in-flight apply, so if the race times out mid-write the data still
+  // changes. The one unacceptable outcome is saying nothing: the dashboard totals would move with
+  // no explanation. `appliedVersion` is live status, so the acknowledgement survives the gate
+  // having already resolved to "unavailable".
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  let listCalls = 0;
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = {
+    // Calls 1 (the gate's own count) and 2 (checkRemote's) are fast, so the apply decision is
+    // reached and passes. Call 3 is applyRemote's internal re-listing — slow, so the race times
+    // out while the write is already in flight. That is the only window where an apply can land
+    // after the caller has been told "unavailable".
+    list: async () => {
+      listCalls += 1;
+      if (listCalls > 2) await new Promise((r) => setTimeout(r, 120));
+      return files;
+    },
+    getSessionFileId: () => null,
+    loadFile: async () => ({ doc, meta: files[0] }),
+  };
+  c.provider = { list: async () => files };
+  c.codec = {};
+  eq((await controller.startupCheck(40)).kind, "unavailable", "the caller stopped waiting");
+  await new Promise((r) => setTimeout(r, 400));
+  ok(store.getState().transactions.some((t) => t.id === "from-B"), "the write did land (uncancellable)");
+  eq(controller.getStatus().appliedVersion, 9, "…and it is announced, so the UI can say so");
+}
+
+section("[startup] a STRICT-SUPERSET snapshot still goes to review when local work is unsynced");
+{
+  // The existing dirty-device test passes for the wrong reason: its unsynced row reads as
+  // `removed`, so `pureAddition` is already false and `removed === 0` alone forces review —
+  // deleting the `!hasLocalChanges` condition would not fail it. This is the load-bearing case:
+  // the peer's snapshot is a strict SUPERSET of ours (nothing removed, nothing modified) while we
+  // still hold unpushed work, so only `hasLocalChanges` can stop the automatic lane.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  // Build the peer doc from our CURRENT rows plus one, then make ourselves dirty in a way the
+  // snapshot already contains — a re-save of an existing row (what an autopay reconcile does).
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  // `localVersion > lastSyncedVersion` with the DATA untouched: unpushed work by the store's own
+  // definition, while the peer's snapshot remains a strict superset of ours.
+  await store.saveSettings({ lastSyncedVersion: store.getState().settings.localVersion - 1 });
+  const { controller } = withFolder(store, [meta("fileB", 9, "tablet")], { fileB: doc });
+  const remote = await controller.checkRemote();
+  eq(remote?.diff.summary.removed, 0, "nothing would be removed");
+  eq(remote?.diff.summary.modified, 0, "…and nothing modified — a strict superset");
+  ok(remote?.hasLocalChanges, "…yet this device has unsynced work");
+  eq((await controller.startupCheck()).kind, "review", "so the automatic lane must refuse");
+  ok(!store.getState().transactions.some((t) => t.id === "from-B"), "nothing was applied");
+}
+
+section("[startup] an unknown COLLECTION is refused even at our own schema version");
+{
+  // The schema guard is `schemaVersion <= ours && every collection known`. The existing test bumps
+  // the version, which short-circuits the && — so the collection clause was never evaluated.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const base = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  // Same schemaVersion as us, but carrying a store this build doesn't have: `importAll` would skip
+  // it while we recorded the file as incorporated, so its rows would be silently dropped.
+  const withUnknown = {
+    ...base,
+    data: { ...base.data, budgets: [{ id: "b1", name: "Groceries" }] } as never,
+  };
+  const { controller } = withFolder(store, [meta("fileB", 9, "tablet")], { fileB: withUnknown });
+  eq((await controller.startupCheck()).kind, "review", "an unknown collection goes to review");
+  ok(!store.getState().transactions.some((t) => t.id === "from-B"), "nothing was applied");
+
+  // And it is not over-tight: a snapshot that simply OMITS our empty collections still auto-applies.
+  const store2 = await deviceWith([tx("local-1")], 3);
+  await store2.markSynced(store2.getState().version);
+  await store2.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const full = await peerDoc(store2, 9, (t) => [...t, tx("from-B")]);
+  const trimmed = { ...full, data: { ...full.data } as Record<string, unknown> };
+  delete trimmed.data.holdings;
+  delete trimmed.data.holdingEvents;
+  const { controller: c2 } = withFolder(store2, [meta("fileB", 9, "tablet")], { fileB: trimmed as never });
+  eq((await c2.startupCheck()).kind, "applied", "omitting empty collections is fine");
+}
+
+section("[startup] a dead run's timer can never speak over a later success");
+{
+  // `clearTimeout` used to sit after the await inside the try, so a REJECTING run skipped it and
+  // the orphan timer fired seconds later, setting `unreachable: true` over whatever had happened
+  // since — including a successful apply. The pill flipped to "Not connected" with no way back.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  // Run 1 REJECTS (offline).
+  c.provider = { list: async () => { throw new Error("offline"); } };
+  c.engine = { list: async () => { throw new Error("offline"); }, getSessionFileId: () => null };
+  c.codec = {};
+  eq((await controller.startupCheck(30)).kind, "unavailable", "the offline launch reports unavailable");
+  eq(seen(controller).unreachable, true, "…and says so");
+  // Run 2 succeeds, as it would after the user reconnects or unlocks.
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const files = [meta("fileB", 9, "tablet")];
+  c.provider = { list: async () => files };
+  c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => ({ doc, meta: files[0] }) };
+  eq((await controller.startupCheck()).kind, "applied", "the second run applies");
+  eq(seen(controller).unreachable, false, "…and clears the offline flag");
+  // Well past run 1's 30ms deadline: the orphan must stay silent.
+  await new Promise((r) => setTimeout(r, 200));
+  eq(seen(controller).unreachable, false, "the dead run's timer did not re-flag us offline");
+}
+
+section("[startup] a successful listing clears the offline flag, even with nothing to send");
+{
+  // The notice tells the user their changes are local-only; both recoveries it points at (Sync now,
+  // Pull latest) list the folder successfully, so neither may leave the flag set.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.provider = { list: async () => { throw new Error("offline"); } };
+  c.engine = { list: async () => { throw new Error("offline"); }, getSessionFileId: () => null };
+  c.codec = {};
+  await controller.startupCheck(30);
+  eq(seen(controller).unreachable, true, "offline launch sets the flag");
+  // Now reachable, and there is genuinely nothing to reconcile.
+  const doc = await peerDoc(store, 9, (t) => t);
+  const files = [meta("fileB", 9, "tablet")];
+  c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => ({ doc, meta: files[0] }) };
+  c.provider = { list: async () => files };
+  await controller.checkRemote();
+  eq(seen(controller).unreachable, false, "a successful Pull latest clears it");
+}
+
+section("[startup] a successful apply never leaves a 'you are behind' claim standing");
+{
+  // `remaining` used to be derived from a listing taken BEFORE the write and published after it.
+  // When that listing threw, the gate's pre-apply count survived — so a SUCCESSFUL automatic apply
+  // still said "Behind — 1", which also outranked (and hid) the acknowledgement.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  let calls = 0;
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = {
+    // Calls 1-2 succeed (the gate's count, then checkRemote); call 3 — applyRemote's own
+    // re-listing — fails, as a rate-limit or a drop mid-write would.
+    list: async () => {
+      calls += 1;
+      if (calls > 2) throw new Error("rate limited");
+      return files;
+    },
+    getSessionFileId: () => null,
+    loadFile: async () => ({ doc, meta: files[0] }),
+  };
+  c.provider = { list: async () => files };
+  c.codec = {};
+  eq((await controller.startupCheck()).kind, "applied", "the apply succeeds");
+  ok(store.getState().transactions.some((t) => t.id === "from-B"), "the data is here");
+  eq(seen(controller).behind, 0, "and the count says nothing is waiting — not a stale 1, not 'unknown'");
+  eq(controller.getStatus().appliedVersion, 9, "…so the acknowledgement is what the user sees");
+}
+
+section("[startup] the count after a merge excludes the file just merged");
+{
+  // `commitMerge` gated the count on `ackBlocked === null`, which by definition means "nothing
+  // outstanding" — so the only value it could publish was 0, while the case carrying a real number
+  // ("outstanding", a SUCCESSFUL listing) was skipped and the pre-merge count stood. The user was
+  // then nagged about the very file they had just merged.
+  const store = await deviceWith([tx("local-1")], 3);
+  const files = [meta("fileA", 4, "phone"), meta("fileB", 5, "tablet")];
+  const docs: Record<string, SnapshotDoc> = {
+    fileA: { schemaVersion: SCHEMA.version, version: 4, data: { transactions: [tx("from-A")] } as never },
+    fileB: { schemaVersion: SCHEMA.version, version: 5, data: { transactions: [tx("from-B")] } as never },
+  };
+  const controller = new SyncController(store);
+  const inject = (): void => {
+    (controller as unknown as { engine: unknown }).engine = {
+      list: async () => files,
+      getSessionFileId: () => null,
+      loadFile: async (m: { id: string }) => ({ doc: docs[m.id], meta: files.find((f) => f.id === m.id) }),
+    };
+  };
+  inject();
+  const preview = await controller.previewMerge(docs.fileB!, "fileB");
+  eq(preview.ackBlocked, "outstanding", "one other file is still unreconciled");
+  eq(preview.outstandingOthers, 1, "…exactly one");
+  await controller.commitMerge(preview, {});
+  eq(seen(controller).behind, 1, "the count is what remains AFTER the merge, not before");
+  ok(store.getState().transactions.some((t) => t.id === "from-B"), "the merged rows are here");
+}
+
+section("[sync] a raw error never reaches the banner, only the tooltip");
+{
+  // The diff promotes `status.message` to an app-wide banner, where "TypeError: Failed to fetch"
+  // is not something a person can act on. The sentence and the diagnostic are now separate fields.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.provider = { list: async () => files0 };
+  const files0: SnapshotMeta[] = [];
+  c.engine = { list: async () => { throw new TypeError("Failed to fetch"); }, getSessionFileId: () => null };
+  c.codec = {};
+  await controller.syncNow().catch(() => {});
+  const st = controller.getStatus();
+  ok(!/TypeError/.test(st.message ?? ""), `the banner sentence is human: ${st.message}`);
+  ok(/Failed to fetch/.test(st.detail ?? ""), "…and the raw text is kept as detail");
+}
+
+section("[startup] an automatic apply still reports the OTHER files left to load");
+{
+  // The auto-apply lane was only ever tested with a single peer file, so a bug that dropped the
+  // remaining count went unnoticed: with the post-write listing failing, `behind` became
+  // "unknown", which renders as NO notice at all — hiding a file the push guard would then refuse
+  // and turning a free fast-forward into a merge.
+  const build = async () => {
+    const store = await deviceWith([tx("local-1")], 3);
+    await store.markSynced(store.getState().version);
+    await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+    const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+    // fileB is a pure addition (auto-appliable); fileC is a different device's file we've never read.
+    const files = [meta("fileB", 9, "tablet"), meta("fileC", 8, "phone")];
+    return { store, doc, files };
+  };
+
+  // (a) everything reachable: the count must be the OTHER file.
+  {
+    const { store, doc, files } = await build();
+    const { controller } = withFolder(store, files, { fileB: doc, fileC: doc });
+    eq((await controller.startupCheck()).kind, "applied", "the pure addition is applied");
+    eq(seen(controller).behind, 1, "…and the untouched peer file is still reported");
+  }
+
+  // (b) the post-write listing fails: it must fall back to the known-good figure, never to unknown.
+  {
+    const { store, doc, files } = await build();
+    const controller = new SyncController(store);
+    let calls = 0;
+    const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+    c.engine = {
+      list: async () => {
+        calls += 1;
+        if (calls > 2) throw new Error("rate limited"); // applyRemote's own re-listing
+        return files;
+      },
+      getSessionFileId: () => null,
+      loadFile: async (m: { id: string }) => ({ doc, meta: files.find((f) => f.id === m.id) }),
+    };
+    c.provider = { list: async () => files };
+    c.codec = {};
+    eq((await controller.startupCheck()).kind, "applied", "the apply still succeeds");
+    eq(seen(controller).behind, 1, "…and the outstanding file is NOT hidden");
+    ok(!seen(controller).unreachable, "…nor is a successful download called unreachable");
+  }
+}
+
+section("[sync] a successful push clears the offline flag");
+{
+  // The other half of what the "clears the offline flag" test claims to cover: `runSync`'s own
+  // paths. Reverting those clears used to leave the whole suite green.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.provider = { list: async () => { throw new Error("offline"); } };
+  c.engine = { list: async () => { throw new Error("offline"); }, getSessionFileId: () => null };
+  c.codec = {};
+  await controller.startupCheck(30);
+  eq(seen(controller).unreachable, true, "the offline launch sets the flag");
+  // Now reachable and nothing to send (a clean device): runSync's "nothing to sync" path.
+  await store.markSynced(store.getState().version);
+  c.engine = { list: async () => [meta("fileB", 2, "tablet")], getSessionFileId: () => null };
+  c.provider = { list: async () => [meta("fileB", 2, "tablet")] };
+  await controller.syncNow().catch(() => {});
+  eq(seen(controller).unreachable, false, "a successful listing clears it, even with nothing to send");
+}
+
+section("[startup] the count is recomputed AFTER the write, not carried over from before it");
+{
+  // The mutation audit's headline gap: nothing distinguished a post-write recount from the
+  // caller's pre-write figure, so the whole mechanism could have been deleted silently. A replace
+  // RESETS the seen-log, which resurrects a previously acknowledged file — so any number measured
+  // before the write can report 0 while a file sits unread.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  // fileC was merged earlier: it is in the seen-log, so a PRE-write count excludes it.
+  await store.applyDocument(
+    { schemaVersion: SCHEMA.version, version: 5, data: {} as never },
+    { dirty: true, seenSnapshotKey: "fileC@5" },
+  );
+  await store.markSynced(store.getState().version);
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const files = [meta("fileB", 9, "tablet"), meta("fileC", 5, "phone")];
+  const controller = new SyncController(store);
+  let calls = 0;
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = {
+    // checkRemote's listing succeeds; applyRemote's own re-listing fails, which forces the
+    // watermark to be HELD — the only state where the resurrected file still counts (otherwise
+    // the advanced watermark legitimately supersedes it).
+    list: async () => {
+      calls += 1;
+      if (calls > 1) throw new Error("rate limited");
+      return files;
+    },
+    getSessionFileId: () => null,
+    loadFile: async () => ({ doc, meta: files[0] }),
+  };
+  c.provider = { list: async () => files };
+  c.codec = {};
+  const remote = await controller.checkRemote();
+  eq(remote?.outstandingOthers, 0, "before the write, fileC is excluded — it is in the seen-log");
+  await controller.applyRemote(remote!.doc, remote!.fileId, remote!.outstandingOthers, remote!.base, {
+    listing: remote!.listing,
+  });
+  // The replace reset the log to [fileB@9] and held the watermark, so fileC is unincorporated
+  // again — and must be counted.
+  eq(store.getState().settings.seenSnapshots?.join(","), "fileB@9", "the replace reset the log");
+  eq(seen(controller).behind, 1, "the published count reflects POST-write state, not the pre-write 0");
+}
+
+section("[startup] a decode failure is not reported as an unreachable folder");
+{
+  // Restoring the pre-fix `unreachable: true` here used to leave the suite green.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async () => { throw new Error("decrypt failed: bad MAC"); },
+  };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  eq((await controller.startupCheck()).kind, "review", "an unreadable snapshot needs a human");
+  eq(seen(controller).unreachable, false, "the folder listed fine — this is not a network fault");
+  eq(seen(controller).behind, 1, "…and the count from that listing stands");
+  // Reported through `problem`, not `message`: the check leaves `phase` alone, and the shell's
+  // error branch is keyed on `phase === "error"` — so a sentence in `message` reached a tooltip
+  // and nowhere else.
+  ok(/Couldn't read the newest snapshot/.test(controller.getStatus().problem?.text ?? ""), "the sentence names the real problem");
+}
+
+section("[sync] a successful push records what the folder held afterwards");
+{
+  // Deleting the post-push observation used to leave the suite green.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  await store.saveTransaction(tx("to-push")); // dirty, so runSync actually pushes
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown; sessionVerified: boolean; keyringEnsured: boolean };
+  let pushed = 0;
+  c.engine = {
+    list: async () => [],
+    getSessionFileId: () => null,
+    setSessionFileId: () => {},
+    push: async () => {
+      pushed += 1;
+      return meta("mine", store.getState().version + 1, store.getState().settings.deviceId);
+    },
+    prune: async () => 0,
+  };
+  c.provider = { list: async () => [] };
+  c.codec = {};
+  c.sessionVerified = true; // skip the DEK backstop, which needs a real provider
+  c.keyringEnsured = true;
+  await controller.syncNow().catch(() => {});
+  eq(pushed, 1, "it pushed");
+  eq(seen(controller).behind, 0, "…and recorded the post-push listing as the observation");
+  ok(!!seen(controller).at, "…with the moment it was taken");
+}
+
+section("[startup] a merge is stamped with the moment its listing was taken, not the moment OK was clicked");
+{
+  // The review modal can sit open for minutes. Publishing the count under `new Date()` claimed a
+  // freshness no check had: "checked just now" against a folder last looked at before lunch.
+  const store = await deviceWith([tx("local-1")], 3);
+  const files = [meta("fileA", 4, "phone"), meta("fileB", 5, "tablet")];
+  const docs: Record<string, SnapshotDoc> = {
+    fileA: { schemaVersion: SCHEMA.version, version: 4, data: { transactions: [tx("from-A")] } as never },
+    fileB: { schemaVersion: SCHEMA.version, version: 5, data: { transactions: [tx("from-B")] } as never },
+  };
+  const stamped = new SyncController(store);
+  (stamped as unknown as { engine: unknown }).engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async (m: { id: string }) => ({ doc: docs[m.id], meta: files.find((f) => f.id === m.id) }),
+  };
+  const preview = await stamped.previewMerge(docs.fileB!, "fileB");
+  ok(!!preview.listing?.at, "the preview carries the moment it looked");
+  await new Promise((r) => setTimeout(r, 5)); // the user reads the diff
+  await stamped.commitMerge(preview, {});
+  eq(seen(stamped).at, preview.listing?.at, "the observation keeps the LISTING's timestamp");
+}
+
+section("[sync] a push that loses the race still records what the other device published");
+{
+  // The TOCTOU branch reported the conflict and said nothing about the listing that proved it, so
+  // the shell kept whatever count it had — often 0 — while a file it had never read sat there.
+  // (In the WINNING lane every other file is below the new watermark by construction, so the only
+  // post-push listing that can carry a real number is this one.)
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  await store.saveTransaction(tx("to-push")); // dirty, so runSync actually pushes
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown; sessionVerified: boolean; keyringEnsured: boolean };
+  let listed = 0;
+  let pushedVersion = 0;
+  c.engine = {
+    // Empty before the push; a rival's file at our own version after it — the race we lost.
+    list: async () => (++listed === 1 ? [] : [meta("fileRival", pushedVersion, "tablet")]),
+    getSessionFileId: () => null,
+    setSessionFileId: () => {},
+    push: async () => {
+      pushedVersion = store.getState().version + 1;
+      return meta("mine", pushedVersion, store.getState().settings.deviceId);
+    },
+    prune: async () => 0,
+  };
+  c.provider = { list: async () => [] };
+  c.codec = {};
+  c.sessionVerified = true;
+  c.keyringEnsured = true;
+  await controller.syncNow().catch(() => {});
+  ok(listed >= 2, "it re-listed after pushing");
+  ok(/Sync conflict/.test(controller.getStatus().message ?? ""), "the conflict is reported");
+  eq(seen(controller).behind, 1, "…and so is the rival file we have never read");
+}
+
+section("[sync] a successful push dates the pill from the listing taken AFTER it");
+{
+  // The count itself can't move here — the push guard only lets us publish when nothing is
+  // outstanding, and everything else is below the new watermark — so what the post-push
+  // observation carries is FRESHNESS. Without it "checked at" is stamped from the pre-push
+  // listing, which is older than the folder we just wrote to.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  await store.saveTransaction(tx("to-push"));
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown; sessionVerified: boolean; keyringEnsured: boolean };
+  let pushedAt = "";
+  c.engine = {
+    list: async () => [],
+    getSessionFileId: () => null,
+    setSessionFileId: () => {},
+    push: async () => {
+      await new Promise((r) => setTimeout(r, 5)); // uploads take time; the pre-push look is now old
+      pushedAt = new Date().toISOString();
+      return meta("mine", store.getState().version + 1, store.getState().settings.deviceId);
+    },
+    prune: async () => 0,
+  };
+  c.provider = { list: async () => [] };
+  c.codec = {};
+  c.sessionVerified = true;
+  c.keyringEnsured = true;
+  await controller.syncNow().catch(() => {});
+  eq(controller.getStatus().phase, "ready", "the push went through");
+  eq(seen(controller).behind, 0, "…with nothing left outstanding");
+  ok((seen(controller).at ?? "") >= pushedAt, "…and dated from after the upload, not before it");
+}
+
+section("[startup] a dropped download and an unreadable snapshot get different sentences");
+{
+  // Both are read failures with a good listing, but only one is the user's connection. Collapsing
+  // them told an offline user their peer's file was corrupt.
+  const build = async () => {
+    const store = await deviceWith([tx("local-1")], 3);
+    await store.markSynced(store.getState().version);
+    await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+    return store;
+  };
+  const files = [meta("fileB", 9, "tablet")];
+  const run = async (thrown: unknown): Promise<string> => {
+    const controller = new SyncController(await build());
+    const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+    c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => { throw thrown; } };
+    c.provider = { list: async () => files, download: async () => new Uint8Array() };
+    c.codec = {};
+    eq((await controller.startupCheck()).kind, "review", "either way a human decides");
+    return controller.getStatus().problem?.text ?? "";
+  };
+  ok(/check your connection/.test(await run(new TypeError("Failed to fetch"))), "a dropped download blames the connection");
+  ok(/still be uploading/.test(await run(new Error("decrypt failed"))), "an unreadable snapshot does not");
+}
+
+section("[startup] an apply is never started once the run has been abandoned");
+{
+  // `Promise.race` cannot cancel: without the flag the losing run reached the auto-apply lane and
+  // replaced the user's data after the overlay had already gone away.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]); // a pure addition: auto-appliable
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    // The read outlives the deadline, so the decision below happens on an abandoned run.
+    loadFile: async () => { await new Promise((r) => setTimeout(r, 30)); return { doc, meta: files[0] }; },
+  };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  const res = await controller.startupCheck(10);
+  eq(res.kind, "unavailable", "the caller was told we timed out");
+  await new Promise((r) => setTimeout(r, 60)); // let the losing run finish
+  ok(!store.getState().transactions.some((t) => t.id === "from-B"), "nothing was applied behind the user's back");
+}
+
+section("[ui] the shell's readings of lastCheck");
+{
+  // Rendered by the shell and covered by nothing until these: every mutation of them survived.
+  eq(readLastCheck(undefined).behind, 0, "never looked → nothing to report");
+  eq(readLastCheck(undefined).unreachable, false, "…and not a failure either");
+  eq(readLastCheck(undefined).checkedAt, null, "…and no 'checked at' to show");
+  const good = readLastCheck({ at: "2026-01-01T00:00:00.000Z", behind: 2 });
+  eq(good.behind, 2, "a successful look reports its count");
+  eq(good.unreachable, false, "…is not a failure");
+  eq(good.checkedAt, "2026-01-01T00:00:00.000Z", "…and licenses a 'checked at'");
+  const bad = readLastCheck({ at: "2026-01-01T00:00:00.000Z", unreachable: true });
+  eq(bad.unreachable, true, "a failed look is a failure");
+  eq(bad.behind, 0, "…claims no count");
+  eq(bad.checkedAt, null, "…and must NOT render as 'Synced · 00:00' — we never saw the folder");
+}
+
+section("[ui] every failure reaches the user as a sentence");
+{
+  const offlineText = humanError(new TypeError("Failed to fetch"));
+  ok(/check your connection/.test(offlineText), "offline is named as offline");
+  // This funnel also carries FX refreshes and backup restores, so it must not blame one service.
+  ok(!/Drive|Google/.test(offlineText), `…without blaming a service that may not be involved: ${offlineText}`);
+  ok(/sign-in expired/.test(humanError(new SignInRequiredError("nope"))), "an expired session says so");
+  eq(humanError(new RangeError("Version 4 is older than 5")), "Version 4 is older than 5", "our own errors are already sentences, subclass or not");
+  eq(humanError("plain string"), "plain string", "a non-Error still says something");
+}
+
+section("[startup] a listing that SUCCEEDED is not retracted by a slow download");
+{
+  // The count and "the folder is unreachable" came from two different moments: `note()` published
+  // a true count from a listing that worked, then the deadline overwrote it with `unreachable`,
+  // which reads as behind:0. The overlay drops on that same tick, so the user starts editing with
+  // the "1 snapshot to load" warning gone and a false "you're offline" in its place — the exact
+  // outcome the gate exists to prevent.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = {
+    list: async () => files, // the folder answers immediately…
+    getSessionFileId: () => null,
+    loadFile: async () => { await new Promise((r) => setTimeout(r, 40)); return null; }, // …the download does not
+  };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  eq((await controller.startupCheck(10)).kind, "unavailable", "the caller is told we gave up waiting");
+  eq(seen(controller).unreachable, false, "but we DID see the folder — saying otherwise is a falsehood");
+  eq(seen(controller).behind, 1, "…and the warning the user needs still stands");
+}
+
+section("[startup] a sign-in that expires mid-download doesn't erase the count either");
+{
+  // Worse than the timeout: nothing repairs this one. The shell's gate is spent, so an erased
+  // count stays erased for the whole session.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async () => { throw new SignInRequiredError("token expired"); },
+  };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  eq((await controller.startupCheck()).kind, "unavailable", "sign-in is a transport failure");
+  eq(controller.getStatus().needsAuth, true, "…and the user is told what to fix");
+  eq(seen(controller).unreachable, false, "the listing still happened");
+  eq(seen(controller).behind, 1, "…so what is at stake is still on screen");
+}
+
+section("[startup] a folder we never reached IS reported as unreachable");
+{
+  // The other side of the same rule — the guard must not swallow a real offline case.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = { list: async () => { throw new TypeError("Failed to fetch"); }, getSessionFileId: () => null };
+  c.provider = { list: async () => { throw new TypeError("Failed to fetch"); } };
+  c.codec = {};
+  eq((await controller.startupCheck()).kind, "unavailable", "we could not look");
+  eq(seen(controller).unreachable, true, "…and we say so");
+}
+
+section("[startup] a dead run cannot republish its count over what the user has since done");
+{
+  // `note()` guards the run's own writes, but `checkRemote` published from INSIDE the download —
+  // so the run that lost the race came back minutes later and reinstated its pre-download count
+  // over a folder the user had meanwhile reconciled by hand: a permanent false "1 to load", and a
+  // Review button that re-opens a file already applied.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  let release: (() => void) | null = null;
+  c.engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async () => {
+      await new Promise<void>((r) => { release = r; }); // held open past the deadline
+      return { doc, meta: files[0] };
+    },
+  };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  eq((await controller.startupCheck(10)).kind, "unavailable", "the caller moved on");
+  // The user reconciles by hand; THIS is the current truth.
+  (controller as unknown as { set: (p: object) => void }).set({ lastCheck: { at: "TRUTH", behind: 0 } });
+  release!();
+  await new Promise((r) => setTimeout(r, 30)); // let the dead run finish
+  eq(seen(controller).behind, 0, "the dead run did not overwrite it");
+  eq(seen(controller).at, "TRUTH", "…the standing observation is still the live one");
+}
+
+section("[startup] a problem carries its own diagnostic, and both retire together");
+{
+  // The raw text used to live in the shared `detail`, which nothing cleared when the problem was
+  // resolved — so "decrypt failed: bad MAC" re-attached itself to whatever notice showed next.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  let broken = true;
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  c.engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async () => {
+      if (broken) throw new Error("decrypt failed: bad MAC");
+      return { doc, meta: files[0] };
+    },
+  };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  await controller.startupCheck();
+  ok(/bad MAC/.test(controller.getStatus().problem?.detail ?? ""), "the diagnostic travels WITH the sentence");
+  eq(controller.getStatus().detail, undefined, "…not in the shared field, where it would outlive it");
+  broken = false;
+  await controller.startupCheck();
+  eq(controller.getStatus().problem, undefined, "a check that worked retires the problem");
+}
+
+section("[sync] a diagnostic never outlives the message it explains");
+{
+  // `detail` is the raw text behind the CURRENT sentence. Left standing, it gets read as the
+  // explanation of a later, unrelated one.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  await store.saveTransaction(tx("to-push"));
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown; sessionVerified: boolean; keyringEnsured: boolean };
+  let offline = true;
+  c.engine = {
+    list: async () => { if (offline) throw new TypeError("Failed to fetch"); return []; },
+    getSessionFileId: () => null,
+    setSessionFileId: () => {},
+    push: async () => meta("mine", store.getState().version + 1, store.getState().settings.deviceId),
+    prune: async () => 0,
+  };
+  c.provider = { list: async () => [] };
+  c.codec = {};
+  c.sessionVerified = true;
+  c.keyringEnsured = true;
+  await controller.syncNow().catch(() => {});
+  ok(/Failed to fetch/.test(controller.getStatus().detail ?? ""), "the failure left a diagnostic");
+  offline = false;
+  await controller.syncNow().catch(() => {});
+  eq(controller.getStatus().phase, "ready", "the retry worked");
+  eq(controller.getStatus().detail, undefined, "…and took the old diagnostic with it");
+}
+
+section("[ui] one problem, one next step — never the same thing twice");
+{
+  // Both of these pairs fired in the running app: the push guard sets `phase:error` only when it
+  // has ALREADY recorded a listing with behind >= 1, and a startup `problem` is only ever set
+  // inside the behind > 0 branch. Two amber banners, two buttons, one situation.
+  const base = { phase: "ready" as const };
+  const guardRefused = syncSituation({
+    ...base,
+    phase: "error",
+    message: "Remote has newer changes — Pull latest and review before syncing.",
+    lastCheck: { at: "T", behind: 2 },
+  });
+  eq(guardRefused.notices.length, 1, "the refusal and the count are ONE banner");
+  ok(/2 snapshots still to load/.test(guardRefused.notices[0]!.text), "…and the count survives the fold");
+  eq(guardRefused.notices[0]!.action.kind, "review", "…under the action that actually resolves it");
+
+  const readFailed = syncSituation({
+    ...base,
+    problem: { text: "Couldn't read the newest snapshot from your other device.", detail: "bad MAC" },
+    lastCheck: { at: "T", behind: 1 },
+  });
+  eq(readFailed.notices.length, 1, "a failed read plus its count is one banner too");
+  eq(readFailed.notices[0]!.title, "bad MAC", "…with its own diagnostic on hover");
+  eq(readFailed.pill.title, "Couldn't read the newest snapshot from your other device.",
+     "the pill explains itself from the SAME fact, not from a stale message");
+
+  const stillBoth = syncSituation({
+    ...base,
+    phase: "error",
+    message: "Sync conflict — another device synced at the same time. Pull latest to reconcile.",
+    needsAuth: true,
+  });
+  eq(stillBoth.notices.length, 1, "an expired sign-in under an error banner is not a second banner");
+
+  const applied = syncSituation({ ...base, appliedVersion: 9, lastCheck: { at: "T", behind: 1 } });
+  eq(applied.notices.length, 2, "but 'we loaded your data' is a DIFFERENT fact and still shows");
+  eq(applied.notices[0]!.key, "applied", "…first, because it explains what just changed");
+  eq(syncSituation({ ...base, appliedVersion: 9 }, { dismissedApplied: 9 }).notices.length, 0, "…and it dismisses");
+}
+
+section("[ui] a locked vault is never offered a review it cannot run");
+{
+  // Keyed on the frozen startup RESULT, re-locking after the check left "Review now" as the only
+  // offer — and it dead-ends in `new Error("sync not ready")`, shown to the user verbatim.
+  const locked = syncSituation({ phase: "locked", lastCheck: { at: "T", behind: 1 } });
+  eq(locked.notices.length, 1, "one next step");
+  eq(locked.notices[0]!.action.label, "Unlock", "…and it is the one that can actually be done");
+  const ready = syncSituation({ phase: "ready", lastCheck: { at: "T", behind: 1 } });
+  eq(ready.notices[0]!.action.label, "Review now", "an unlocked device still goes to review");
+}
+
+section("[ui] the pill only claims 'synced' about a look that happened");
+{
+  const never = syncSituation({ phase: "ready" });
+  eq(never.pill.label, "Not checked yet", "a device that never looked says so");
+  const looked = syncSituation({ phase: "ready", lastCheck: { at: "2026-01-01T09:30:00.000Z", behind: 0 } },
+    { formatTime: () => "09:30" });
+  eq(looked.pill.label, "Synced · 09:30", "…and one that did is dated from the look");
+  const failed = syncSituation({ phase: "ready", lastCheck: { at: "2026-01-01T09:30:00.000Z", unreachable: true } });
+  eq(failed.pill.label, "Offline", "a look that FAILED is not a sync time");
+}
+
+section("[pull] a listing the caller has been holding keeps the caller's timestamp");
+{
+  // The confirm dialog can sit open for half an hour. Republishing its listing under `new Date()`
+  // put a green "Synced · 14:30" over a folder last looked at 14:05 — with a file published at
+  // 14:20 unread and unmentioned, because the old listing has never heard of it.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const old = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; codec: unknown };
+  c.engine = {
+    list: async () => { throw new TypeError("Failed to fetch"); }, // the in-apply re-listing blips
+    getSessionFileId: () => null,
+    loadFile: async () => ({ doc, meta: old[0] }),
+  };
+  c.codec = {};
+  const takenAt = "2026-01-01T14:05:00.000Z";
+  await controller.applyRemote(doc, "fileB", 0, undefined, { listing: { files: old, seq: 1, at: takenAt } });
+  eq(seen(controller).at, takenAt, "the observation is dated from when the folder was SEEN");
+  ok(store.getState().transactions.some((t) => t.id === "from-B"), "…and the pull still applied");
+}
+
+section("[startup] a session that starts with no folder still gets a check for the one it picks");
+{
+  // The gate runs once per app start. Spending that on "there is no folder" meant the folder the
+  // user connected a minute later was never checked at all — the moment it is MOST likely to hold
+  // family data this device has never seen.
+  const store = await deviceWith([tx("local-1")], 3);
+  const controller = new SyncController(store);
+  eq((await controller.startupCheck()).kind, "no-folder", "nothing to look at yet");
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("fileB", 9, "tablet")];
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => { throw new Error("x"); } };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  eq((await controller.startupCheck()).kind, "review", "…and once there is, it is checked");
+  eq(seen(controller).behind, 1, "…with the count published");
+}
+
+section("[merge] our OWN deviceId is excused only up to the version this database reached");
+{
+  // The bound exists for cloned profiles: a copied IndexedDB keeps the deviceId while the data
+  // diverges, so a twin that edited and pushed past us must still be reviewed. Exercised through
+  // the controller, so it pins `ownBound` itself — the direct `unincorporatedFiles` tests build
+  // `own` by hand and would pass with the bound removed entirely.
+  const build = async (peerVersion: number) => {
+    const store = await deviceWith([tx("local-1")], 3);
+    await store.markSynced(store.getState().version);
+    await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+    const mine = store.getState().settings.deviceId;
+    const files = [meta("twin", peerVersion, mine)]; // same deviceId, different database
+    const controller = new SyncController(store);
+    const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+    c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => { throw new Error("x"); } };
+    c.provider = { list: async () => files, download: async () => new Uint8Array() };
+    c.codec = {};
+    await controller.startupCheck();
+    return seen(controller).behind;
+  };
+  const at = (await deviceWith([tx("local-1")], 3)).getState().version;
+  eq(await build(at), 0, "our own file at a version we have reached is ours — nothing to review");
+  eq(await build(at + 5), 1, "a file with our id ABOVE our version is a TWIN's, and must be read");
+}
+
+section("[ui] the sentences the user actually reads");
+{
+  // No DOM harness, so nothing asserted a full sentence — and a refactor shipped "1 snapshot
+  // hasn't from your other devices been loaded here yet" to every stale device.
+  const one = syncSituation({ phase: "ready", lastCheck: { at: "T", behind: 1 } }).notices[0]!;
+  eq(one.text,
+     "1 snapshot from your other devices hasn't been loaded here yet. Editing before loading it means merging later.",
+     "singular reads as English");
+  const many = syncSituation({ phase: "ready", lastCheck: { at: "T", behind: 3 } }).notices[0]!;
+  eq(many.text,
+     "3 snapshots from your other devices haven't been loaded here yet. Editing before loading them means merging later.",
+     "…and so does the plural");
+  const lockedOne = syncSituation({ phase: "locked", lastCheck: { at: "T", behind: 1 } }).notices[0]!;
+  eq(lockedOne.text,
+     "1 snapshot from your other devices is waiting. Unlock to load it — editing before that means merging later.",
+     "the locked sentence too");
+  const lockedMany = syncSituation({ phase: "locked", lastCheck: { at: "T", behind: 2 } }).notices[0]!;
+  ok(lockedMany.text.startsWith("2 snapshots from your other devices are waiting."), "…in both numbers");
+  const auth = syncSituation({ phase: "ready", needsAuth: true }).notices[0]!;
+  ok(/Google sign-in expired/.test(auth.text), "a proper noun keeps its capital letter");
+}
+
+section("[ui] a transport failure keeps the button its own sentence names");
+{
+  // Folding took the OTHER notice's action, so "click Reconnect to resume sync" arrived under a
+  // button labelled "Review now" — a control the sentence never mentions, and one that cannot run
+  // until the session is restored.
+  const authError = syncSituation({
+    phase: "error",
+    needsAuth: true,
+    message: "Google sign-in expired — click Reconnect to resume sync.",
+    lastCheck: { at: "T", behind: 1 },
+  });
+  eq(authError.notices.length, 1, "still one banner");
+  eq(authError.notices[0]!.action.label, "Reconnect", "…and it offers what the sentence promises");
+  ok(/1 snapshot still to load/.test(authError.notices[0]!.text),
+     "…and still says what is at stake: the button it can't offer is not a reason to hide the count");
+
+  // The offline next-step is dropped next to an error banner, and nothing is invented in its place.
+  const offline = syncSituation({
+    phase: "error",
+    message: "Sync conflict — another device synced at the same time. Pull latest to reconcile.",
+    lastCheck: { at: "T", unreachable: true },
+  });
+  eq(offline.notices.length, 1, "an unreachable folder is not a second banner");
+  ok(!/0 snapshots/.test(offline.notices[0]!.text), "…and no count is folded in when there is none");
+}
+
+section("[ui] a device that cannot see the folder is told so, on its own");
+{
+  const offline = syncSituation({ phase: "ready", lastCheck: { at: "T", unreachable: true } });
+  eq(offline.notices.length, 1, "one notice");
+  eq(offline.notices[0]!.tone, "slate", "…quieter than a problem: nothing is wrong with the data");
+  ok(/saved on this device/.test(offline.notices[0]!.text), "…and it says the work is safe");
+  eq(offline.pill.label, "Offline", "the pill agrees with it");
+  eq(offline.pill.tone, "idle", "…in the same quiet voice as its banner, not a louder one");
+}
+
+section("[ui] a locked device is never told to Reconnect");
+{
+  // Settings shows no Reconnect control while locked — that row needs ready/syncing/error — so
+  // naming it sends the user to a screen that cannot do it.
+  const locked = syncSituation({ phase: "locked", needsAuth: true });
+  eq(locked.notices[0]!.action.label, "Unlock", "locked: unlock first");
+  ok(/locked/.test(locked.notices[0]!.text), "…and the sentence says why");
+  const ready = syncSituation({ phase: "ready", needsAuth: true });
+  eq(ready.notices[0]!.action.label, "Reconnect", "unlocked: reconnect");
+}
+
+section("[ui] a locked device is not offered a retry it cannot run either");
+{
+  // Same rule as the two branches above, applied to the problem banner: "Try again" reaches
+  // `checkRemote`, which throws a developer string while the vault is locked.
+  const locked = syncSituation({
+    phase: "locked",
+    problem: { text: "Couldn't read the newest snapshot from your other device.", detail: "bad MAC" },
+  });
+  eq(locked.notices[0]!.action.label, "Unlock", "…so it asks for the unlock instead");
+}
+
+section("[startup] a failure BEFORE we look is not blamed on the folder");
+{
+  // The first thing the run does is read local bookkeeping. When THAT throws, the folder has not
+  // been asked anything — telling the user "couldn't reach the shared folder" sends them to check
+  // a connection that is fine, over a problem that isn't theirs.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown; store: { persistedSyncState: () => Promise<unknown> } };
+  c.engine = { list: async () => [], getSessionFileId: () => null };
+  c.provider = { list: async () => [] };
+  c.codec = {};
+  const real = c.store.persistedSyncState.bind(c.store);
+  c.store.persistedSyncState = async () => { throw new Error("IndexedDB: UnknownError"); };
+  eq((await controller.startupCheck()).kind, "unavailable", "the check could not run");
+  eq(controller.getStatus().lastCheck, undefined, "…and it makes NO claim about the folder");
+  c.store.persistedSyncState = real;
+}
+
+section("[startup] a deadline reached before we even look claims nothing either");
+{
+  // Same rule on the timeout path: the run stalled on local bookkeeping, so the folder was never
+  // asked. "Couldn't reach the shared folder" would be a guess dressed as an observation.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown; store: { persistedSyncState: () => Promise<unknown> } };
+  c.engine = { list: async () => [], getSessionFileId: () => null };
+  c.provider = { list: async () => [] };
+  c.codec = {};
+  const real = c.store.persistedSyncState.bind(c.store);
+  c.store.persistedSyncState = () => new Promise(() => {}); // never settles
+  eq((await controller.startupCheck(10)).kind, "unavailable", "we gave up waiting");
+  eq(controller.getStatus().lastCheck, undefined, "…having looked at nothing, we say nothing");
+  c.store.persistedSyncState = real;
+}
+
+section("[startup] the auto-applied write is refused if the user has typed since");
+{
+  // The design deliberately lets this write land AFTER the deadline — nothing can cancel it. The
+  // only thing standing between "the overlay dropped, so I started typing" and losing that row is
+  // the `expect` fingerprint handed to `applyRemote`. Removing it left the suite green while a
+  // probe watched a typed row disappear under a green "Loaded the latest changes (v9)".
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]); // a pure addition: auto-appliable
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  let release: (() => void) | null = null;
+  c.engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async () => ({ doc, meta: files[0] }),
+  };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  // Hold the WRITE open past the deadline: the decision was made while the gate still owned the
+  // screen, the write lands after the user got it back.
+  const realApply = store.applyDocument.bind(store);
+  store.applyDocument = async (...args: Parameters<typeof store.applyDocument>) => {
+    await new Promise<void>((r) => { release = r; });
+    return realApply(...args);
+  };
+  const res = controller.startupCheck(10);
+  eq((await res).kind, "unavailable", "the caller gave up waiting");
+  await store.saveTransaction(tx("typed-after-overlay")); // the user has the app back
+  release!();
+  await new Promise((r) => setTimeout(r, 30));
+  store.applyDocument = realApply;
+  ok(store.getState().transactions.some((t) => t.id === "typed-after-overlay"), "what they typed is still here");
+  eq(controller.getStatus().appliedVersion, undefined, "…and nothing claims to have loaded over it");
+}
+
+section("[ui] which outcomes give the check slot back");
+{
+  // One check per app start — but two outcomes checked NOTHING and must not spend it.
+  eq(refundsCheckSlot("no-folder", "full"), true, "no folder: the one the user picks next still needs a check");
+  eq(refundsCheckSlot("unavailable", "locked"), true, "a locked run that failed: the unlock still owes us one");
+  eq(refundsCheckSlot("unavailable", "full"), false,
+     "a failed FULL run keeps it: an offline device flips syncing→error constantly, and re-arming put the app behind the overlay every few seconds");
+  eq(refundsCheckSlot("review", "full"), false, "a real answer spends it");
+  eq(refundsCheckSlot("applied", "full"), false, "…as does a successful apply");
+  eq(refundsCheckSlot("up-to-date", "full"), false, "…and finding nothing new");
+}
+
+section("[ui] an expired sign-in is never silent, however far behind we are");
+{
+  // `behind` outranked `needsAuth`, so a device that was BOTH behind and disconnected was offered
+  // "Review now" — which re-throws the same sign-in error — and never told why it failed.
+  const both = syncSituation({ phase: "ready", needsAuth: true, lastCheck: { at: "T", behind: 2 } });
+  eq(both.notices.length, 1, "one notice");
+  ok(/Google sign-in expired/.test(both.notices[0]!.text), "…it names the disconnection");
+  ok(/2 snapshots/.test(both.notices[0]!.text), "…and what is waiting behind it");
+  eq(both.notices[0]!.action.label, "Reconnect", "…and offers the step that unblocks both");
+}
+
+section("[pull] the post-write count comes from OUR listing, not the one the caller was holding");
+{
+  // The caller's listing is a fallback for when our own re-listing fails — not a preference. It
+  // predates the write, so a file that arrived while the diff sat open is missing from it, and a
+  // file the write incorporated is still in it.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const fileB = meta("fileB", 9, "tablet");
+  const stale = { files: [fileB, meta("fileC", 12, "phone")], at: "2026-01-01T14:05:00.000Z" };
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; codec: unknown };
+  c.engine = {
+    list: async () => [fileB], // fileC was pruned away in the meantime
+    getSessionFileId: () => null,
+    loadFile: async () => ({ doc, meta: fileB }),
+  };
+  c.codec = {};
+  await controller.applyRemote(doc, "fileB", 0, undefined, { listing: stale });
+  eq(seen(controller).behind, 0, "the count is what the folder holds NOW");
+  ok(seen(controller).at !== stale.at, "…dated from our own look, not the caller's older one");
+}
+
+section("[pull] a listing is dated when the folder answers, not when the download finishes");
+{
+  // Stamping after the download overstates freshness by however long the transfer took — on a bad
+  // link, minutes — and that stamp is what a later write publishes as "checked at".
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; codec: unknown };
+  let downloadStarted = "";
+  c.engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async () => {
+      downloadStarted = new Date().toISOString();
+      await new Promise((r) => setTimeout(r, 25)); // a slow link
+      return { doc, meta: files[0] };
+    },
+  };
+  c.codec = {};
+  const remote = await controller.checkRemote();
+  ok(!!remote, "there was something to check");
+  ok(/^\d{4}-\d{2}-\d{2}T/.test(remote!.listing?.at ?? ""), "the listing carries a real timestamp");
+  ok((remote!.listing?.at ?? "") <= downloadStarted, "…dated from before the download, not after it");
+}
+
+section("[pull] the newest FILES are recounted against the newest STATE");
+{
+  // Two half-truths used to fight over one field. The caller's listing predates the dialog, so it
+  // has never heard of anything published since — recounting it alone retired a real "2 to load"
+  // warning. But the standing count predates the WRITE, so keeping it nagged the user about the
+  // very file they had just merged. Neither is the answer: the newest file set, recounted against
+  // the state we now have.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  await store.saveTransaction(tx("mine-unsynced")); // dirty, so the gate reviews rather than auto-applies
+  const fileB = meta("fileB", 9, "tablet");
+  const fileC = meta("fileC", 12, "phone"); // published while the dialog sat open
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  let listing = [fileB, fileC];
+  c.engine = {
+    list: async () => { if (listing.length === 0) throw new TypeError("Failed to fetch"); return listing; },
+    getSessionFileId: () => null,
+    loadFile: async () => ({ doc, meta: fileB }),
+  };
+  c.provider = { list: async () => listing, download: async () => new Uint8Array() };
+  c.codec = {};
+  await controller.startupCheck(); // a real look: two files outstanding
+  eq(seen(controller).behind, 2, "both are waiting");
+  listing = []; // …and now our own re-listing blips, so the write falls back to the caller's set
+  await controller.applyRemote(doc, "fileB", 0, undefined, {
+    listing: { files: [fileB], seq: 1, at: "2026-01-01T14:05:00.000Z" }, // the pre-dialog set, without fileC
+  });
+  ok(store.getState().transactions.some((t) => t.id === "from-B"), "the pull applied");
+  eq(seen(controller).behind, 1,
+     "the merged file drops out (new state) and the one published since is still counted (newest files)");
+}
+
+section("[pull] the PUBLISHED timestamp is the listing's, not the download's");
+{
+  // Two stamps for one look: `listing.at` was taken when the folder answered, but what reached
+  // `lastCheck` was `observed()`'s default — computed after `loadFile` returned.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 9, (t) => [...t, tx("from-B")]);
+  const files = [meta("fileB", 9, "tablet")];
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; codec: unknown };
+  c.engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async () => { await new Promise((r) => setTimeout(r, 25)); return { doc, meta: files[0] }; },
+  };
+  c.codec = {};
+  const remote = await controller.checkRemote();
+  eq(seen(controller).at, remote!.listing?.at, "one look, one timestamp — the folder's own");
+}
+
+section("[ui] the pill's colour is part of what it says");
+{
+  // `tone` is what the header text and the Settings badge are painted from. Nothing asserted it,
+  // so a green "Behind — 2 to load" beside an amber banner passed the suite.
+  eq(syncSituation({ phase: "ready", lastCheck: { at: "T", behind: 2 } }).pill.tone, "warn",
+     "being behind is a warning, whatever else is true");
+  eq(syncSituation({ phase: "error", message: "x" }).pill.tone, "bad", "an error is worse");
+  eq(syncSituation({ phase: "ready", lastCheck: { at: "T", behind: 0 } }).pill.tone, "ok", "level is fine");
+  eq(syncSituation({ phase: "ready" }).pill.tone, "idle", "never looked is neither");
+  eq(syncSituation({ phase: "syncing", lastCheck: { at: "T", behind: 0 } }).pill.tone, "ok", "a plain push is fine");
+  // A push in progress must not out-shout anything that is actually wrong.
+  const busyAuth = syncSituation({ phase: "syncing", needsAuth: true });
+  eq(busyAuth.pill.tone, "warn", "…but not while the session is expired");
+  eq(busyAuth.pill.label, "Not connected", "…and the pill says which problem");
+  const busyProblem = syncSituation({ phase: "syncing", problem: { text: "Couldn't read it.", detail: "x" } });
+  eq(busyProblem.pill.tone, "warn", "…nor while a check failed");
+  eq(busyProblem.pill.title, "Couldn't read it.", "…keeping the explanation on hover");
+  // The colour NAME for each meaning is one decision, shared by the header and the badge.
+  eq(SYNC_TONE_COLOR.warn, "amber", "warn is amber, everywhere");
+  eq(SYNC_TONE_COLOR.bad, "red", "bad is red");
+  eq(SYNC_TONE_COLOR.ok, "green", "ok is green");
+  eq(SYNC_TONE_COLOR.idle, "slate", "idle is slate");
+  const busyBehind = syncSituation({ phase: "syncing", lastCheck: { at: "T", behind: 2 } }).pill;
+  eq(busyBehind.tone, "warn", "…but a push does not settle what is still unread");
+  ok(/2 to load/.test(busyBehind.label), "…and the label says so too");
+  // The same label is the Settings badge, so "no sync" states must say WHICH.
+  eq(syncSituation({ phase: "locked" }).pill.label, "Locked", "a locked vault says so");
+  eq(syncSituation({ phase: "no-vault" }).pill.label, "No password", "…and an unencrypted one says that");
+  eq(syncSituation({ phase: "no-folder" }).pill.label, "Local only", "…and a folderless device that");
+}
+
+section("[sync] a merge is not followed by a nag about the file it just merged");
+{
+  // The other half of the same rule. A push landing between the preview and the commit publishes a
+  // count taken BEFORE the merge; keeping it (because it is newer in time) told the user the file
+  // they had just merged was still waiting.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("fileB", 9, "tablet")];
+  const docs: Record<string, SnapshotDoc> = {
+    fileB: { schemaVersion: SCHEMA.version, version: 9, data: { transactions: [tx("from-B")] } as never },
+  };
+  const controller = new SyncController(store);
+  const c = controller as unknown as { engine: unknown; codec: unknown };
+  c.engine = {
+    list: async () => files,
+    getSessionFileId: () => null,
+    loadFile: async (m: { id: string }) => ({ doc: docs[m.id], meta: files.find((f) => f.id === m.id) }),
+  };
+  c.codec = {};
+  const preview = await controller.previewMerge(docs.fileB!, "fileB");
+  // …a push attempt lists the folder again while the dialog is open, publishing a count taken
+  // before the merge — and stamped LATER than the preview's listing.
+  await controller.syncNow().catch(() => {});
+  eq(seen(controller).behind, 1, "one file is waiting, correctly: nothing has been merged yet");
+  await controller.commitMerge(preview, {});
+  eq(seen(controller).behind, 0, "after the merge it is retired — not re-reported by the newer stamp");
+  ok(store.getState().transactions.some((t) => t.id === "from-B"), "…and the rows are here");
+}
+
+section("[sync] the diagnostic never outlives its sentence, at ANY error site");
+{
+  // Three of the four `phase: "error"` writers cleared `detail` by hand and the fourth didn't, so
+  // "TypeError: Failed to fetch" from a previous failure ended up as the tooltip on a vault
+  // mismatch. Enforced in the one funnel every status write goes through.
+  const store = await deviceWith([tx("local-1")], 3);
+  const controller = new SyncController(store);
+  const set = (p: object): void => (controller as unknown as { set: (p: object) => void }).set(p);
+  set({ phase: "error", message: "first failure", detail: "TypeError: Failed to fetch" });
+  eq(controller.getStatus().detail, "TypeError: Failed to fetch", "the diagnostic is kept with its sentence");
+  set({ phase: "error", message: "a different failure entirely" });
+  eq(controller.getStatus().detail, undefined, "…and does not survive into the next one");
+  set({ phase: "error", message: "explained", detail: "the real reason" });
+  eq(controller.getStatus().detail, "the real reason", "…while a message that brings its own keeps it");
+}
+
+section("[sync] a folder change is NOTICED, whoever makes it");
+{
+  // The old folder's count and "checked at" kept driving the UI. Hung off the phase refresh so it
+  // covers a sibling tab's pick arriving through the settings row, not just this tab's picker.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "OLD", folderName: "Old" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as {
+    engine: unknown; provider: unknown; codec: unknown; engineFolderId: string | null; refreshPhase: () => void;
+  };
+  const files = [meta("fileB", 9, "tablet")];
+  c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => { throw new Error("x"); } };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  c.engineFolderId = "OLD"; // what `rebuildEngine` records: the folder this engine talks to
+  await controller.startupCheck();
+  eq(seen(controller).behind, 1, "one file waiting in the old folder");
+  await store.saveSettings({ drive: { folderId: "NEW", folderName: "New" } });
+  c.refreshPhase();
+  eq(controller.getStatus().lastCheck, undefined, "nothing is claimed about a folder we haven't looked at");
+}
+
+section("[sync] a folder switch can't be walked past by a look taken mid-switch");
+{
+  // `connectFolder` writes the settings row and THEN awaits network work before repointing the
+  // engine. A debounced autosave landing in that window lists the OLD folder — and if the label
+  // came from the settings row, that listing got filed under the NEW folder, after which the
+  // guard, having already advanced, never fired again: the old folder's count kept driving the UI
+  // for the rest of the session.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.saveSettings({ drive: { folderId: "OLD", folderName: "Old" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as {
+    engine: unknown; provider: unknown; codec: unknown; engineFolderId: string | null; refreshPhase: () => void;
+  };
+  const files = [meta("fileB", 9, "tablet")];
+  c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => { throw new Error("x"); } };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  c.engineFolderId = "OLD";
+  await controller.startupCheck();
+  eq(seen(controller).behind, 1, "one file waiting in the old folder");
+  // The picker has written the new folder, but the engine still talks to the old one.
+  await store.saveSettings({ drive: { folderId: "NEW", folderName: "New" } });
+  await controller.startupCheck(); // an autosave-shaped look, still through the OLD engine
+  eq(seen(controller).behind, 1, "…and this look is still about the OLD folder");
+  // Now the switch completes.
+  c.engineFolderId = "NEW";
+  c.engine = { list: async () => [], getSessionFileId: () => null };
+  c.provider = { list: async () => [] };
+  (controller as unknown as { forgetOtherFolder: () => void }).forgetOtherFolder();
+  eq(controller.getStatus().lastCheck, undefined, "the switch is noticed, not swallowed by the mid-switch look");
+}
+
+section("[sync] a wrong clock cannot change which listing wins");
+{
+  // Ordering is by SEQUENCE — which listing this device saw later — so the clock has no vote.
+  // Ordering by timestamp cost four consecutive review rounds: a stamp is written by the same
+  // clock that says what "now" is, so while the clock is wrong the two agree and nothing looks
+  // amiss; the impossibility only appears after a correction, by which point the bad stamp is
+  // stored and out-ranks every later look. The gate then reported "up-to-date" over an unread
+  // snapshot — no overlay, no banner, straight into editing.
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const controller = new SyncController(store);
+  const c = controller as unknown as {
+    engine: unknown; provider: unknown; codec: unknown; engineFolderId: string | null;
+    nowIso: () => string; newListing: (f: SnapshotMeta[]) => { files: SnapshotMeta[]; seq: number; at: string };
+  };
+  let files: SnapshotMeta[] = [];
+  c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => { throw new Error("x"); } };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  c.codec = {};
+  c.engineFolderId = "F1";
+  const realNow = c.nowIso.bind(controller);
+  c.nowIso = () => new Date(Date.parse(realNow()) + 60 * 60 * 1000).toISOString(); // an hour fast
+  eq((await controller.startupCheck()).kind, "up-to-date", "the folder really is empty right now");
+  c.nowIso = realNow; // NTP corrects it
+
+  // The gate's own path: a later look wins.
+  files = [meta("fileB", 99, "phone")];
+  eq((await controller.startupCheck()).kind, "review", "a later look wins, whatever the clock did");
+  eq(seen(controller).behind, 1, "…and the arrival is counted");
+
+  // And the caller-stamped path — a listing handed over after a write, minted later than the one
+  // recorded under the wrong clock. (This is the shape the gate's own path never exercises.)
+  const doc = await peerDoc(store, 4, (t) => t);
+  c.engine = { list: async () => { throw new TypeError("blip"); }, getSessionFileId: () => null };
+  await controller.applyRemote(doc, "self", 0, undefined, { listing: c.newListing([]) });
+  eq(seen(controller).behind, 0, "the newer listing retires the count");
+
+  // And when the winner IS the one recorded under the wrong clock, its stamp is still not rendered
+  // as a time that hasn't happened — the ordering ignores the clock, the display just refuses to
+  // lie about it.
+  c.nowIso = () => new Date(Date.parse(realNow()) + 60 * 60 * 1000).toISOString();
+  files = [meta("fileC", 100, "tablet")];
+  c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => { throw new Error("x"); } };
+  c.provider = { list: async () => files, download: async () => new Uint8Array() };
+  await controller.startupCheck(); // minted under the fast clock, so it is the newest listing
+  c.nowIso = realNow;
+  c.engine = { list: async () => { throw new TypeError("blip"); }, getSessionFileId: () => null };
+  await controller.applyRemote(doc, "self", 0, undefined, {
+    listing: { files: [], seq: 1, at: "2026-01-01T00:00:00.000Z" }, // older: the fast one still wins
+  });
+  eq(seen(controller).behind, 1, "the newest listing still decides the count");
+  ok((seen(controller).at ?? "") <= new Date().toISOString(), "…but the stamp shown is never in the future");
+}
+
+section("[sync] the WINNER is what gets remembered, and an unminted sequence cannot claim to lead");
+{
+  // Two rules that only bite on the second observation, which is why neither was pinned:
+  //  - remembering the loser would let a caller's old file set become the baseline for the next
+  //    comparison, quietly discarding what the newest look had seen;
+  //  - `applyRemote({ listing })` is public and `Listing` is exported, so a sequence this
+  //    controller never minted can arrive. A too-high one would out-rank every real look FOREVER
+  //    (the old timestamp scheme at least healed once wall time caught up).
+  const store = await deviceWith([tx("local-1")], 3);
+  await store.markSynced(store.getState().version);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const doc = await peerDoc(store, 4, (t) => t);
+  const fileA = meta("fileA", 90, "tablet");
+  const fileB = meta("fileB", 91, "phone");
+  const controller = new SyncController(store);
+  const c = controller as unknown as {
+    engine: unknown; provider: unknown; codec: unknown; engineFolderId: string | null;
+    newListing: (f: SnapshotMeta[]) => { files: SnapshotMeta[]; seq: number; at: string };
+  };
+  c.engine = { list: async () => [fileA, fileB], getSessionFileId: () => null, loadFile: async () => { throw new Error("x"); } };
+  c.provider = { list: async () => [fileA, fileB], download: async () => new Uint8Array() };
+  c.codec = {};
+  c.engineFolderId = "F1";
+  // Two looks, so the remembered listing is demonstrably LATER than the ones handed over below.
+  // (A failed download consumes a sequence without recording it — only relative order matters.)
+  await controller.startupCheck();
+  // A listing minted the way production mints them, held while a LATER look happens.
+  const source = [fileA];
+  const held = c.newListing(source);
+  source.push(fileB); // the caller's array keeps moving; the listing is a snapshot, not a view
+  eq(held.files.length, 1, "a listing is a copy of what the folder held, not a live reference");
+  await controller.startupCheck();
+  eq(seen(controller).behind, 2, "two files waiting");
+  // From here every listing handed over is an older, partial one, and our own re-listing fails.
+  c.engine = { list: async () => { throw new TypeError("blip"); }, getSessionFileId: () => null };
+  await controller.applyRemote(doc, "self", 0, undefined, { listing: held });
+  eq(seen(controller).behind, 2, "the newest look still decides, not the listing the caller was holding");
+  await controller.applyRemote(doc, "self", 0, undefined, { listing: { files: [fileA], seq: 2, at: "2026-01-01T00:00:01.000Z" } });
+  eq(seen(controller).behind, 2, "…and it is still the remembered one, not the last caller's");
+  // A sequence from nowhere must not take over.
+  await controller.applyRemote(doc, "self", 0, undefined, { listing: { files: [], seq: 1e9, at: "2026-01-01T00:00:02.000Z" } });
+  eq(seen(controller).behind, 2, "an unminted sequence does not out-rank a real look");
+
+  // …and it must not be able to BECOME the baseline either. With nothing remembered yet there is
+  // nothing for it to lose to, so demoting it — rather than refusing it — is what stops it
+  // refusing every real look afterwards.
+  const fresh = new SyncController(store);
+  const f = fresh as unknown as { engine: unknown; provider: unknown; codec: unknown; engineFolderId: string | null };
+  f.engine = { list: async () => [fileA, fileB], getSessionFileId: () => null, loadFile: async () => { throw new Error("x"); } };
+  f.provider = { list: async () => [fileA, fileB], download: async () => new Uint8Array() };
+  f.codec = {};
+  f.engineFolderId = "F1";
+  await fresh.applyRemote(doc, "self", 0, undefined, { listing: { files: [], seq: 1e9, at: "2026-01-01T00:00:03.000Z" } });
+  await fresh.startupCheck();
+  eq(seen(fresh).behind, 2, "a real look still lands on a controller that was handed a bogus sequence first");
+  // …and a genuinely newer look still wins, so the clamp hasn't wedged anything.
+  c.engine = { list: async () => [fileA], getSessionFileId: () => null, loadFile: async () => { throw new Error("x"); } };
+  c.provider = { list: async () => [fileA], download: async () => new Uint8Array() };
+  await controller.startupCheck();
+  eq(seen(controller).behind, 1, "the folder moved on, and we can still see it");
 }
 
 done();

@@ -3,6 +3,7 @@
 
 import type { CurrencyCode, FxTable } from "../../../lib/money/currency";
 import { rebase } from "../../../lib/money/currency";
+import type { BadgeTone } from "./components";
 import type { PortfolioState } from "../state/store";
 import { SHARED } from "../model/types";
 import type {
@@ -16,7 +17,7 @@ import type {
 } from "../model/types";
 
 /** Badge styling + label for a holding's data-quality classification. */
-export const QUALITY_TONE: Record<DataQuality, string> = {
+export const QUALITY_TONE: Record<DataQuality, BadgeTone> = {
   complete: "green",
   "cost-estimate": "amber",
   "value-only": "slate",
