@@ -156,12 +156,30 @@ export function Badge({
   );
 }
 
-export function Field({ label, children, hint }: { label: string; children: ReactNode; hint?: string }) {
+/** A labelled form control. `error` (shown in red, replacing the hint) marks a
+ *  field that blocks Save, so the user sees which input is missing and why. */
+export function Field({
+  label,
+  children,
+  hint,
+  error,
+}: {
+  label: string;
+  children: ReactNode;
+  hint?: string;
+  error?: string;
+}) {
   return (
     <label className="block">
-      <span className="mb-1 block text-xs font-medium text-slate-500">{label}</span>
+      <span className={`mb-1 block text-xs font-medium ${error ? "text-red-600" : "text-slate-500"}`}>{label}</span>
       {children}
-      {hint ? <span className="mt-1 block text-xs font-normal text-slate-400">{hint}</span> : null}
+      {error ? (
+        <span className="mt-1 block text-xs font-normal text-red-600" role="alert">
+          {error}
+        </span>
+      ) : hint ? (
+        <span className="mt-1 block text-xs font-normal text-slate-400">{hint}</span>
+      ) : null}
     </label>
   );
 }

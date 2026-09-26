@@ -6,11 +6,15 @@ import {
   dataQuality,
   fdAccrualValuation,
   fdMaturityInfo,
+  fdMaturityWatch,
   fdValue,
+  firstDepositDate,
+  isFdDueSoon,
   holdingPnl,
   holdingXirr,
   netUnits,
   portfolioReturn,
+  validateFdInput,
   withFdAccrual,
 } from "../src/features/portfolio/domain/holdings";
 import { accountBalances, accountBalancesByPerson, netWorth, sumAccountBalances, totalReturn } from "../src/features/portfolio/domain/networth";
@@ -21,11 +25,11 @@ import {
   isAutopayTransaction,
   planAutopayReconcile,
 } from "../src/features/portfolio/domain/autopay";
-import { accountOptions, categoryOptions, composeAccountExtras, personOptions } from "../src/features/portfolio/ui/helpers";
+import { accountOptions, categoryOptions, composeAccountExtras, fdMaturityStatus, personOptions } from "../src/features/portfolio/ui/helpers";
 import type { PortfolioState } from "../src/features/portfolio/state/store";
 import { accruedInterest, compoundValue } from "../src/lib/money/interest";
 import { xirr, type Cashflow } from "../src/lib/money/xirr";
-import { addMonthsIso, daysInMonth, ddmmyyyyToIso, formatDdmmyyyy, isoFromParts, isoToDdmmyyyy } from "../src/lib/util/date";
+import { addMonthsIso, addTenureIso, daysInMonth, ddmmyyyyToIso, formatDdmmyyyy, isoFromParts, isoToDdmmyyyy } from "../src/lib/util/date";
 import type { Account, Category, Holding, HoldingEvent, Transaction } from "../src/features/portfolio/model/types";
 import type { FxTable } from "../src/lib/money/currency";
 import { done, eq, near, ok, section } from "./_harness";
@@ -1471,6 +1475,129 @@ section("[helpers] account & person dropdowns sort alphabetically (Shared sentin
   const p = personOptions(state).map((o) => o.label);
   eq(p[0], "Shared", "Shared sentinel stays first");
   eq(p.slice(1).join(","), "Ann,Bob", "people sorted A→Z after Shared");
+}
+
+section("[addTenureIso] deposit tenure → maturity date");
+{
+  eq(addTenureIso("2025-01-15", 12, "months"), "2026-01-15", "12 months");
+  eq(addTenureIso("2025-01-15", 1, "years"), "2026-01-15", "1 year == 12 months");
+  eq(addTenureIso("2025-01-15", 444, "days"), "2026-04-04", "444 days");
+  eq(addTenureIso("2025-01-31", 1, "months"), "2025-02-28", "31 Jan + 1 month clamps to 28 Feb (no rollover to March)");
+  eq(addTenureIso("2024-02-29", 1, "years"), "2025-02-28", "leap day + 1 year clamps to 28 Feb");
+  eq(addTenureIso("2025-11-30", 3, "months"), "2026-02-28", "crosses the year boundary");
+  eq(addTenureIso("2025-01-15", 0, "months"), null, "zero tenure → null");
+  eq(addTenureIso("2025-01-15", 1.5, "years"), null, "fractional tenure → null");
+  eq(addTenureIso("", 12, "months"), null, "no start date → null");
+  // Beyond a 4-digit year toISOString emits "+012025-…" or throws; return null instead.
+  eq(addTenureIso("2025-01-15", 10000, "years"), null, "10000 years → null (not '+012025-01')");
+  eq(addTenureIso("2025-01-15", 999999, "years"), null, "huge years → null, no RangeError");
+  eq(addTenureIso("2025-01-15", 999999999, "days"), null, "huge days → null, no RangeError");
+  eq(addTenureIso("2025-01-15", 7974, "years"), "9999-01-15", "year 9999 still allowed");
+  eq(addTenureIso("9999-12-30", 1, "days"), "9999-12-31", "last representable day");
+  eq(addTenureIso("9999-12-31", 1, "days"), null, "day into year 10000 → null (not '+010000-…')");
+  eq(addTenureIso("9999-12-15", 1, "months"), null, "month into year 10000 → null");
+  eq(addTenureIso("2025-01-15", 3_000_000, "days"), null, "finite but 5-digit-year days → null");
+}
+
+section("[validateFdInput] blocks FDs that would show no value or never be tracked");
+{
+  const ok0 = { isNew: true, principal: 100000, startDate: "2025-01-15", ratePct: 7.1, tenure: "", maturityDate: "2026-01-15", today: "2026-09-26" };
+  eq(Object.keys(validateFdInput(ok0)).length, 0, "complete new FD → no errors");
+  ok(validateFdInput({ ...ok0, principal: null }).principal !== undefined, "missing principal → error");
+  ok(validateFdInput({ ...ok0, principal: 0 }).principal !== undefined, "zero principal → error");
+  ok(validateFdInput({ ...ok0, startDate: "" }).startDate !== undefined, "missing deposit date → error (was silently 'today')");
+  ok(validateFdInput({ ...ok0, startDate: "2026-10-01" }).startDate !== undefined, "future deposit date → error");
+  ok(validateFdInput({ ...ok0, ratePct: null }).ratePct !== undefined, "missing rate → error");
+  ok(validateFdInput({ ...ok0, ratePct: 710 }).ratePct !== undefined, "absurd rate → error");
+  ok(validateFdInput({ ...ok0, ratePct: 0 }).ratePct !== undefined, "zero rate → error");
+  ok(validateFdInput({ ...ok0, ratePct: -2 }).ratePct !== undefined, "negative rate → error");
+  eq(validateFdInput({ ...ok0, ratePct: 100 }).ratePct, undefined, "100% is the upper bound, still accepted");
+  eq(validateFdInput({ ...ok0, startDate: "2026-09-26", maturityDate: "2027-09-26" }).startDate, undefined, "deposit dated today is fine");
+  ok(validateFdInput({ ...ok0, startDate: "2025-02-30" }).startDate !== undefined, "impossible deposit date → error");
+  ok(validateFdInput({ ...ok0, maturityDate: "2026-02-30" }).maturityDate !== undefined, "impossible maturity date → error");
+  // An impossible deposit date must not be used to judge the maturity (it's already flagged).
+  eq(validateFdInput({ ...ok0, startDate: "2027-02-30", maturityDate: "2026-01-15" }).maturityDate, undefined, "invalid start not compared");
+  ok(validateFdInput({ ...ok0, tenure: "1.5" }).tenure !== undefined, "fractional tenure → tenure error");
+  ok(validateFdInput({ ...ok0, tenure: "0" }).tenure !== undefined, "zero tenure → tenure error");
+  ok(validateFdInput({ ...ok0, tenure: "999999", maturityDate: "" }).tenure !== undefined, "tenure that yields no date → tenure error");
+  eq(validateFdInput({ ...ok0, tenure: "12" }).tenure, undefined, "valid tenure with its maturity → ok");
+  // Tenure typed before the deposit date: point at the missing date, not a bogus overflow.
+  const noStart = validateFdInput({ ...ok0, startDate: "", tenure: "12", maturityDate: "" });
+  eq(noStart.tenure, undefined, "no deposit date yet → no tenure overflow error");
+  ok(/deposit date/.test(noStart.maturityDate ?? ""), "maturity error asks for the deposit date");
+  ok(/tenure or maturity/.test(validateFdInput({ ...ok0, maturityDate: "" }).maturityDate ?? ""), "no tenure → asks for a tenure or maturity");
+  ok(validateFdInput({ ...ok0, maturityDate: "" }).maturityDate !== undefined, "new FD needs a maturity date");
+  ok(validateFdInput({ ...ok0, maturityDate: "2025-01-15" }).maturityDate !== undefined, "maturity on the deposit date → error");
+  ok(validateFdInput({ ...ok0, maturityDate: "2024-12-01" }).maturityDate !== undefined, "maturity before deposit → error");
+  // Editing: principal/date are managed in the transaction history, maturity optional.
+  const edit = { isNew: false, principal: null, startDate: "2025-01-15", ratePct: 7.1, tenure: "", maturityDate: "", today: "2026-09-26" };
+  eq(Object.keys(validateFdInput(edit)).length, 0, "edit without maturity is allowed");
+  ok(validateFdInput({ ...edit, maturityDate: "2024-01-01" }).maturityDate !== undefined, "edit still checks maturity > deposit");
+  eq(Object.keys(validateFdInput({ ...edit, startDate: "", maturityDate: "2027-01-01" })).length, 0, "edit with no recorded deposit: nothing to compare");
+  // Legacy data the old form could produce must not block a rename...
+  const legacy = { ...edit, startDate: "2026-06-01", maturityDate: "2026-05-01", ratePct: 120, stored: { ratePct: 120, maturityDate: "2026-05-01" } };
+  eq(Object.keys(validateFdInput(legacy)).length, 0, "untouched legacy maturity/rate → rename allowed");
+  // ...but changing those fields is still checked.
+  ok(validateFdInput({ ...legacy, maturityDate: "2026-05-02" }).maturityDate !== undefined, "edited maturity still order-checked");
+  ok(validateFdInput({ ...legacy, ratePct: 130 }).ratePct !== undefined, "edited rate still range-checked");
+  ok(validateFdInput({ ...legacy, ratePct: 0 }).ratePct !== undefined, "rate 0 is never OK, stored or not");
+}
+
+section("[fdMaturityWatch] Dashboard list of matured / maturing FDs");
+{
+  const mk = (id: string, name: string, maturityDate?: string, extra: Partial<Holding> = {}): Holding => ({
+    id, name, personId: "shared", assetClass: "debt", currency: "INR", incomeMode: "accumulating",
+    fd: { ratePct: 7, compounding: "quarterly", maturityDate }, ...extra,
+  });
+  const today = "2026-09-26";
+  const holdings: Holding[] = [
+    mk("far", "Far", "2027-06-01"),
+    mk("soon", "Soon", "2026-10-06"),
+    mk("edge", "Edge", "2026-10-26"), // exactly 30 days → included
+    mk("over", "Overdue", "2026-08-01"),
+    mk("today", "Today", "2026-09-26"),
+    mk("none", "No maturity"),
+    mk("bad", "Bad date", "2026-13-40"),
+    mk("settled", "Settled", "2026-09-01", { archived: true }),
+    { id: "eq", name: "Stock", personId: "shared", assetClass: "equity", currency: "INR", incomeMode: "accumulating" },
+  ];
+  const w = fdMaturityWatch(holdings, () => [], today, 30);
+  eq(w.due.map((d) => d.holding.id).join(","), "over,today,soon,edge", "overdue first, then soonest; far/settled/non-FD excluded");
+  eq(w.due[0].info.daysUntil, -56, "overdue carries negative days");
+  eq(w.missingMaturity.map((h) => h.id).join(","), "bad,none", "no/invalid maturity flagged (sorted by name)");
+  // A sold-out FD (units netted to 0 after a sell) is inactive → not listed.
+  const soldEvents: HoldingEvent[] = [
+    { id: "b", holdingId: "soon", date: "2025-01-01", type: "buy", units: 1, price: 100 },
+    { id: "s", holdingId: "soon", date: "2026-01-01", type: "sell", units: 1, price: 105 },
+  ];
+  const w2 = fdMaturityWatch(holdings, (id) => (id === "soon" ? soldEvents : []), today, 30);
+  ok(!w2.due.some((d) => d.holding.id === "soon"), "closed FD excluded");
+  // Same maturity → alphabetical, so the list order is stable.
+  const tie = fdMaturityWatch([mk("b", "Beta", "2026-10-01"), mk("a", "Alpha", "2026-10-01")], () => [], today, 30);
+  eq(tie.due.map((d) => d.holding.name).join(","), "Alpha,Beta", "same-day maturities sorted by name");
+  // A closed FD with no maturity isn't nagged about either.
+  const w3 = fdMaturityWatch([mk("n", "No mat")], () => soldEvents, today, 30);
+  eq(w3.missingMaturity.length, 0, "closed FD without maturity not flagged");
+}
+
+section("[isFdDueSoon / firstDepositDate] shared FD rules");
+{
+  const m = (daysUntil: number) => ({ date: "2026-10-01", daysUntil, matured: daysUntil <= 0 });
+  eq(isFdDueSoon(m(30), 30), true, "edge of the window is due");
+  eq(isFdDueSoon(m(31), 30), false, "one day past the window is not");
+  eq(isFdDueSoon(m(-5), 30), true, "matured is due");
+  const ev = (id: string, date: string, type: HoldingEvent["type"]): HoldingEvent => ({ id, holdingId: "h", date, type, amount: 1 });
+  eq(firstDepositDate([ev("1", "2025-05-01", "buy"), ev("2", "2025-01-10", "opening"), ev("3", "2024-01-01", "valuation")]), "2025-01-10", "earliest opening/buy, valuations ignored");
+  eq(firstDepositDate([ev("1", "2024-01-01", "dividend")]), "", "no deposit → empty");
+}
+
+section("[fdMaturityStatus] relative maturity wording");
+{
+  eq(fdMaturityStatus(-3), "Matured 3 days ago", "past");
+  eq(fdMaturityStatus(-1), "Matured yesterday", "yesterday");
+  eq(fdMaturityStatus(0), "Matures today", "today");
+  eq(fdMaturityStatus(1), "Matures tomorrow", "tomorrow");
+  eq(fdMaturityStatus(12), "Matures in 12 days", "future");
 }
 
 done();

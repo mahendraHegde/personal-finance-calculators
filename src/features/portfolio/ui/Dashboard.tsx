@@ -6,10 +6,11 @@
 // expand with a chevron. Charts show values on hover.
 
 import { useMemo, useState } from "react";
-import { formatCompactMoney, formatMoney, formatPercent, monthKey, todayIso } from "../../../lib/util/format";
+import { formatCompactMoney, formatDate, formatMoney, formatPercent, monthKey, todayIso } from "../../../lib/util/format";
+import { useNavigate } from "./navigation";
 import { tryConvert } from "../../../lib/money/currency";
 import { accountBalancesByPerson, netWorth, sumAccountBalances, totalReturn } from "../domain/networth";
-import { currentHoldingValue, dataQuality, fdMaturityInfo, holdingXirr, isClosed, portfolioReturn, withFdAccrual } from "../domain/holdings";
+import { currentHoldingValue, dataQuality, fdMaturityWatch, holdingXirr, portfolioReturn, withFdAccrual } from "../domain/holdings";
 import { UI } from "../../../config";
 import { categoryTotals, flowSummary, monthlyTotals, type CategoryTotal } from "../domain/transactions";
 import type { PortfolioState } from "../state/store";
@@ -19,6 +20,7 @@ import {
   accountLabelById,
   displayFx,
   eventsByHolding,
+  fdMaturityStatus,
   makeFxAt,
   ownerLabel,
   PALETTE,
@@ -128,19 +130,18 @@ export function Dashboard() {
   const { state } = usePortfolio();
   const { base } = displayFx(state); // cheap (no scan): just the latest rates + display ccy
 
-  // Fixed deposits maturing within the "soon" window or already matured — a nudge to
-  // reinvest/withdraw (cheap: no full scan). INACTIVE FDs are excluded — the same
-  // invariant as the Investments "Closed" view: settled (archived) OR fully-exited
-  // (isClosed via a unit sell). isClosed needs the holding's events, so it's evaluated
-  // only for the handful that clear the maturity gate. Ordered by urgency (most overdue
-  // first) so the named few in the banner are the ones that matter most.
+  // Fixed deposits matured or maturing within the "soon" window (a nudge to settle or
+  // renew), plus active FDs with no maturity date, which can't be tracked until one is
+  // added. Inactive FDs (settled, or sold out) are excluded, the same rule as the
+  // Investments "Closed" view. Only FDs that are due (or have no maturity) get their events scanned.
   const today = todayIso();
-  const maturingFds = state.holdings
-    .map((h) => ({ h, info: fdMaturityInfo(h, today) }))
-    .filter((x) => !x.h.archived && x.info !== null && x.info.daysUntil <= UI.FD_MATURITY_SOON_DAYS)
-    .filter((x) => !isClosed(state.holdingEvents.filter((e) => e.holdingId === x.h.id)))
-    .sort((a, b) => a.info!.daysUntil - b.info!.daysUntil)
-    .map((x) => x.h);
+  const fdWatch = fdMaturityWatch(
+    state.holdings,
+    (id) => state.holdingEvents.filter((e) => e.holdingId === id),
+    today,
+    UI.FD_MATURITY_SOON_DAYS,
+  );
+  const navigate = useNavigate();
 
   const [open, setOpen] = useState<Set<string>>(() => new Set());
   const isOpen = (k: string): boolean => open.has(k);
@@ -205,12 +206,38 @@ export function Dashboard() {
         </div>
       )}
 
-      {maturingFds.length > 0 && (
+      {(fdWatch.due.length > 0 || fdWatch.missingMaturity.length > 0) && (
         <div className="rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
-          ⚡ {maturingFds.length} fixed deposit{maturingFds.length === 1 ? "" : "s"}{" "}
-          {maturingFds.length === 1 ? "is" : "are"} maturing within {UI.FD_MATURITY_SOON_DAYS} days or already matured:{" "}
-          {maturingFds.slice(0, 4).map((h) => h.name).join(", ")}
-          {maturingFds.length > 4 ? `, +${maturingFds.length - 4} more` : ""}. Review them under Investments.
+          {fdWatch.due.length > 0 && (
+            <>
+              <div className="font-medium">
+                Fixed deposits matured or maturing in the next {UI.FD_MATURITY_SOON_DAYS} days
+              </div>
+              <ul className="mt-2 divide-y divide-amber-100">
+                {fdWatch.due.map(({ holding: h, info }) => (
+                  <li key={h.id} className="flex flex-wrap items-baseline justify-between gap-x-3 py-1.5">
+                    <span className="min-w-0">
+                      <span className="font-medium">{h.name}</span>
+                      <span className="text-xs text-amber-700"> · {ownerLabel(state, h.personId)}</span>
+                    </span>
+                    <span className="text-xs">
+                      {formatDate(info.date)} · <span className="font-medium">{fdMaturityStatus(info.daysUntil)}</span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {fdWatch.missingMaturity.length > 0 && (
+            <p className={fdWatch.due.length > 0 ? "mt-2 text-xs" : "text-xs"}>
+              {fdWatch.missingMaturity.length} fixed deposit{fdWatch.missingMaturity.length === 1 ? " has" : "s have"} no
+              maturity date, so {fdWatch.missingMaturity.length === 1 ? "it" : "they"} can't be tracked here:{" "}
+              {fdWatch.missingMaturity.map((h) => h.name).join(", ")}. Add one with Edit details.
+            </p>
+          )}
+          <button className="mt-2 text-xs font-medium text-amber-900 underline" onClick={() => navigate("investments")}>
+            {fdWatch.due.length > 0 ? "Open Investments to settle or renew" : "Open Investments"}
+          </button>
         </div>
       )}
 

@@ -137,6 +137,24 @@ export interface FdMaturity {
   matured: boolean;
 }
 
+/** Matured, or maturing within `soonDays`: the one rule behind the amber card note
+ *  and the Dashboard list, so the two can't disagree about which FDs need action. */
+export function isFdDueSoon(m: FdMaturity, soonDays: number): boolean {
+  return m.daysUntil <= soonDays;
+}
+
+/** An event that puts principal INTO a deposit (the opening lump sum or a top-up). */
+export function isDepositEvent(e: HoldingEvent): boolean {
+  return e.type === "opening" || e.type === "buy";
+}
+
+/** ISO date of a holding's earliest deposit, or "" when none is recorded. */
+export function firstDepositDate(events: HoldingEvent[]): string {
+  let first = "";
+  for (const e of events) if (isDepositEvent(e) && (!first || e.date < first)) first = e.date;
+  return first;
+}
+
 /** Maturity info for a fixed-deposit holding, or null if it isn't an FD with a
  *  maturity date. Pure + `asOf`-driven so it's testable and the card + the Dashboard
  *  "maturing soon" banner share identical logic. */
@@ -148,6 +166,82 @@ export function fdMaturityInfo(h: Holding, asOf: string): FdMaturity | null {
   if (!date || !isValidIsoDate(date)) return null;
   const daysUntil = isoDayNumber(date) - isoDayNumber(asOf);
   return { date, daysUntil, matured: daysUntil <= 0 };
+}
+
+/** Active FDs that need attention, for the Dashboard: `due` = matured or maturing
+ *  within `soonDays` (most overdue first, then soonest), and `missingMaturity` =
+ *  FDs with no usable maturity date, which can never show up in `due` and so need
+ *  one added. "Active" = not settled (archived) and not fully sold out. `eventsFor`
+ *  is only called for FDs, so a caller can pass a cheap per-holding filter. */
+export function fdMaturityWatch(
+  holdings: Holding[],
+  eventsFor: (holdingId: string) => HoldingEvent[],
+  asOf: string,
+  soonDays: number,
+): { due: Array<{ holding: Holding; info: FdMaturity }>; missingMaturity: Holding[] } {
+  const due: Array<{ holding: Holding; info: FdMaturity }> = [];
+  const missingMaturity: Holding[] = [];
+  for (const h of holdings) {
+    if (!h.fd || h.archived) continue;
+    const info = fdMaturityInfo(h, asOf);
+    if (info && !isFdDueSoon(info, soonDays)) continue; // not due: skip the event scan
+    if (isClosed(eventsFor(h.id))) continue;
+    if (!info) missingMaturity.push(h);
+    else due.push({ holding: h, info });
+  }
+  due.sort((a, b) => a.info.daysUntil - b.info.daysUntil || a.holding.name.localeCompare(b.holding.name));
+  missingMaturity.sort((a, b) => a.name.localeCompare(b.name));
+  return { due, missingMaturity };
+}
+
+/** What the Add/Edit holding form collected for a fixed deposit. `startDate` is
+ *  the deposit date: typed in for a new FD, or the earliest recorded deposit when
+ *  editing (may be "" if none). Numbers are null when the field is empty/invalid. */
+export interface FdFormInput {
+  isNew: boolean;
+  principal: number | null;
+  startDate: string;
+  ratePct: number | null;
+  /** Raw tenure text ("" when the maturity date was typed directly instead). */
+  tenure: string;
+  maturityDate: string;
+  today: string;
+  /** When editing: the FD's terms as stored. A range/order check on a value the user
+   *  didn't touch is skipped, so legacy data (e.g. a maturity on or before the first
+   *  deposit, from the old form's today-dated default) can't block a rename. */
+  stored?: { ratePct: number; maturityDate?: string };
+}
+export type FdFormErrors = Partial<Record<"principal" | "startDate" | "ratePct" | "tenure" | "maturityDate", string>>;
+
+/** Field-level problems that would leave an FD un-valued or un-tracked, so the form
+ *  can block Save and say why instead of quietly saving a holding that shows "—" (no
+ *  principal), accrues nothing (deposit dated today by default), or never reaches
+ *  the Dashboard maturity list (no maturity date). Empty object = OK to save. */
+export function validateFdInput(i: FdFormInput): FdFormErrors {
+  const errors: FdFormErrors = {};
+  if (i.ratePct === null || !(i.ratePct > 0)) errors.ratePct = "Enter the interest rate, e.g. 7.1";
+  else if (i.ratePct > 100 && i.ratePct !== i.stored?.ratePct) errors.ratePct = "Rate is a yearly percentage; over 100 looks like a typo";
+  if (i.isNew) {
+    if (i.principal === null || !(i.principal > 0)) errors.principal = "Enter the amount you deposited";
+    if (!i.startDate || !isValidIsoDate(i.startDate)) errors.startDate = "Enter the deposit date (dd/mm/yyyy)";
+    else if (i.startDate > i.today) errors.startDate = "The deposit date can't be in the future";
+    if (!i.maturityDate)
+      errors.maturityDate =
+        i.tenure.trim() !== "" && !i.startDate
+          ? "Enter the deposit date so the tenure can be counted"
+          : "Enter a tenure or maturity date so you're reminded when it matures";
+  }
+  if (i.tenure.trim() !== "") {
+    const n = Number(i.tenure);
+    if (!Number.isInteger(n) || n <= 0) errors.tenure = "Use a whole number, e.g. 12 months or 444 days";
+    else if (i.startDate && !i.maturityDate) errors.tenure = "That tenure runs past the year 9999";
+  }
+  if (i.maturityDate && i.maturityDate !== i.stored?.maturityDate) {
+    if (!isValidIsoDate(i.maturityDate)) errors.maturityDate = "Enter a valid maturity date (dd/mm/yyyy)";
+    else if (i.startDate && isValidIsoDate(i.startDate) && i.maturityDate <= i.startDate)
+      errors.maturityDate = "Maturity must be after the deposit date";
+  }
+  return errors;
 }
 
 // --- Fixed-deposit auto-accrual -------------------------------------------
@@ -196,7 +290,7 @@ export function fdAccrualValuation(
     let sum = 0;
     let any = false;
     for (const e of events) {
-      if (e.type === "opening" || e.type === "buy") {
+      if (isDepositEvent(e)) {
         sum += fdValue(grossAmount(e), holding.fd, e.date, asOf);
         any = true;
       }

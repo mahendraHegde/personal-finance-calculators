@@ -30,6 +30,18 @@ export const QUALITY_LABEL: Record<DataQuality, string> = {
   "needs-valuation": "needs value",
 };
 
+/** Relative maturity wording for an FD, from whole days until maturity:
+ *  "Matured 3 days ago" / "Matures today" / "Matures tomorrow" / "Matures in 12 days". */
+export function fdMaturityStatus(daysUntil: number): string {
+  if (daysUntil < 0) {
+    const ago = -daysUntil;
+    return ago === 1 ? "Matured yesterday" : `Matured ${ago} days ago`;
+  }
+  if (daysUntil === 0) return "Matures today";
+  if (daysUntil === 1) return "Matures tomorrow";
+  return `Matures in ${daysUntil} days`;
+}
+
 /** Interest / statement crediting frequencies, in menu order. Shared by the
  *  savings-interest and FD forms (the FD form appends a "simple" option). */
 export const INTEREST_FREQUENCY_OPTIONS: Array<{ value: InterestFrequency; label: string }> = [

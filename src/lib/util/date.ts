@@ -27,6 +27,33 @@ export function addMonthsIso(iso: string, months: number): string {
   return new Date(Date.UTC(y, m - 1 + months, d)).toISOString().slice(0, 10);
 }
 
+export type TenureUnit = "days" | "months" | "years";
+
+/** End date of a term of `n` `unit`s starting on `iso` (a deposit tenure → its
+ *  maturity date). Months/years keep the day-of-month, CLAMPED to the target
+ *  month's length (31 Jan + 1 month = 28/29 Feb, as banks count it) rather than
+ *  rolling into the next month like `addMonthsIso`. Null for a non-positive or
+ *  non-integer `n`, or an unparseable start. */
+export function addTenureIso(iso: string, n: number, unit: TenureUnit): string | null {
+  if (!Number.isInteger(n) || n <= 0) return null;
+  const [y, m, d] = iso.slice(0, 10).split("-").map(Number);
+  if (![y, m, d].every(Number.isInteger)) return null;
+  let end: string;
+  if (unit === "days") {
+    const ms = Date.UTC(y, m - 1, d + n);
+    if (!Number.isFinite(ms) || new Date(ms).getUTCFullYear() > 9999) return null;
+    end = new Date(ms).toISOString().slice(0, 10);
+  } else {
+    const total = m - 1 + (unit === "years" ? 12 * n : n);
+    const year = y + Math.floor(total / 12);
+    // Same 4-digit year bound as the date input: beyond it toISOString emits
+    // "+012025-…" or throws, neither of which is a date the app can store.
+    if (year > 9999) return null;
+    end = isoFromParts(year, (total % 12) + 1, d);
+  }
+  return end;
+}
+
 // --- DD/MM/YYYY <-> ISO (for the date input; storage stays ISO yyyy-mm-dd) -----
 
 /** Group up to 8 typed digits as `dd/mm/yyyy`, auto-inserting the slashes (so a

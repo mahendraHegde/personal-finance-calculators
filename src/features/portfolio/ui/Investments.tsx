@@ -8,13 +8,19 @@ import {
   currentHoldingValue,
   dataQuality,
   fdMaturityInfo,
+  fdValue,
+  firstDepositDate,
   holdingPnl,
   holdingXirr,
   isClosed,
+  isFdDueSoon,
   portfolioReturn,
+  validateFdInput,
   withFdAccrual,
+  type FdFormErrors,
   type FdMaturity,
 } from "../domain/holdings";
+import { addTenureIso, type TenureUnit } from "../../../lib/util/date";
 import { UI } from "../../../config";
 import { tryConvert } from "../../../lib/money/currency";
 import { usePortfolio, useSyncStatus } from "../state/context";
@@ -39,6 +45,7 @@ import {
   CURRENCY_CHOICES,
   displayFx,
   eventsByHolding,
+  fdMaturityStatus,
   INTEREST_FREQUENCY_OPTIONS,
   makeFxAt,
   ownerLabel,
@@ -47,19 +54,16 @@ import {
 } from "./helpers";
 import { ImportHoldings } from "./ImportHoldings";
 
-/** Human maturity text for an FD (dates via the app's locale `formatDate`):
- *  "Matures today (…)" on the day, "Matures … · in N days" when near,
- *  "Matures …" when far off, or "Matured …" once past. */
+/** Maturity text for an FD card: the Dashboard's relative wording plus the date
+ *  ("Matures in 14 days (10 Oct 2026)", "Matured 3 days ago (…)") once it's due,
+ *  or just "Matures …" when far off. */
 function fdMaturityText(m: FdMaturity): string {
   const d = formatDate(m.date);
-  if (m.daysUntil < 0) return `Matured ${d}`;
-  if (m.daysUntil === 0) return `Matures today (${d})`;
-  if (m.daysUntil <= UI.FD_MATURITY_SOON_DAYS) return `Matures ${d} · in ${m.daysUntil} day${m.daysUntil === 1 ? "" : "s"}`;
-  return `Matures ${d}`;
+  return isFdDueSoon(m, UI.FD_MATURITY_SOON_DAYS) ? `${fdMaturityStatus(m.daysUntil)} (${d})` : `Matures ${d}`;
 }
 /** Amber styling once an FD is matured or maturing within the "soon" window. */
 function fdMaturityTone(m: FdMaturity): string {
-  return m.matured || m.daysUntil <= UI.FD_MATURITY_SOON_DAYS ? "text-amber-700" : "text-slate-400";
+  return isFdDueSoon(m, UI.FD_MATURITY_SOON_DAYS) ? "text-amber-700" : "text-slate-400";
 }
 
 const ASSET_CLASSES: AssetClass[] = ["equity", "debt", "cash", "crypto", "gold", "realestate", "other"];
@@ -696,6 +700,21 @@ function HoldingForm({
   const [fdRate, setFdRate] = useState(initial?.fd ? String(initial.fd.ratePct) : "");
   const [fdCompounding, setFdCompounding] = useState<FdCompounding>(initial?.fd?.compounding ?? "quarterly");
   const [fdMaturity, setFdMaturity] = useState(initial?.fd?.maturityDate ?? "");
+  // Tenure is a helper that fills the maturity date (banks quote "1 year" / "444
+  // days"); typing a maturity date directly clears it, so the two never disagree.
+  const [tenure, setTenure] = useState("");
+  // The maturity as it was before a tenure started driving it, so clearing the
+  // tenure puts it back instead of leaving the tenure-derived date behind.
+  const [maturityBeforeTenure, setMaturityBeforeTenure] = useState("");
+  const [tenureUnit, setTenureUnit] = useState<TenureUnit>("months");
+  // Errors show only after a Save attempt, so a fresh form isn't covered in red.
+  const [triedSave, setTriedSave] = useState(false);
+  // When editing, the FD's deposit date is its earliest recorded deposit (the form
+  // doesn't edit lots); it anchors the tenure helper and the maturity check.
+  const existingDepositDate = useMemo(
+    () => (initial ? firstDepositDate(state.holdingEvents.filter((e) => e.holdingId === initial.id)) : ""),
+    [initial, state.holdingEvents],
+  );
 
   // Default the price source to match the asset class until the user touches it.
   const pickAssetClass = (v: AssetClass): void => {
@@ -737,10 +756,71 @@ function HoldingForm({
   const toggleFd = (on: boolean): void => {
     setFdEnabled(on);
     if (on && assetClass !== "debt") setAssetClass("debt");
+    // Re-derive the maturity on (re)enabling, in case the deposit date changed
+    // while the FD box was hidden.
+    if (on) applyTenure(depositDate, tenure, tenureUnit);
   };
+
+  const isFd = assetClass === "debt" && fdEnabled;
+  const depositDate = initial ? existingDepositDate : startDate;
+  // Recompute the maturity from the tenure whenever either end of it changes.
+  const applyTenure = (start: string, n: string, unit: TenureUnit): void => {
+    if (n.trim() === "") return;
+    const end = start ? addTenureIso(start, Number(n), unit) : null;
+    setFdMaturity(end ?? "");
+  };
+  const changeTenure = (n: string): void => {
+    if (tenure.trim() === "" && n.trim() !== "") setMaturityBeforeTenure(fdMaturity);
+    setTenure(n);
+    if (n.trim() === "") setFdMaturity(maturityBeforeTenure);
+    else applyTenure(depositDate, n, tenureUnit);
+  };
+  const changeTenureUnit = (u: TenureUnit): void => {
+    setTenureUnit(u);
+    applyTenure(depositDate, tenure, u);
+  };
+  // Applied even while the FD box is hidden (unticked / another class), so a tenure
+  // kept in state can never be shown against a stale maturity when it comes back.
+  const changeStartDate = (d: string): void => {
+    setStartDate(d);
+    applyTenure(d, tenure, tenureUnit);
+  };
+  const changeMaturity = (d: string): void => {
+    setFdMaturity(d);
+    setTenure("");
+  };
+  const fdErrors: FdFormErrors = isFd
+    ? validateFdInput({
+        isNew: !initial,
+        principal: num(invested),
+        startDate: depositDate,
+        ratePct: num(fdRate),
+        tenure,
+        maturityDate: fdMaturity,
+        today: todayIso(),
+        stored: initial?.fd,
+      })
+    : {};
+  const shownFdErrors: FdFormErrors = triedSave ? fdErrors : {};
+  // Live estimate for a new FD, once the terms are complete enough to compute.
+  const fdPreview = ((): { today: number; atMaturity: number | null } | null => {
+    if (!isFd || initial) return null;
+    const p = num(invested);
+    const r = num(fdRate);
+    if (p === null || !(p > 0) || r === null || !(r > 0) || fdErrors.startDate) return null;
+    const terms: FdTerms = { ratePct: r, compounding: fdCompounding, maturityDate: fdErrors.maturityDate ? undefined : fdMaturity || undefined };
+    return {
+      today: fdValue(p, terms, startDate, todayIso()),
+      atMaturity: terms.maturityDate ? fdValue(p, terms, startDate, terms.maturityDate) : null,
+    };
+  })();
 
   const save = async (): Promise<void> => {
     if (!name.trim()) return;
+    if (Object.keys(fdErrors).length > 0) {
+      setTriedSave(true);
+      return;
+    }
     // FD terms only for a DEBT holding with FD enabled and a valid rate — the
     // `assetClass === "debt"` gate enforces the "fd ⇒ debt" invariant, so
     // reclassifying off debt (even for an existing FD) drops the FD instead of
@@ -815,9 +895,11 @@ function HoldingForm({
       });
     }
     // A manual current value only makes sense when there's no live source to
-    // fetch it; otherwise the refresh provides it (units × live price).
+    // fetch it; otherwise the refresh provides it (units × live price). A new FD is
+    // valued by its interest, so the field is hidden and any value typed before
+    // ticking "fixed deposit" is ignored (it would override the accrual from day one).
     const valueNum = num(currentValue);
-    if (!livePriced && valueNum !== null && valueNum >= 0) {
+    if (!livePriced && !isFd && valueNum !== null && valueNum >= 0) {
       await store.saveHoldingEvent({
         id: newId(),
         holdingId: holding.id,
@@ -860,22 +942,126 @@ function HoldingForm({
               options={ASSET_CLASSES.map((c) => ({ value: c, label: ASSET_CLASS_LABELS[c] }))}
             />
           </Field>
-          <Field label="Dividends">
-            <Select
-              value={incomeMode}
-              onChange={(v) => setIncomeMode(v as IncomeMode)}
-              options={[
-                { value: "accumulating", label: "Reinvested (growth)" },
-                { value: "payout", label: "Paid out (income)" },
-              ]}
-            />
-          </Field>
+          {!isFd && (
+            <Field label="Dividends">
+              <Select
+                value={incomeMode}
+                onChange={(v) => setIncomeMode(v as IncomeMode)}
+                options={[
+                  { value: "accumulating", label: "Reinvested (growth)" },
+                  { value: "payout", label: "Paid out (income)" },
+                ]}
+              />
+            </Field>
+          )}
         </div>
-        <p className="text-xs text-slate-400">
-          {incomeMode === "accumulating"
-            ? "Growth funds reinvest dividends into the price, so you don't log them separately."
-            : "Income funds pay cash dividends — you'll log each payout, and it counts toward returns."}
-        </p>
+        {!isFd && (
+          <p className="text-xs text-slate-400">
+            {incomeMode === "accumulating"
+              ? "Growth funds reinvest dividends into the price, so you don't log them separately."
+              : "Income funds pay cash dividends — you'll log each payout, and it counts toward returns."}
+          </p>
+        )}
+
+        {showFd && (
+          <div className="rounded-lg bg-slate-50 p-3">
+            <label className="flex items-center gap-2 text-sm font-medium text-slate-700">
+              <input type="checkbox" checked={fdEnabled} onChange={(e) => toggleFd(e.target.checked)} />
+              This is a fixed deposit (value is calculated from the interest)
+            </label>
+            {isFd && (
+              <div className="mt-3 space-y-3">
+                <div className="grid grid-cols-2 gap-2">
+                  {!initial && (
+                    <>
+                      <Field label="Deposit amount" error={shownFdErrors.principal}>
+                        <NumberInput value={invested} onChange={setInvested} placeholder="e.g. 100000" />
+                      </Field>
+                      <Field label="Deposit date" error={shownFdErrors.startDate}>
+                        <TextInput value={startDate} onChange={changeStartDate} type="date" />
+                      </Field>
+                    </>
+                  )}
+                  <Field label="Interest rate (% p.a.)" error={shownFdErrors.ratePct}>
+                    <NumberInput value={fdRate} onChange={setFdRate} placeholder="e.g. 7.1" />
+                  </Field>
+                  <Field label="Compounding">
+                    <Select
+                      value={fdCompounding}
+                      onChange={(v) => setFdCompounding(v as FdCompounding)}
+                      // Same crediting frequencies as savings interest, plus an FD-only "simple".
+                      options={[...INTEREST_FREQUENCY_OPTIONS, { value: "simple", label: "Simple (no compounding)" }]}
+                    />
+                  </Field>
+                  {/* Editing an FD with no recorded deposit: there's no date to count a
+                      tenure from, so offer only the maturity date. */}
+                  {(!initial || depositDate) && (
+                    <Field
+                      label="Tenure"
+                      hint={depositDate ? undefined : "Enter the deposit date first"}
+                      error={shownFdErrors.tenure}
+                    >
+                      <div className="flex gap-2">
+                        <NumberInput value={tenure} onChange={changeTenure} placeholder="e.g. 12" />
+                        <Select
+                          value={tenureUnit}
+                          onChange={(v) => changeTenureUnit(v as TenureUnit)}
+                          options={[
+                            { value: "days", label: "days" },
+                            { value: "months", label: "months" },
+                            { value: "years", label: "years" },
+                          ]}
+                        />
+                      </div>
+                    </Field>
+                  )}
+                  <Field
+                    label={initial ? "Maturity date (optional)" : "Maturity date"}
+                    hint={tenure.trim() !== "" && fdMaturity ? "Filled in from the tenure" : "Or type it directly"}
+                    error={shownFdErrors.maturityDate}
+                  >
+                    <TextInput value={fdMaturity} onChange={changeMaturity} type="date" />
+                  </Field>
+                  <Field label="Interest">
+                    <Select
+                      value={incomeMode}
+                      onChange={(v) => setIncomeMode(v as IncomeMode)}
+                      options={[
+                        { value: "accumulating", label: "Cumulative (reinvested)" },
+                        { value: "payout", label: "Paid out to my account" },
+                      ]}
+                    />
+                  </Field>
+                </div>
+                {incomeMode === "payout" ? (
+                  <p className="rounded-md bg-amber-50 p-2 text-xs text-amber-800">
+                    A payout FD isn't valued automatically: log each interest payout as a dividend and update its
+                    value from its detail view. Choose "Cumulative" if the bank adds the interest to the deposit.
+                  </p>
+                ) : fdPreview ? (
+                  <p className="text-sm text-slate-700">
+                    Estimated value today{" "}
+                    <span className="font-semibold">{formatMoney(fdPreview.today, currency)}</span>
+                    {fdPreview.atMaturity !== null && (
+                      <>
+                        {" "}
+                        · at maturity ({formatDate(fdMaturity)}){" "}
+                        <span className="font-semibold">{formatMoney(fdPreview.atMaturity, currency)}</span>
+                      </>
+                    )}
+                  </p>
+                ) : null}
+                <p className="text-xs text-slate-400">
+                  {initial
+                    ? "Value accrues from your deposit (or latest manual valuation) to today. "
+                    : "The value grows from the deposit date to today. "}
+                  It's an estimate (banks round and deduct TDS); add a valuation from the holding's detail view any time
+                  to match your bank statement.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
 
         {showLivePricing && (
           <LivePriceFields
@@ -886,9 +1072,9 @@ function HoldingForm({
           />
         )}
 
-        {/* Onboarding (NEW holdings only) — for an existing one, lots are edited
-            in its transaction history. */}
-        {!initial && (
+        {/* Onboarding (NEW, non-FD holdings only; an FD collects its deposit above).
+            For an existing one, lots are edited in its transaction history. */}
+        {!initial && !isFd && (
           <div className="rounded-lg bg-slate-50 p-3">
             <div className="mb-2 text-xs font-medium text-slate-500">
               Already hold this? Enter your quantity and what you paid (optional).
@@ -899,11 +1085,11 @@ function HoldingForm({
                   <NumberInput value={quantity} onChange={setQuantity} placeholder="e.g. 0.085" />
                 </Field>
               )}
-              <Field label={fdEnabled ? "Deposit amount (principal)" : "Total cost (what you paid)"}>
+              <Field label="Total cost (what you paid)">
                 <NumberInput value={invested} onChange={setInvested} placeholder="cost basis" />
               </Field>
               <Field label="Since">
-                <TextInput value={startDate} onChange={setStartDate} type="date" />
+                <TextInput value={startDate} onChange={changeStartDate} type="date" />
               </Field>
               {!livePriced && (
                 <Field label="Current value">
@@ -921,45 +1107,8 @@ function HoldingForm({
           </div>
         )}
 
-        {showFd && (
-          <div className="rounded-lg bg-slate-50 p-3">
-            <label className="flex items-center gap-2 text-sm text-slate-700">
-              <input
-                type="checkbox"
-                checked={fdEnabled}
-                onChange={(e) => toggleFd(e.target.checked)}
-              />
-              Fixed deposit — auto-calculate its value from interest
-            </label>
-            {fdEnabled && (
-              <>
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  <Field label="Interest rate (% p.a.)">
-                    <NumberInput value={fdRate} onChange={setFdRate} placeholder="e.g. 7.1" />
-                  </Field>
-                  <Field label="Compounding">
-                    <Select
-                      value={fdCompounding}
-                      onChange={(v) => setFdCompounding(v as FdCompounding)}
-                      // Same crediting frequencies as savings interest, plus an FD-only "simple".
-                      options={[...INTEREST_FREQUENCY_OPTIONS, { value: "simple", label: "Simple (no compounding)" }]}
-                    />
-                  </Field>
-                  <Field label="Maturity date (optional)">
-                    <TextInput value={fdMaturity} onChange={setFdMaturity} type="date" />
-                  </Field>
-                </div>
-                <p className="mt-1 text-xs text-slate-400">
-                  {initial
-                    ? "Value accrues from your deposit (or latest manual valuation) to today."
-                    : "Enter your principal as “Deposit amount” and its date as “Since” above; the value then accrues to today."}{" "}
-                  It's an estimate (banks round / deduct TDS) — enter a current value any time to reconcile.
-                  Assumes interest is reinvested (cumulative FD); a payout FD (Dividends = “Paid out”) isn't
-                  auto-valued — log each payout instead.
-                </p>
-              </>
-            )}
-          </div>
+        {triedSave && Object.keys(fdErrors).length > 0 && (
+          <p className="text-sm text-red-600">Fill in the highlighted fixed-deposit fields to save.</p>
         )}
 
         <div className="flex justify-end gap-2 pt-2">
