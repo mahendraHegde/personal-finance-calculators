@@ -2896,4 +2896,361 @@ section("[sync] the WINNER is what gets remembered, and an unminted sequence can
   eq(seen(controller).behind, 1, "the folder moved on, and we can still see it");
 }
 
+// ---------------------------------------------------------------------------
+// Provenance: a snapshot says which older files its data already holds.
+// ---------------------------------------------------------------------------
+
+/** A fresh device and a folder of four devices' last files, where each device pulled the previous
+ *  one before publishing, so D@12 holds every row. `prov` is D@12's provenance, if any. */
+async function fourDeviceFolder(prov?: unknown) {
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("A", 3, "devA"), meta("B", 6, "devB"), meta("C", 9, "devC"), meta("D", 12, "devD")];
+  const docs: Record<string, SnapshotDoc> = {};
+  const rows: Transaction[] = [];
+  for (const f of files) {
+    rows.push(tx(`t-${f.id}`));
+    docs[f.id] = { schemaVersion: SCHEMA.version, version: f.version, data: { transactions: [...rows] } as never };
+  }
+  if (prov !== undefined) docs.D.incorporated = prov as never;
+  const { controller, inject } = withFolder(store as never, files, docs);
+  /** One "Pull latest → Replace" round, as Settings runs it. */
+  const pullReplace = async () => {
+    inject();
+    const r = (await controller.checkRemote())!;
+    inject(); // applying tears the stub engine down via refreshPhase
+    await controller.applyRemote(r.doc, r.fileId, r.outstandingOthers, r.base, { listing: r.listing });
+    return r;
+  };
+  return { store, controller, inject, docs, pullReplace };
+}
+
+section("[provenance] a fresh device loading a snapshot that holds everyone's data is fully caught up");
+{
+  const { store, controller, pullReplace } = await fourDeviceFolder({ watermark: 9, seen: ["C@9"] });
+  const r = await pullReplace();
+  eq(r.fileId, "D", "the newest file is the one offered");
+  eq(r.outstandingOthers, 0, "the dialog is told nothing else is outstanding");
+  eq(seen(controller).behind, 0, "the pill reads 0 to load, not 3");
+  const s = await store.persistedSyncState();
+  eq(s.lastSyncedVersion, 12, "the watermark moves up to the loaded file");
+  ok(!store.getState().dirty, "the device is clean, so autosave does not hit the push guard");
+  eq(store.getState().transactions.length, 4, "every device's row is here");
+}
+
+section("[provenance] without it (older builds), the other devices' files stay outstanding");
+{
+  // Pinned so the change is visibly scoped: an old snapshot proves nothing about the files below
+  // it, and treating it as if it did would skip a device that really is unread.
+  const { store, controller, pullReplace } = await fourDeviceFolder();
+  const r = await pullReplace();
+  eq(r.outstandingOthers, 3, "three files are still unread");
+  eq(seen(controller).behind, 3, "…and the pill says so");
+  eq((await store.persistedSyncState()).lastSyncedVersion, 0, "the watermark is held");
+}
+
+section("[provenance] a snapshot that only holds SOME files leaves the rest outstanding");
+{
+  // D pulled C@9 but its watermark was only 4: B@6 is above it and not in its log.
+  const { controller, pullReplace, store } = await fourDeviceFolder({ watermark: 4, seen: ["C@9"] });
+  const r = await pullReplace();
+  eq(r.outstandingOthers, 1, "B@6 is still unread (A@3 is below the inherited watermark)");
+  eq(seen(controller).behind, 1, "…and the pill counts exactly that one");
+  eq((await store.persistedSyncState()).lastSyncedVersion, 4, "the watermark rises only as far as the snapshot's own");
+}
+
+section("[provenance] a malformed or overreaching claim is not trusted");
+{
+  const junk = await fourDeviceFolder({ watermark: "lots", seen: "C@9" });
+  eq((await junk.pullReplace()).outstandingOthers, 3, "a malformed record is ignored rather than thrown on");
+  // A watermark above the file's own version would subsume files published after it.
+  const { store, docs, controller, inject } = await fourDeviceFolder({ watermark: 999, seen: [] });
+  docs.E = { schemaVersion: SCHEMA.version, version: 20, data: { transactions: [tx("t-E")] } as never };
+  const files = [meta("A", 3, "devA"), meta("B", 6, "devB"), meta("C", 9, "devC"), meta("D", 12, "devD"), meta("E", 20, "devE")];
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  const injectE = (): void => {
+    inject();
+    c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async (m: { id: string }) => ({ doc: docs[m.id], meta: files.find((f) => f.id === m.id) }) };
+    c.provider = { list: async () => files };
+  };
+  injectE();
+  await controller.applyRemote(docs.D, "D", 0, undefined);
+  ok((await store.persistedSyncState()).lastSyncedVersion < 20, "the claim is capped at the snapshot's own version");
+  injectE();
+  await controller.startupCheck();
+  ok((seen(controller).behind ?? 0) >= 1, "E@20, published after D, is still counted unread");
+}
+
+section("[provenance] a merge inherits it too, so the result is publishable in one round");
+{
+  const { store, controller, inject } = await fourDeviceFolder({ watermark: 9, seen: ["C@9"] });
+  await store.saveTransaction(tx("mine"));
+  inject();
+  const r = (await controller.checkRemote())!;
+  inject();
+  const preview = await controller.previewMerge(r.doc, r.fileId);
+  eq(preview.outstandingOthers, 0, "nothing is left after merging D@12");
+  inject();
+  const { publishable } = await controller.commitMerge(preview, {});
+  ok(publishable, "…so it can be published straight away");
+  ok(store.getState().transactions.some((t) => t.id === "mine"), "our row survives the merge");
+  eq(store.getState().transactions.length, 5, "…alongside all four devices' rows");
+}
+
+section("[provenance] a peer's snapshot from an OLDER build still catches a caught-up device up");
+{
+  // The ordinary mixed-build case: we already hold X@10, and D@12 (no provenance) was built on it.
+  // Judging the replace against an emptied log held the watermark here, leaving the device dirty
+  // and "1 behind" while the dialog had promised it was brought up to date.
+  const store = await deviceWith([tx("x")], 0);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const docX = await peerDoc(store, 10, (t) => t);
+  await store.applyDocument(docX, { seenSnapshotKey: "X@10" });
+  ok(!store.getState().dirty, "setup: clean after pulling X@10");
+  const files = [meta("X", 10, "devX"), meta("D", 12, "devD")];
+  const docD = await peerDoc(store, 12, (t) => [...t, tx("from-D")]);
+  const { controller, inject } = withFolder(store, files, { D: docD, X: docX });
+  const r = (await controller.checkRemote())!;
+  eq(r.fileId, "D", "D@12 is offered");
+  eq(r.outstandingOthers, 0, "the dialog says nothing else is outstanding");
+  inject();
+  await controller.applyRemote(r.doc, r.fileId, r.outstandingOthers, r.base, { listing: r.listing });
+  eq(seen(controller).behind, 0, "…and after the load that is still true");
+  eq((await store.persistedSyncState()).lastSyncedVersion, 12, "the watermark advances as it always did");
+  ok(!store.getState().dirty, "the device is clean, so autosave does not hit the push guard");
+}
+
+section("[provenance] log entries that are not keys, or name files newer than the snapshot, are dropped");
+{
+  const mixed = await fourDeviceFolder({ watermark: 0, seen: [7, null, "C@9"] });
+  eq((await mixed.pullReplace()).outstandingOthers, 2, "the valid key still counts; the junk neither throws nor counts");
+  // D@12 claiming E@20 would hide a file published after it.
+  const { store, docs, controller, inject } = await fourDeviceFolder({ watermark: 9, seen: ["C@9", "E@20"] });
+  const files = [meta("A", 3, "devA"), meta("B", 6, "devB"), meta("C", 9, "devC"), meta("D", 12, "devD"), meta("E", 20, "devE")];
+  docs.E = { schemaVersion: SCHEMA.version, version: 20, data: { transactions: [tx("t-E")] } as never };
+  const c = controller as unknown as { engine: unknown; provider: unknown };
+  inject();
+  c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async (m: { id: string }) => ({ doc: docs[m.id], meta: files.find((f) => f.id === m.id) }) };
+  c.provider = { list: async () => files };
+  await controller.applyRemote(docs.D, "D", 0, undefined);
+  ok(!(await store.persistedSyncState()).seenSnapshots.includes("E@20"), "the future key is not recorded as seen");
+}
+
+section("[provenance] a partial merge still records what the merged snapshot held");
+{
+  // E@20 stays outstanding, so the watermark cannot move to the folder max; the inherited
+  // watermark and log are then the only record that A, B and C are in our data now.
+  const { store, docs, controller, inject } = await fourDeviceFolder({ watermark: 9, seen: ["C@9"] });
+  const files = [meta("A", 3, "devA"), meta("B", 6, "devB"), meta("C", 9, "devC"), meta("D", 12, "devD"), meta("E", 20, "devE")];
+  const c = controller as unknown as { engine: unknown; provider: unknown };
+  const injectE = (): void => {
+    inject();
+    c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async (m: { id: string }) => ({ doc: docs[m.id], meta: files.find((f) => f.id === m.id) }) };
+    c.provider = { list: async () => files };
+  };
+  await store.saveTransaction(tx("mine"));
+  injectE();
+  const preview = await controller.previewMerge(docs.D, "D");
+  eq(preview.outstandingOthers, 1, "only E@20 remains");
+  injectE();
+  const { publishable } = await controller.commitMerge(preview, {});
+  ok(!publishable, "not publishable while E@20 is unread");
+  const s = await store.persistedSyncState();
+  eq(s.lastSyncedVersion, 9, "the merged snapshot's watermark is inherited");
+  ok(s.seenSnapshots.includes("C@9") && s.seenSnapshots.includes("D@12"), "…with its log and its own key");
+}
+
+section("[provenance] each malformed field is rejected on its own");
+{
+  eq((await (await fourDeviceFolder({ watermark: "lots", seen: [] })).pullReplace()).outstandingOthers, 3, "a non-numeric watermark voids the record");
+  eq((await (await fourDeviceFolder({ watermark: 9, seen: "C@9" })).pullReplace()).outstandingOthers, 3, "a non-array log voids the record");
+  const { store, pullReplace } = await fourDeviceFolder({ watermark: "lots", seen: [] });
+  await pullReplace();
+  ok(Number.isFinite((await store.persistedSyncState()).lastSyncedVersion), "…and no NaN reaches the stored watermark");
+}
+
+section("[provenance] an overreaching watermark does not shrink the dialog's count");
+{
+  const { docs, controller, inject } = await fourDeviceFolder({ watermark: 999, seen: [] });
+  docs.E = { schemaVersion: SCHEMA.version, version: 20, data: { transactions: [tx("t-E")] } as never };
+  // E@20 is newer than D, so the stub loader hands back D whatever is chosen; the question is only
+  // what D's claim leaves outstanding.
+  const files = [meta("A", 3, "devA"), meta("B", 6, "devB"), meta("C", 9, "devC"), meta("D", 12, "devD"), meta("E", 20, "devE")];
+  const c = controller as unknown as { engine: unknown; provider: unknown };
+  inject();
+  c.engine = { list: async () => files, getSessionFileId: () => null, loadFile: async () => ({ doc: docs.D, meta: files[3] }) };
+  c.provider = { list: async () => files };
+  const r = (await controller.checkRemote())!;
+  eq(r.outstandingOthers, 1, "E@20 is still counted, not hidden by D's claim of 999");
+}
+
+section("[provenance] our own higher watermark is kept when the snapshot's is lower");
+{
+  // We are at 7 and hold B@6's rows by watermark; D@12 claims only 2.
+  const { store, pullReplace } = await fourDeviceFolder({ watermark: 2, seen: ["C@9"] });
+  await store.saveSettings({ lastSyncedVersion: 7 });
+  const r = await pullReplace();
+  eq(r.outstandingOthers, 0, "A and B stay below OUR watermark; C is in D's log");
+  ok((await store.persistedSyncState()).lastSyncedVersion >= 7, "…and the watermark does not regress");
+}
+
+section("[provenance] a merge keeps our own log alongside the snapshot's");
+{
+  // We had merged B@6 earlier; D@12 knows only C@9 and sits above A@3 by watermark.
+  const { store, controller, inject } = await fourDeviceFolder({ watermark: 4, seen: ["C@9"] });
+  await store.applyDocument(
+    { schemaVersion: SCHEMA.version, version: 6, data: { transactions: [tx("t-A"), tx("t-B")] } as never },
+    { dirty: true, seenSnapshotKey: "B@6" },
+  );
+  inject();
+  const r = (await controller.checkRemote())!;
+  inject();
+  const preview = await controller.previewMerge(r.doc, r.fileId);
+  eq(preview.outstandingOthers, 0, "B@6 is ours by merge, A below D's watermark, C in D's log");
+}
+
+section("[provenance] the author's previous session file is covered by the one being loaded");
+{
+  // D's first push of a NEW session: D1@8 is its previous session's file, and D2@9 contains it.
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("A", 3, "devA"), meta("B", 6, "devB"), meta("C", 7, "devC"), meta("D1", 8, "devD"), meta("D2", 9, "devD")];
+  const d2: SnapshotDoc = {
+    schemaVersion: SCHEMA.version,
+    version: 9,
+    data: { transactions: [tx("t-A"), tx("t-B"), tx("t-C"), tx("t-D")] } as never,
+    incorporated: { watermark: 8, seen: [] },
+  };
+  const { controller, inject } = withFolder(store as never, files, { D2: d2 });
+  const r = (await controller.checkRemote())!;
+  eq(r.fileId, "D2", "the newest file is offered");
+  eq(r.outstandingOthers, 0, "D1@8 is not promoted to D's top just because D2 is the one being loaded");
+  inject();
+  await controller.applyRemote(r.doc, r.fileId, r.outstandingOthers, r.base, { listing: r.listing });
+  eq(seen(controller).behind, 0, "the pill agrees");
+  ok(!store.getState().dirty, "…and the device is clean");
+}
+
+section("[provenance] a same-device file at the SAME version is not covered (cloned profile)");
+{
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  const files = [meta("D1", 9, "devD"), meta("D2", 9, "devD")];
+  // D2 sorts as latest (same savedAt, higher id), so give IT the provenance.
+  const d2: SnapshotDoc = {
+    schemaVersion: SCHEMA.version,
+    version: 9,
+    data: { transactions: [tx("t-D2")] } as never,
+    incorporated: { watermark: 0, seen: [] },
+  };
+  const { controller, inject } = withFolder(store as never, files, { D2: d2 });
+  const r = (await controller.checkRemote())!;
+  eq(r.fileId, "D2", "D2@9 is offered");
+  eq(r.outstandingOthers, 1, "its tied twin D1@9 is still outstanding");
+  inject();
+  await controller.applyRemote(r.doc, r.fileId, r.outstandingOthers, r.base, { listing: r.listing });
+  ok(!(await store.persistedSyncState()).seenSnapshots.includes("D1@9"), "…and is not recorded as seen");
+}
+
+section("[provenance] a replace does not count a file we had merged once its rows are gone");
+{
+  // We merged X@10. D@12 raced X (its log doesn't include it). Replacing with D drops X's rows,
+  // so X must still be outstanding and the watermark must not jump over it.
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  await store.applyDocument(
+    { schemaVersion: SCHEMA.version, version: 10, data: { transactions: [tx("t-X")] } as never },
+    { dirty: true, seenSnapshotKey: "X@10" },
+  );
+  const files = [meta("X", 10, "devX"), meta("D", 12, "devD")];
+  const d: SnapshotDoc = {
+    schemaVersion: SCHEMA.version,
+    version: 12,
+    data: { transactions: [tx("t-D")] } as never,
+    incorporated: { watermark: 9, seen: [] },
+  };
+  const { controller, inject } = withFolder(store as never, files, { D: d });
+  const r = (await controller.checkRemote())!;
+  eq(r.outstandingOthers, 1, "the dialog says X@10 would be left outstanding by a replace");
+  inject();
+  await controller.applyRemote(r.doc, r.fileId, r.outstandingOthers, r.base, { listing: r.listing });
+  eq(seen(controller).behind, 1, "…and after it, X@10 is counted");
+  ok((await store.persistedSyncState()).lastSyncedVersion <= 10, "the watermark did not jump over X@10");
+}
+
+section("[provenance] an old-build replace that drops a file we pulled keeps that file guarded");
+{
+  // We pulled B@6. Device A (older build, two session files) never read B. Replacing with A2@9
+  // removes B's row, so B@6 must stay a hazard: the push guard is what stops us publishing over it.
+  const store = await createPortfolioStore(createMemoryStorage(SCHEMA));
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  await store.applyDocument(
+    { schemaVersion: SCHEMA.version, version: 6, data: { transactions: [tx("t-B")] } as never },
+    { seenSnapshotKey: "B@6" },
+  );
+  const files = [meta("B", 6, "devB"), meta("A1", 7, "devA"), meta("A2", 9, "devA")];
+  const a2: SnapshotDoc = { schemaVersion: SCHEMA.version, version: 9, data: { transactions: [tx("t-A")] } as never };
+  const { controller, inject } = withFolder(store as never, files, { A2: a2 });
+  const r = (await controller.checkRemote())!;
+  eq(r.fileId, "A2", "A2@9 is offered");
+  inject();
+  await controller.applyRemote(r.doc, r.fileId, r.outstandingOthers, r.base, { listing: r.listing });
+  ok((await store.persistedSyncState()).lastSyncedVersion < 9, "the watermark is held, not jumped over B@6");
+  ok((seen(controller).behind ?? 0) >= 1, "B@6 is still counted unread");
+}
+
+section("[provenance] a backup restore never inherits a snapshot's provenance");
+{
+  const store = await deviceWith([tx("x")], 0);
+  const doc: SnapshotDoc = {
+    schemaVersion: SCHEMA.version,
+    version: 9,
+    data: { transactions: [tx("r")] } as never,
+    incorporated: { watermark: 8, seen: ["P@8"] },
+  };
+  await store.applyDocument(doc, { dirty: true }); // exactly how Settings restores a backup
+  const s = await store.persistedSyncState();
+  eq(s.lastSyncedVersion, 0, "the watermark is not raised by the file's claim");
+  eq(s.seenSnapshots.length, 0, "…and nothing is recorded as seen");
+}
+
+section("[provenance] Sync now publishes the document WITH provenance");
+{
+  const store = await deviceWith([tx("x")], 0);
+  await store.saveSettings({ drive: { folderId: "F1", folderName: "Family" } });
+  await store.applyDocument(await peerDoc(store, 4, (t) => t), { seenSnapshotKey: "P@4" });
+  await store.saveTransaction(tx("edit")); // dirty, so the push actually happens
+  const controller = new SyncController(store);
+  let pushed: SnapshotDoc | undefined;
+  const c = controller as unknown as { engine: unknown; provider: unknown; codec: unknown };
+  c.engine = {
+    list: async () => [],
+    getSessionFileId: () => null,
+    setSessionFileId: () => {},
+    push: async (doc: SnapshotDoc) => {
+      pushed = doc;
+      return meta("mine", doc.version, store.getState().settings.deviceId);
+    },
+    prune: async () => 0,
+  };
+  c.provider = { list: async () => [] };
+  c.codec = {};
+  await controller.syncNow();
+  eq(pushed?.incorporated?.watermark, 4, "the pushed snapshot carries our watermark");
+  ok(pushed?.incorporated?.seen.includes("P@4") ?? false, "…and our seen-log");
+}
+
+section("[provenance] what is published carries the author's log, read with the data");
+{
+  const store = await deviceWith([tx("x")], 7);
+  await store.applyDocument(
+    { schemaVersion: SCHEMA.version, version: 9, data: (await store.exportDocument()).data },
+    { seenSnapshotKey: "peer@9" },
+  );
+  const doc = await store.exportForPublish();
+  eq(doc.incorporated?.watermark, 9, "the watermark is the stored one");
+  ok(doc.incorporated?.seen.includes("peer@9") ?? false, "…and the seen-log travels with it");
+  eq((await store.exportDocument()).incorporated, undefined, "a backup export carries none");
+}
+
 done();

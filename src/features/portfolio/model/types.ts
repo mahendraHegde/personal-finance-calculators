@@ -351,4 +351,17 @@ export interface SnapshotDoc {
   version: number;
   /** Every collection's records (StorageAdapter.exportAll() shape). */
   data: Record<string, Entity[]>;
+  /** What the AUTHOR's data already contained when it published this snapshot: its synced
+   *  watermark and seen-log, read in the same lock as `data`. Without it a device loading this
+   *  file cannot tell that it subsumes the older files it was built from, so on a fresh device
+   *  every other device's last file stayed "unread" forever. Absent on older snapshots and on
+   *  backups; a restore never reads it. */
+  incorporated?: SnapshotProvenance;
+}
+
+export interface SnapshotProvenance {
+  /** Author's `lastSyncedVersion`: every file strictly below it is in `data`. */
+  watermark: number;
+  /** Author's `seenSnapshots`: each `<fileId>@<version>` is in `data`. */
+  seen: string[];
 }

@@ -42,6 +42,9 @@ export interface MergePreview {
   /** The listing this preview was computed from, and when — so `commitMerge` can recount it after
    *  the write instead of republishing a pre-merge number under a fresh timestamp. */
   listing: Listing | null;
+  /** What the merged snapshot already holds (its provenance, widened with its author's own files
+   *  in the listing), so the commit records exactly what the preview counted. */
+  inherit?: SnapshotProvenance;
 }
 import {
   createDekCodec,
@@ -69,7 +72,7 @@ import { DriveSyncProvider } from "../../../lib/google/drive-provider";
 import { SheetsOracle } from "../../../lib/google/sheets-oracle";
 import { newId } from "../../../lib/util/id";
 import { SCHEMA } from "../model/schema";
-import type { SnapshotDoc } from "../model/types";
+import type { SnapshotDoc, SnapshotProvenance } from "../model/types";
 import type { PortfolioStore } from "./store";
 import { SYNC } from "../../../config";
 
@@ -186,6 +189,67 @@ type SyncFacts = { lastSyncedVersion: number; localVersion: number; seenSnapshot
  *  path both ask for it, and a bound that differs between them is a guard that stops guarding. */
 function ownBound(sync: SyncFacts): { deviceId: string; version: number } {
   return { deviceId: sync.deviceId, version: Math.max(sync.localVersion, sync.lastSyncedVersion) };
+}
+
+/** A decoded snapshot's provenance, or undefined when it has none (older builds) or it is not
+ *  shaped as one. It came off the network, and a malformed log must not throw mid-pull. */
+function provenanceOf(doc: SnapshotDoc): SnapshotProvenance | undefined {
+  const p = doc.incorporated as Partial<SnapshotProvenance> | undefined;
+  if (!p || typeof p !== "object" || !Number.isFinite(p.watermark) || !Array.isArray(p.seen)) return undefined;
+  // Never above the snapshot's own version: nobody can have incorporated files newer than
+  // what they published, and a larger number would subsume files this data has never seen.
+  const watermark = Math.max(0, Math.min(p.watermark as number, doc.version));
+  // Same bound for the log: a key newer than the snapshot names a file it cannot contain.
+  const seen = p.seen.filter((k): k is string => {
+    if (typeof k !== "string") return false;
+    const v = Number(k.slice(k.lastIndexOf("@") + 1));
+    return Number.isFinite(v) && v <= doc.version;
+  });
+  return { watermark, seen };
+}
+
+/** `provenanceOf(doc)` plus the author's OWN other files in the listing at or below the loaded
+ *  one: a later full export from the same database contains them. Without this, a snapshot that
+ *  was the first push of a new session left its author's previous session file flagged (it sits
+ *  at the author's watermark, and a file AT the watermark is a hazard). The same-device rule
+ *  `unincorporatedFiles` already applies whenever the loaded file is visible; this only keeps it
+ *  when that file is the one being ignored. Snapshots without provenance get nothing, so they are
+ *  judged exactly as before. */
+function provenanceFor(
+  doc: SnapshotDoc,
+  file: SnapshotMeta | undefined,
+  metas: readonly SnapshotMeta[] | undefined,
+): SnapshotProvenance | undefined {
+  const p = provenanceOf(doc);
+  if (!p || !file || !metas) return p;
+  // STRICTLY below, and below the version we actually decoded (the listing may show the file
+  // updated in place since). A tie is not subsumed, as in `unincorporatedFiles`: two files at one
+  // device's top version can be a cloned profile with diverged data.
+  const bound = Math.min(file.version, doc.version);
+  const own = metas.filter((m) => m.deviceId === file.deviceId && m.id !== file.id && m.version < bound);
+  return { watermark: p.watermark, seen: [...p.seen, ...own.map(snapshotKey)] };
+}
+
+/** The bookkeeping a MERGE leaves: ours, which a merge keeps, plus what the snapshot already
+ *  holds (`p`, from `provenanceFor`). With no provenance it is exactly our own. The replace
+ *  counterpart is `afterReplace`. */
+function withProvenance(sync: SyncFacts, p: SnapshotProvenance | undefined): SyncFacts {
+  if (!p) return sync;
+  return {
+    ...sync,
+    lastSyncedVersion: Math.max(sync.lastSyncedVersion, p.watermark),
+    seenSnapshots: [...sync.seenSnapshots, ...p.seen],
+  };
+}
+
+/** The bookkeeping a REPLACE with `doc` leaves, for the pull's count and hold decision. With
+ *  provenance it is exactly what `applyDocument` writes: the snapshot's log in place of ours, which
+ *  the replace discards (keeping ours counted a file we had merged as held after its rows were
+ *  gone). Without provenance it is our own bookkeeping, as it has always been judged: an emptied
+ *  log there held the watermark on an ordinary catch-up from an older build's snapshot. */
+function afterReplace(sync: SyncFacts, p: SnapshotProvenance | undefined): SyncFacts {
+  if (!p) return sync;
+  return { ...sync, lastSyncedVersion: Math.max(sync.lastSyncedVersion, p.watermark), seenSnapshots: p.seen };
 }
 
 /** A folder listing AND the moment it was taken. One value, never two fields: as `listing` +
@@ -1404,7 +1468,8 @@ export class SyncController {
       // a colliding version number (ours included, to stay unambiguous).
       await this.store.reconcileVersion(remoteMax);
 
-      const doc = await this.store.exportDocument();
+      // With provenance, so a device loading this file knows which older files it already holds.
+      const doc = await this.store.exportForPublish();
       const meta = await this.engine.push(doc, this.sessionStartIso, new Date().toISOString());
 
       // TOCTOU guard: the pre-push list() and the push() aren't atomic on Drive,
@@ -1780,10 +1845,13 @@ export class SyncController {
       const unmerged = this.hazards(metas, sync, [this.engine?.getSessionFileId()]);
       const target = latestSnapshot(unmerged.length > 0 ? unmerged : metas);
       loaded = target ? await this.engine.loadFile(target) : null;
-      // Everything that would remain unread after loading `target`.
-      outstandingOthers = target
-        ? this.hazards(metas, sync, [this.engine?.getSessionFileId(), target.id]).length
-        : 0;
+      // Everything that would remain unread after loading `target`, counting what the target
+      // itself already holds (its provenance). Without that, loading a file that contains every
+      // other device's data still reported all of them outstanding.
+      outstandingOthers =
+        target && loaded
+          ? this.hazards(metas, afterReplace(sync, provenanceFor(loaded.doc, target, metas)), [this.engine?.getSessionFileId(), target.id]).length
+          : 0;
       listing = seen;
       record(seen, sync, [this.engine?.getSessionFileId()]);
     } catch (e) {
@@ -1860,22 +1928,28 @@ export class SyncController {
     let seenRemoteVersion: number | null = null;
     let outstandingOthers = 0;
     let ackBlocked: MergePreview["ackBlocked"] = null;
+    // What the merged snapshot already holds; widened with its author's own files once listed.
+    let inherit = provenanceOf(doc);
     let listing: Listing | null = null;
     if (!this.engine) {
       // No folder configured/reachable at all: we cannot see what else exists, so we make no
       // claim. (An engine that lists an EMPTY folder is different — that IS evidence.)
       ackBlocked = "unavailable";
-      return { doc, plan, base, seenRemoteVersion, seenKey, outstandingOthers, ackBlocked, listing };
+      return { doc, plan, base, seenRemoteVersion, seenKey, outstandingOthers, ackBlocked, listing, inherit };
     }
     try {
       const sessionFileId = this.engine.getSessionFileId();
       const files = await this.engine.list();
       listing = this.newListing(files);
+      inherit = provenanceFor(doc, files.find((f) => f.id === docFileId), files);
       const others = files.filter((f) => f.id !== sessionFileId);
       // The acknowledgement log from STORAGE too: `base` is persisted, but a sibling tab's merge
       // records a key that this tab's memory would not have.
       const sync = await this.store.persistedSyncState();
-      const seen = new Set(sync.seenSnapshots);
+      // The preview's own watermark, plus everything the merged snapshot had already incorporated
+      // (the union now holds that too).
+      const after = withProvenance({ ...sync, lastSyncedVersion: watermark }, inherit);
+      const seen = new Set(after.seenSnapshots);
       if (seenKey) seen.add(seenKey); // what this merge is about to incorporate
       // Deliberately NOT `hazards()`: this is the HYPOTHETICAL count after the merge — the
       // preview's own watermark, `seenKey` already added, and this document's version folded into
@@ -1883,7 +1957,7 @@ export class SyncController {
       // writing a third copy of it.
       const outstanding = unincorporatedFiles(
         others,
-        watermark,
+        after.lastSyncedVersion,
         seen,
         ownBound({ ...sync, localVersion: Math.max(local.version, sync.localVersion) }),
       );
@@ -1909,6 +1983,7 @@ export class SyncController {
       listing = null;
     }
     return {
+      inherit,
       listing,
       doc,
       plan,
@@ -1947,6 +2022,7 @@ export class SyncController {
           dirty: true,
           seenRemoteVersion: preview.seenRemoteVersion ?? undefined,
           seenSnapshotKey: preview.seenKey ?? undefined,
+          inherit: preview.inherit,
           // Compare-and-apply against PERSISTED state, inside the same lock as the write.
           // Checking here rather than out in this method is what makes it airtight: the write
           // is a full replace, and a check performed before `exportDocument` can't see a write
@@ -1993,13 +2069,17 @@ export class SyncController {
       // version between our watermark and this doc's would otherwise be subsumed with no merge
       // ever offered. A failed listing keeps the conservative answer (hold the watermark).
       let holdWatermark = outstandingOthers > 0;
+      let inherit = provenanceOf(doc); // widened below once the listing is in hand
       let listed: Listing | null = null; // our own listing, kept for the post-write recount
       if (this.engine) {
         try {
           const sync = await this.store.persistedSyncState();
           const metas = await this.engine.list();
           listed = this.newListing(metas);
-          holdWatermark = this.hazards(metas, sync, [this.engine.getSessionFileId(), docFileId]).length > 0;
+          inherit = provenanceFor(doc, metas.find((m) => m.id === docFileId), metas);
+          // Same basis as the dialog's count (checkRemote), so the two cannot disagree.
+          holdWatermark =
+            this.hazards(metas, afterReplace(sync, inherit), [this.engine.getSessionFileId(), docFileId]).length > 0;
         } catch {
           holdWatermark = true;
         }
@@ -2009,6 +2089,7 @@ export class SyncController {
         // With other files still unread, the watermark must stay put — the seen-key clears the one
         // file we actually loaded, and nothing else.
         holdWatermark,
+        inherit,
         // Compare-and-apply: this is a full replace and the review window is unbounded.
         expect,
       }); // also records the synced version

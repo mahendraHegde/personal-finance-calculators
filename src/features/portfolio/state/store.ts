@@ -21,6 +21,7 @@ import type {
   Owner,
   Person,
   SnapshotDoc,
+  SnapshotProvenance,
   Transaction,
 } from "../model/types";
 import { createPortfolioRepo, type PortfolioRepo } from "../repo/portfolio-repo";
@@ -1388,6 +1389,27 @@ export class PortfolioStore {
     });
   }
 
+  /** The document to PUBLISH: `exportDocument` plus what that data already incorporates.
+   *
+   *  The watermark and seen-log are read in the SAME lock as the data. Read separately, a sibling
+   *  tab's replace landing in between would leave the snapshot claiming files its rows no longer
+   *  hold, and every device that loads it would skip those files unread. */
+  async exportForPublish(): Promise<SnapshotDoc> {
+    return this.exclusive(async () => {
+      const data = this.stripLocal(await this.adapter.exportAll());
+      const row = await this.settingsRow();
+      return {
+        schemaVersion: SCHEMA.version,
+        version: this.versionFloorFrom(row),
+        data,
+        incorporated: {
+          watermark: row?.lastSyncedVersion ?? this.state.settings.lastSyncedVersion,
+          seen: [...(row?.seenSnapshots ?? this.state.settings.seenSnapshots ?? [])],
+        },
+      };
+    });
+  }
+
   /** Replace local data with a snapshot. Device-local collections are preserved.
    *  The working version never regresses (loading an OLDER snapshot keeps the
    *  higher local version so the next push can't collide with Drive).
@@ -1425,6 +1447,11 @@ export class PortfolioStore {
        *  replace" on a clean device with two other devices in play. The seen-KEY still records
        *  the file we loaded, which is what clears that file (and only that file). */
       holdWatermark?: boolean;
+      /** PULL or MERGE: the incoming snapshot's own provenance (`doc.incorporated`). The data now
+       *  holds that snapshot, so it holds everything the snapshot's author had incorporated too.
+       *  Inherited on a replace (in place of our old log, which the replace falsifies) and unioned
+       *  on a merge. Never passed for a backup restore. */
+      inherit?: SnapshotProvenance;
       /** COMPARE-AND-APPLY. When given, the write is abandoned unless the PERSISTED version
        *  bookkeeping still matches — checked here, inside the same lock as the write, and
        *  read from storage rather than memory.
@@ -1464,10 +1491,13 @@ export class PortfolioStore {
       // atomically WITH the data.
       let version = Math.max(doc.version, priorVersion);
       let lastSyncedVersion: number;
+      // Everything below the snapshot's own watermark is in its data, and so now in ours.
+      // Capped here as well as by the controller: no snapshot incorporates files above itself.
+      const inheritedFloor = Math.max(priorLastSynced, Math.min(opts.inherit?.watermark ?? 0, doc.version));
       if (opts.dirty) {
         // A merge additionally acknowledges the remote it reconciled; a plain restore
         // acknowledges nothing. Never regress an already-higher watermark.
-        lastSyncedVersion = Math.max(priorLastSynced, opts.seenRemoteVersion ?? 0);
+        lastSyncedVersion = Math.max(inheritedFloor, opts.seenRemoteVersion ?? 0);
         // This is a data change, so the working version must MOVE — merging a file numbered
         // below our own left it untouched, and then a plan captured before this merge still
         // matched and deleted everything the merge had adopted.
@@ -1475,8 +1505,9 @@ export class PortfolioStore {
         if (version <= lastSyncedVersion) version = lastSyncedVersion + 1; // ensure publishable
       } else {
         // Never regress, and never leap over a file we haven't read (see holdWatermark).
-        lastSyncedVersion = opts.holdWatermark ? priorLastSynced : Math.max(priorLastSynced, doc.version);
+        lastSyncedVersion = opts.holdWatermark ? inheritedFloor : Math.max(inheritedFloor, doc.version);
       }
+      const addSeen = [...(opts.inherit?.seen ?? []), ...(opts.seenSnapshotKey ? [opts.seenSnapshotKey] : [])];
       const settings = await this.nextSettings(
         {
           lastSyncedVersion,
@@ -1488,11 +1519,14 @@ export class PortfolioStore {
           // FALSIFIES every earlier acknowledgement — those rows are gone. Keeping the ones above
           // the new watermark let "Replace with snapshot" on an older file leave a merged sibling
           // still marked seen, and the next push then went over it with no merge ever offered.
+          // The snapshot's OWN log survives a replace, though: it describes the rows we now hold.
           seenSnapshots: opts.dirty
-            ? pruneSeen(storedRow?.seenSnapshots, lastSyncedVersion, opts.seenSnapshotKey)
-            : opts.seenSnapshotKey
-              ? [opts.seenSnapshotKey]
-              : [],
+            ? pruneSeen(storedRow?.seenSnapshots, lastSyncedVersion, addSeen)
+            : [
+                ...pruneSeen([], lastSyncedVersion, opts.inherit?.seen ?? []),
+                // The file we loaded is kept even below a watermark that never regresses.
+                ...(opts.seenSnapshotKey ? [opts.seenSnapshotKey] : []),
+              ],
         },
         { dataWrite: true, stored: storedRow },
       );
