@@ -5,10 +5,16 @@
 import type { CurrencyCode, FxTable } from "../../../lib/money/currency";
 import { tryConvert } from "../../../lib/money/currency";
 import { monthKey } from "../../../lib/util/format";
-import type { Category, Owner, Transaction, TxnType } from "../model/types";
+import type { Account, Category, Owner, Transaction, TxnType } from "../model/types";
+import { SHARED } from "../model/types";
 
 export interface TxnFilter {
+  /** Whose transaction it is (the transaction's own `personId`). */
   personId?: Owner;
+  /** Whose NAME the account is in (`Account.personId`), which can differ from the
+   *  transaction's owner. A transfer matches if EITHER of its accounts is held by them,
+   *  since the money moved through that person's account. Needs `accounts`. */
+  accountHolderId?: Owner;
   accountId?: string;
   categoryId?: string;
   /** Match any of these category ids — used by the ledger's category filter, where
@@ -27,10 +33,19 @@ export interface TxnFilter {
   text?: string;
 }
 
-export function filterTransactions(txns: Transaction[], f: TxnFilter): Transaction[] {
+export function filterTransactions(
+  txns: Transaction[],
+  f: TxnFilter,
+  accounts: readonly Pick<Account, "id" | "personId">[] = [],
+): Transaction[] {
   const text = f.text?.trim().toLowerCase();
+  const holderOf = f.accountHolderId ? new Map(accounts.map((a) => [a.id, a.personId])) : null;
   return txns.filter((t) => {
     if (f.personId && t.personId !== f.personId) return false;
+    if (holderOf) {
+      const held = (id: string | undefined): boolean => id !== undefined && holderOf.get(id) === f.accountHolderId;
+      if (!held(t.accountId) && !(t.type === "transfer" && held(t.transferToAccountId))) return false;
+    }
     if (f.accountId && t.accountId !== f.accountId) return false;
     if (f.categoryId && t.categoryId !== f.categoryId) return false;
     if (f.categoryIds && (t.categoryId === undefined || !f.categoryIds.includes(t.categoryId))) return false;
@@ -42,6 +57,67 @@ export function filterTransactions(txns: Transaction[], f: TxnFilter): Transacti
     if (text && !(t.note ?? "").toLowerCase().includes(text)) return false;
     return true;
   });
+}
+
+/** Year-select value in the ledger toolbar meaning "custom From/To range" (never a real year). */
+export const LEDGER_CUSTOM = "custom";
+
+/** What the ledger toolbar has selected, before it is checked against the current data. */
+export interface LedgerSelection {
+  /** Type, text, owner, account holder and currency as picked. */
+  filter: TxnFilter;
+  /** "" = all years, "YYYY", or LEDGER_CUSTOM. */
+  year: string;
+  /** "01".."12" or "". Ignored for a custom range. */
+  month: string;
+  /** Inclusive ISO bounds for a custom range; "" = open on that side. */
+  rangeFrom: string;
+  rangeTo: string;
+  /** Category and subcategory picks, already checked to exist ("" = none). */
+  categoryId: string;
+  subcategoryId: string;
+}
+
+/** The data a selection is checked against. */
+export interface LedgerContext {
+  /** Currencies present in the ledger; the currency select hides when there is only one. */
+  currencies: readonly string[];
+  people: readonly { id: string }[];
+  categories: readonly Pick<Category, "id" | "parentId">[];
+  /** The account-holder select only exists when there are accounts. */
+  hasAccounts: boolean;
+}
+
+/** The filter the ledger actually applies, rows AND totals alike.
+ *
+ *  Drops any pick that no longer resolves or whose control is hidden, so the list and the
+ *  Income/Expense/Net figures can never stay SILENTLY scoped to something the toolbar no longer
+ *  shows: a currency once only one remains, a hard-deleted person (an ARCHIVED one still
+ *  resolves and stays selectable), an account holder when there are no accounts. A category
+ *  becomes its id set: a subcategory alone, or a parent plus all its subcategories. The period
+ *  becomes inclusive bounds; a custom range ignores the month. */
+export function ledgerFilter(sel: LedgerSelection, ctx: LedgerContext): TxnFilter {
+  const resolves = (id: string | undefined): boolean =>
+    id === SHARED || ctx.people.some((p) => p.id === id);
+  let f: TxnFilter = { ...sel.filter, categoryIds: undefined, from: undefined, to: undefined, month: undefined };
+  if (f.currency && (ctx.currencies.length < 2 || !ctx.currencies.includes(f.currency))) f = { ...f, currency: undefined };
+  if (f.personId && !resolves(f.personId)) f = { ...f, personId: undefined };
+  if (f.accountHolderId && (!ctx.hasAccounts || !resolves(f.accountHolderId))) f = { ...f, accountHolderId: undefined };
+  if (sel.subcategoryId) f = { ...f, categoryIds: [sel.subcategoryId] };
+  else if (sel.categoryId) {
+    const kids = ctx.categories.filter((c) => c.parentId === sel.categoryId).map((c) => c.id);
+    f = { ...f, categoryIds: [sel.categoryId, ...kids] };
+  }
+  if (sel.year === LEDGER_CUSTOM) return { ...f, from: sel.rangeFrom || undefined, to: sel.rangeTo || undefined };
+  if (sel.year) f = { ...f, from: `${sel.year}-01-01`, to: `${sel.year}-12-31` };
+  return sel.month ? { ...f, month: sel.month } : f;
+}
+
+/** How many of the ledger's SECONDARY filters (the ones behind its Filters button) a filter from
+ *  `ledgerFilter` applies. Counted from the effective filter, so a dropped pick can't leave a
+ *  phantom count with nothing visible to clear. */
+export function secondaryFilterCount(f: TxnFilter): number {
+  return [f.categoryIds, f.personId, f.accountHolderId, f.currency].filter((v) => v !== undefined).length;
 }
 
 /** Newest-first by date, stable on id. */

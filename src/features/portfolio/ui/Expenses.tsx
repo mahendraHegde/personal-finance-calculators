@@ -5,12 +5,32 @@ import type { BadgeTone } from "./components";
 import { formatDate, formatMoney, todayIso } from "../../../lib/util/format";
 import { tryConvert } from "../../../lib/money/currency";
 import { newId } from "../../../lib/util/id";
-import { filterTransactions, flowSummary, sortByDateDesc, type TxnFilter } from "../domain/transactions";
+import {
+  filterTransactions,
+  flowSummary,
+  LEDGER_CUSTOM as CUSTOM,
+  ledgerFilter,
+  secondaryFilterCount,
+  sortByDateDesc,
+  type TxnFilter,
+} from "../domain/transactions";
 import { isAutopayTransaction } from "../domain/autopay";
 import { usePortfolio } from "../state/context";
 import type { Category, Transaction, TxnType } from "../model/types";
 import { SHARED } from "../model/types";
-import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, TextInput } from "./components";
+import {
+  Badge,
+  Button,
+  Card,
+  EmptyState,
+  Field,
+  FiltersButton,
+  FiltersPanel,
+  Modal,
+  NumberInput,
+  Select,
+  TextInput,
+} from "./components";
 import { ImportTransactions } from "./ImportTransactions";
 import {
   accountLabel,
@@ -35,10 +55,14 @@ const MONTH_OPTIONS: { value: string; label: string }[] = [
 export function Expenses() {
   const { state, store } = usePortfolio();
   const [filter, setFilter] = useState<TxnFilter>({});
-  // Default to the current year; "" = all years.
+  // Default to the current year; "" = all years; CUSTOM = the From/To range below.
   const [year, setYear] = useState<string>(todayIso().slice(0, 4));
-  // Month-of-year "01".."12"; "" = all months (the default).
+  // Month-of-year "01".."12"; "" = all months (the default). Ignored for a custom range.
   const [month, setMonth] = useState<string>("");
+  // Inclusive ISO bounds for a custom range; "" = open on that side.
+  const [rangeFrom, setRangeFrom] = useState("");
+  const [rangeTo, setRangeTo] = useState("");
+  const [showFilters, setShowFilters] = useState(false);
   const [fCat, setFCat] = useState<string>(""); // top-level category filter ("" = all)
   const [fSubCat, setFSubCat] = useState<string>(""); // subcategory filter ("" = all)
   const [limit, setLimit] = useState(PAGE);
@@ -94,32 +118,30 @@ export function Expenses() {
   }, [state.categories, catVal]);
   const subVal = fSubCat && subFilterOptions.some((o) => o.value === fSubCat) ? fSubCat : "";
 
-  // Merge the year selection into the filter as inclusive date bounds.
-  const effFilter = useMemo<TxnFilter>(() => {
-    // Drop a filter value that no longer resolves, so the ledger + totals can't
-    // stay SILENTLY scoped to something the dropdown no longer shows (which would
-    // make the headline numbers look wrong with no visible cause):
-    //  - currency: its Select hides once only one currency remains.
-    //  - personId: a person who was hard-deleted is gone from state.people.
-    //    (An ARCHIVED person still resolves — they stay selectable in this filter.)
-    let f: TxnFilter = filter;
-    if (f.currency && !currencies.includes(f.currency)) f = { ...f, currency: undefined };
-    if (f.personId && f.personId !== SHARED && !state.people.some((p) => p.id === f.personId)) {
-      f = { ...f, personId: undefined };
-    }
-    // Category filter → the set of category ids to match: a subcategory alone, or a
-    // parent PLUS all of its subcategories (both computed from the normalized values).
-    if (subVal) f = { ...f, categoryIds: [subVal] };
-    else if (catVal) {
-      f = { ...f, categoryIds: [catVal, ...state.categories.filter((c) => c.parentId === catVal).map((c) => c.id)] };
-    }
-    const scoped = year ? { ...f, from: `${year}-01-01`, to: `${year}-12-31` } : f;
-    return month ? { ...scoped, month } : scoped;
-  }, [filter, year, month, catVal, subVal, currencies, state.people, state.categories]);
-  const rows = useMemo(
-    () => sortByDateDesc(filterTransactions(state.transactions, effFilter)),
-    [state.transactions, effFilter],
+  // The filter actually applied (rows and totals): drops picks that no longer resolve or whose
+  // control is hidden, and turns the period into date bounds. See ledgerFilter.
+  const effFilter = useMemo<TxnFilter>(
+    () =>
+      ledgerFilter(
+        { filter, year, month, rangeFrom, rangeTo, categoryId: catVal, subcategoryId: subVal },
+        { currencies, people: state.people, categories: state.categories, hasAccounts: state.accounts.length > 0 },
+      ),
+    [filter, year, month, rangeFrom, rangeTo, catVal, subVal, currencies, state.people, state.categories, state.accounts],
   );
+  const rows = useMemo(
+    () => sortByDateDesc(filterTransactions(state.transactions, effFilter, state.accounts)),
+    [state.transactions, effFilter, state.accounts],
+  );
+  // A From after To matches nothing; say so instead of showing an unexplained empty list.
+  const rangeInverted = year === CUSTOM && !!rangeFrom && !!rangeTo && rangeFrom > rangeTo;
+  // Secondary filters live behind the Filters button; count the EFFECTIVE (normalized) ones,
+  // so a value that no longer resolves can't leave a phantom count with nothing to clear.
+  const secondaryCount = secondaryFilterCount(effFilter);
+  const clearSecondary = (): void => {
+    setFCat("");
+    setFSubCat("");
+    updateFilter({ personId: undefined, accountHolderId: undefined, currency: undefined });
+  };
   const visible = rows.slice(0, limit);
 
   // Income/expense totals for the current view (year + any other filters), in the
@@ -156,32 +178,81 @@ export function Expenses() {
 
   const monthName = month ? (MONTH_OPTIONS.find((m) => m.value === month)?.label ?? "") : "";
   const periodLabel =
-    year && month ? `${monthName} ${year}` : year ? year : month ? `${monthName} (all years)` : "All time";
+    year === CUSTOM
+      ? rangeFrom && rangeTo
+        ? `${formatDate(rangeFrom)} to ${formatDate(rangeTo)}`
+        : rangeFrom
+          ? `From ${formatDate(rangeFrom)}`
+          : rangeTo
+            ? `Up to ${formatDate(rangeTo)}`
+            : "All time"
+      : year && month
+        ? `${monthName} ${year}`
+        : year
+          ? year
+          : month
+            ? `${monthName} (all years)`
+            : "All time";
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="w-28">
+      {/* Everyday controls only; the rest sit behind Filters. Two per row on a phone. */}
+      <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
+        {/* Full width on a phone in custom mode: the date pair below can't sit beside it. */}
+        <div className={`sm:w-36 ${year === CUSTOM ? "col-span-2 sm:col-auto" : ""}`}>
           <Select
             value={year}
             onChange={(v) => {
               setYear(v);
               setLimit(PAGE);
             }}
-            options={[{ value: "", label: "All years" }, ...years.map((y) => ({ value: y, label: y }))]}
+            options={[
+              { value: "", label: "All years" },
+              ...years.map((y) => ({ value: y, label: y })),
+              { value: CUSTOM, label: "Custom range…" },
+            ]}
           />
         </div>
-        <div className="w-32">
-          <Select
-            value={month}
-            onChange={(v) => {
-              setMonth(v);
-              setLimit(PAGE);
-            }}
-            options={[{ value: "", label: "All months" }, ...MONTH_OPTIONS]}
-          />
-        </div>
-        <div className="w-32">
+        {year === CUSTOM ? (
+          <div className="col-span-2 grid grid-cols-2 gap-2 sm:col-auto sm:flex sm:items-center">
+            <div className="sm:w-36">
+              <TextInput
+                type="date"
+                value={rangeFrom}
+                onChange={(v) => {
+                  setRangeFrom(v);
+                  setLimit(PAGE);
+                }}
+                placeholder="From date"
+                ariaLabel="From date"
+              />
+            </div>
+            <div className="sm:w-36">
+              <TextInput
+                type="date"
+                value={rangeTo}
+                onChange={(v) => {
+                  setRangeTo(v);
+                  setLimit(PAGE);
+                }}
+                placeholder="To date"
+                ariaLabel="To date"
+              />
+            </div>
+          </div>
+        ) : (
+          <div className="sm:w-32">
+            <Select
+              value={month}
+              onChange={(v) => {
+                setMonth(v);
+                setLimit(PAGE);
+              }}
+              options={[{ value: "", label: "All months" }, ...MONTH_OPTIONS]}
+            />
+          </div>
+        )}
+        <div className="sm:w-32">
           <Select
             value={filter.type ?? ""}
             onChange={(v) => updateFilter({ type: (v || undefined) as TxnType | undefined })}
@@ -193,62 +264,88 @@ export function Expenses() {
             ]}
           />
         </div>
-        <div className="w-40">
-          <Select
-            value={catVal}
-            onChange={(v) => {
-              setFCat(v);
-              setFSubCat(""); // subcategories belong to a parent
-              setLimit(PAGE);
-            }}
-            options={catFilterOptions}
-          />
-        </div>
-        {subFilterOptions.length > 1 && (
-          <div className="w-40">
-            <Select
-              value={subVal}
-              onChange={(v) => {
-                setFSubCat(v);
-                setLimit(PAGE);
-              }}
-              options={subFilterOptions}
-            />
-          </div>
-        )}
-        <div className="w-40">
-          <Select
-            value={filter.personId ?? ""}
-            onChange={(v) => updateFilter({ personId: v || undefined })}
-            options={[{ value: "", label: "All people" }, ...personOptions(state, true, undefined, true)]}
-          />
-        </div>
-        {currencies.length > 1 && (
-          <div className="w-28">
-            <Select
-              value={filter.currency ?? ""}
-              onChange={(v) => updateFilter({ currency: v || undefined })}
-              options={[{ value: "", label: "All ccy" }, ...currencies.map((c) => ({ value: c, label: c }))]}
-            />
-          </div>
-        )}
-        <div className="min-w-[8rem] flex-1">
+        <div className="sm:min-w-[8rem] sm:flex-1">
           <TextInput
             value={filter.text ?? ""}
             onChange={(v) => updateFilter({ text: v || undefined })}
             placeholder="Search notes…"
           />
         </div>
-        <Button variant="ghost" onClick={() => setShowImport(true)}>
-          Import CSV
-        </Button>
-        <Button onClick={openNew}>+ Add</Button>
+        <div className="col-span-2 flex gap-2 sm:contents">
+          <FiltersButton open={showFilters} onToggle={() => setShowFilters((o) => !o)} count={secondaryCount} />
+          <Button variant="ghost" className="flex-1 whitespace-nowrap sm:flex-none" onClick={() => setShowImport(true)}>
+            Import CSV
+          </Button>
+          <Button className="flex-1 whitespace-nowrap sm:flex-none" onClick={openNew}>
+            + Add
+          </Button>
+        </div>
       </div>
+
+      {showFilters && (
+        <FiltersPanel onClear={secondaryCount > 0 ? clearSecondary : undefined}>
+          <Field label="Category">
+            <Select
+              value={catVal}
+              onChange={(v) => {
+                setFCat(v);
+                setFSubCat(""); // subcategories belong to a parent
+                setLimit(PAGE);
+              }}
+              options={catFilterOptions}
+            />
+          </Field>
+          {subFilterOptions.length > 1 && (
+            <Field label="Subcategory">
+              <Select
+                value={subVal}
+                onChange={(v) => {
+                  setFSubCat(v);
+                  setLimit(PAGE);
+                }}
+                options={subFilterOptions}
+              />
+            </Field>
+          )}
+          {/* Two different people: whose transaction it is, and whose name the account is in. */}
+          <Field label="Owner">
+            <Select
+              value={effFilter.personId ?? ""}
+              onChange={(v) => updateFilter({ personId: v || undefined })}
+              options={[{ value: "", label: "All owners" }, ...personOptions(state, true, undefined, true)]}
+            />
+          </Field>
+          {state.accounts.length > 0 && (
+            <Field label="Account holder">
+              <Select
+                value={effFilter.accountHolderId ?? ""}
+                onChange={(v) => updateFilter({ accountHolderId: v || undefined })}
+                options={[{ value: "", label: "All holders" }, ...personOptions(state, true, undefined, true)]}
+              />
+            </Field>
+          )}
+          {currencies.length > 1 && (
+            <Field label="Currency">
+              <Select
+                value={effFilter.currency ?? ""}
+                onChange={(v) => updateFilter({ currency: v || undefined })}
+                options={[{ value: "", label: "All currencies" }, ...currencies.map((c) => ({ value: c, label: c }))]}
+              />
+            </Field>
+          )}
+        </FiltersPanel>
+      )}
+
+      {rangeInverted && (
+        <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700">
+          The From date is after the To date, so nothing can match. Swap them to see transactions.
+        </p>
+      )}
 
       <Card className="flex flex-wrap items-center justify-between gap-2 py-3">
         <span className="text-sm font-medium text-slate-600">
           {periodLabel}
-          {filter.type || filter.personId || filter.currency || filter.text || catVal || subVal ? " (filtered)" : ""}
+          {filter.type || filter.text || secondaryCount > 0 ? " (filtered)" : ""}
         </span>
         <div className="flex gap-4 text-sm">
           <span className="text-green-600">Income {formatMoney(totals.income, totals.base)}</span>

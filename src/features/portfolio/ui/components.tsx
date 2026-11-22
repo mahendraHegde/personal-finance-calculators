@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent, ReactNode } from "react";
-import { ChevronDown, ChevronUp, Eye, EyeOff } from "lucide-react";
+import { ChevronDown, ChevronUp, Eye, EyeOff, SlidersHorizontal } from "lucide-react";
 import { ddmmyyyyToIso, formatDdmmyyyy, isoToDdmmyyyy } from "../../../lib/util/date";
 
 export function Button({
@@ -122,6 +122,47 @@ export function RevealCard({
   );
 }
 
+/** Toolbar toggle for a screen's secondary filters, so the toolbar keeps only the everyday
+ *  controls. `count` is how many secondary filters are set, shown on the button so a
+ *  narrowed list is never a mystery while the panel is closed. */
+export function FiltersButton({ open, onToggle, count }: { open: boolean; onToggle: () => void; count: number }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={open}
+      className={`flex items-center gap-1.5 whitespace-nowrap rounded-lg border px-3 py-2 text-sm font-medium transition ${
+        open || count > 0
+          ? "border-blue-200 bg-blue-50 text-blue-700"
+          : "border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+      }`}
+    >
+      <SlidersHorizontal size={16} aria-hidden="true" />
+      Filters
+      {count > 0 && (
+        <span className="rounded-full bg-blue-600 px-1.5 text-xs font-semibold text-white">{count}</span>
+      )}
+    </button>
+  );
+}
+
+/** The panel a `FiltersButton` opens: labelled fields, two per row on a phone and more as the
+ *  screen widens, with an optional "Clear" action. */
+export function FiltersPanel({ children, onClear }: { children: ReactNode; onClear?: () => void }) {
+  return (
+    <Card className="py-3">
+      <div className="grid grid-cols-2 gap-x-3 gap-y-2 sm:grid-cols-3 lg:grid-cols-4">{children}</div>
+      {onClear && (
+        <div className="mt-2 flex justify-end">
+          <button type="button" onClick={onClear} className="text-xs font-medium text-blue-600 hover:underline">
+            Clear filters
+          </button>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 export function SectionTitle({ children }: { children: ReactNode }) {
   return <h2 className="mb-3 text-lg font-semibold text-slate-800">{children}</h2>;
 }
@@ -192,21 +233,25 @@ export function TextInput({
   onChange,
   placeholder,
   type = "text",
+  ariaLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
   type?: string;
+  /** For a field with no visible label (the placeholder disappears once it is filled). */
+  ariaLabel?: string;
 }) {
   // A native <input type="date"> renders its display format from the BROWSER's
   // locale (Chrome ignores the element `lang`), so DD/MM can't be forced there.
   // Use an explicit DD/MM/YYYY text field instead — storage stays ISO yyyy-mm-dd.
-  if (type === "date") return <DateInput value={value} onChange={onChange} placeholder={placeholder} />;
+  if (type === "date") return <DateInput value={value} onChange={onChange} placeholder={placeholder} ariaLabel={ariaLabel} />;
   return (
     <input
       type={type}
       value={value}
       placeholder={placeholder}
+      aria-label={ariaLabel}
       onChange={(e: ChangeEvent<HTMLInputElement>) => onChange(e.target.value)}
       className={inputCls}
     />
@@ -222,10 +267,12 @@ function DateInput({
   value,
   onChange,
   placeholder,
+  ariaLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
+  ariaLabel?: string;
 }) {
   const [text, setText] = useState(() => isoToDdmmyyyy(value));
   const emitted = useRef(value);
@@ -267,6 +314,7 @@ function DateInput({
       type="text"
       inputMode="numeric"
       placeholder={placeholder ?? "dd/mm/yyyy"}
+      aria-label={ariaLabel}
       value={text}
       onChange={(e: ChangeEvent<HTMLInputElement>) => handle(e.target.value)}
       onBlur={commit}

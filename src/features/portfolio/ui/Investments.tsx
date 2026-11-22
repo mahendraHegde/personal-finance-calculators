@@ -37,7 +37,20 @@ import type {
   PriceSource,
 } from "../model/types";
 import { SHARED } from "../model/types";
-import { Badge, Button, Card, EmptyState, Field, Modal, NumberInput, Select, StatCard, TextInput } from "./components";
+import {
+  Badge,
+  Button,
+  Card,
+  EmptyState,
+  Field,
+  FiltersButton,
+  FiltersPanel,
+  Modal,
+  NumberInput,
+  Select,
+  StatCard,
+  TextInput,
+} from "./components";
 import {
   accountLabel,
   accountLabelById,
@@ -224,6 +237,9 @@ export function Investments() {
   const [fClass, setFClass] = useState("all");
   const [fAccount, setFAccount] = useState("all");
   const [fOwner, setFOwner] = useState("all");
+  // Whose NAME the holding's account is in, which can differ from the holding's owner.
+  const [fHolder, setFHolder] = useState("all");
+  const [showFilters, setShowFilters] = useState(false);
   const [fCurrency, setFCurrency] = useState("all");
   const [statusFilter, setStatusFilter] = useState<"active" | "closed" | "all">("active"); // default: hide fully-exited positions
   const [sortBy, setSortBy] = useState<"value" | "xirr" | "name" | "type">("value");
@@ -237,20 +253,48 @@ export function Investments() {
   // derive from these, so a stale value can neither blank the list nor leave a phantom
   // "filtered" badge with no way to clear it. `status: "active"` is the DEFAULT view, so
   // it doesn't count as filtering.
-  const acc = fAccount === "all" || fAccount === "none" || state.accounts.some((a) => a.id === fAccount) ? fAccount : "all";
-  const own = fOwner === "all" || fOwner === SHARED || state.people.some((p) => p.id === fOwner) ? fOwner : "all";
-  const cur = fCurrency === "all" || currencies.includes(fCurrency) ? fCurrency : "all";
+  // The account select only exists when there are accounts, and the currency select when
+  // there is more than one currency; a pick behind a hidden select collapses like a stale one.
+  const acc =
+    state.accounts.length > 0 && (fAccount === "none" || state.accounts.some((a) => a.id === fAccount)) ? fAccount : "all";
+  // Owner and account holder also collapse when their select is HIDDEN (one person or fewer,
+  // and for the holder no accounts), so they can't keep narrowing the list out of sight.
+  const resolvesPerson = (id: string): boolean => id === SHARED || state.people.some((p) => p.id === id);
+  const peopleShown = state.people.length > 1;
+  const holderShown = peopleShown && state.accounts.length > 0;
+  const own = peopleShown && fOwner !== "all" && resolvesPerson(fOwner) ? fOwner : "all";
+  const holder = holderShown && fHolder !== "all" && resolvesPerson(fHolder) ? fHolder : "all";
+  const cur = currencies.length > 1 && currencies.includes(fCurrency) ? fCurrency : "all";
   const filtersActive =
-    search.trim() !== "" || fClass !== "all" || acc !== "all" || own !== "all" || cur !== "all" || statusFilter !== "active";
+    search.trim() !== "" ||
+    fClass !== "all" ||
+    acc !== "all" ||
+    own !== "all" ||
+    holder !== "all" ||
+    cur !== "all" ||
+    statusFilter !== "active";
+  // Shared + people (archived ones kept and labelled, as in the ledger's filters), for both the
+  // owner and the account-holder filters.
+  const peopleChoices = personOptions(state, true, undefined, true);
+  // Whether the Filters panel would hold anything at all; with one person and one currency
+  // and no accounts there is nothing to put in it, so the button stays out of the way.
+  const hasSecondary = state.accounts.length > 0 || state.people.length > 1 || currencies.length > 1;
+  // The ones behind the Filters button, counted on it.
+  const secondaryCount = [acc, own, holder, cur].filter((v) => v !== "all").length;
+  const clearSecondary = (): void => {
+    setFAccount("all");
+    setFOwner("all");
+    setFHolder("all");
+    setFCurrency("all");
+  };
   const clearFilters = (): void => {
     setSearch("");
     setFClass("all");
-    setFAccount("all");
-    setFOwner("all");
-    setFCurrency("all");
     setStatusFilter("active");
+    clearSecondary();
   };
 
+  const holderOf = useMemo(() => new Map(state.accounts.map((a) => [a.id, a.personId])), [state.accounts]);
   // The matching set (pre-sort), recomputed on a filter/search change — cheap array work.
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -259,11 +303,13 @@ export function Investments() {
       if (fClass !== "all" && h.assetClass !== fClass) return false;
       if (acc !== "all" && (acc === "none" ? !!h.accountId : h.accountId !== acc)) return false;
       if (own !== "all" && h.personId !== own) return false;
+      // A holding with no account has no holder, so it never matches a holder filter.
+      if (holder !== "all" && (h.accountId === undefined || holderOf.get(h.accountId) !== holder)) return false;
       if (cur !== "all" && h.currency !== cur) return false;
       if (q && !`${h.name} ${h.ticker ?? ""}`.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [state.holdings, rows, statusFilter, acc, own, cur, search, fClass]);
+  }, [state.holdings, rows, statusFilter, acc, own, holder, holderOf, cur, search, fClass]);
 
   // Summary reflects the FILTERED set, so filtering to (say) equity / one account shows
   // that subset's value, cost and return. Only ONE blended XIRR root-find runs here, and
@@ -466,8 +512,8 @@ export function Investments() {
           )}
 
           {/* Search / filter / sort — pure UI over the memoized figures (no recompute). */}
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-            <div className="sm:w-52">
+          <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-center">
+            <div className="col-span-2 sm:w-52">
               <TextInput value={search} onChange={setSearch} placeholder="Search name or ticker…" />
             </div>
             <div className="sm:w-44">
@@ -488,41 +534,6 @@ export function Investments() {
                 ]}
               />
             </div>
-            {state.accounts.length > 0 && (
-              <div className="sm:w-44">
-                <Select
-                  value={acc}
-                  onChange={setFAccount}
-                  options={[
-                    { value: "all", label: "All accounts" },
-                    { value: "none", label: "No account" },
-                    ...holdingAccountOptions(state, fAccount),
-                  ]}
-                />
-              </div>
-            )}
-            {state.people.length > 1 && (
-              <div className="sm:w-44">
-                <Select
-                  value={own}
-                  onChange={setFOwner}
-                  options={[
-                    { value: "all", label: "All owners" },
-                    { value: SHARED, label: "Shared" },
-                    ...[...state.people].sort((a, b) => a.name.localeCompare(b.name)).map((p) => ({ value: p.id, label: p.name })),
-                  ]}
-                />
-              </div>
-            )}
-            {currencies.length > 1 && (
-              <div className="sm:w-40">
-                <Select
-                  value={cur}
-                  onChange={setFCurrency}
-                  options={[{ value: "all", label: "All currencies" }, ...currencies.map((c) => ({ value: c, label: c }))]}
-                />
-              </div>
-            )}
             <div className="sm:w-40">
               <Select
                 value={sortBy}
@@ -535,10 +546,55 @@ export function Investments() {
                 ]}
               />
             </div>
-            <span className="text-xs text-slate-400 sm:ml-auto">
+            {hasSecondary && (
+              <FiltersButton open={showFilters} onToggle={() => setShowFilters((o) => !o)} count={secondaryCount} />
+            )}
+            <span className="col-span-2 text-right text-xs text-slate-400 sm:ml-auto">
               {visible.length} of {state.holdings.length}
             </span>
           </div>
+
+          {hasSecondary && showFilters && (
+            <FiltersPanel onClear={secondaryCount > 0 ? clearSecondary : undefined}>
+              {state.accounts.length > 0 && (
+                <Field label="Account">
+                  <Select
+                    value={acc}
+                    onChange={setFAccount}
+                    options={[
+                      { value: "all", label: "All accounts" },
+                      { value: "none", label: "No account" },
+                      ...holdingAccountOptions(state, fAccount),
+                    ]}
+                  />
+                </Field>
+              )}
+              {/* Two different people: whose holding it is, and whose name its account is in. */}
+              {peopleShown && (
+                <Field label="Owner">
+                  <Select value={own} onChange={setFOwner} options={[{ value: "all", label: "All owners" }, ...peopleChoices]} />
+                </Field>
+              )}
+              {holderShown && (
+                <Field label="Account holder">
+                  <Select
+                    value={holder}
+                    onChange={setFHolder}
+                    options={[{ value: "all", label: "All holders" }, ...peopleChoices]}
+                  />
+                </Field>
+              )}
+              {currencies.length > 1 && (
+                <Field label="Currency">
+                  <Select
+                    value={cur}
+                    onChange={setFCurrency}
+                    options={[{ value: "all", label: "All currencies" }, ...currencies.map((c) => ({ value: c, label: c }))]}
+                  />
+                </Field>
+              )}
+            </FiltersPanel>
+          )}
 
           {visible.length === 0 ? (
             filtersActive ? (

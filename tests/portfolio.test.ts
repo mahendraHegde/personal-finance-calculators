@@ -18,7 +18,18 @@ import {
   withFdAccrual,
 } from "../src/features/portfolio/domain/holdings";
 import { accountBalances, accountBalancesByPerson, netWorth, sumAccountBalances, totalReturn } from "../src/features/portfolio/domain/networth";
-import { categoryTotals, filterTransactions, flowSummary, monthlyTotals, type TxnFilter } from "../src/features/portfolio/domain/transactions";
+import {
+  categoryTotals,
+  filterTransactions,
+  flowSummary,
+  LEDGER_CUSTOM,
+  ledgerFilter,
+  monthlyTotals,
+  secondaryFilterCount,
+  type LedgerContext,
+  type LedgerSelection,
+  type TxnFilter,
+} from "../src/features/portfolio/domain/transactions";
 import {
   autopayId,
   desiredAutopayTransfers,
@@ -1434,6 +1445,88 @@ section("[transactions] filterTransactions categoryIds matches any id in the set
   eq(ids({ categoryIds: ["salary"] }), "c", "an unrelated category matches only itself");
   eq(ids({ categoryIds: ["nope"] }), "", "no member matches → empty");
   eq(filterTransactions(txns, { categoryIds: ["food"] }).some((x) => x.id === "d"), false, "uncategorized txn excluded by a category filter");
+}
+
+section("[transactions] filterTransactions: owner and account holder are separate filters");
+{
+  // Ravi's expense paid from an account in Asha's name: Ravi owns it, Asha holds the account.
+  const accounts = [
+    { id: "asha-bank", personId: "asha" },
+    { id: "ravi-bank", personId: "ravi" },
+    { id: "joint", personId: "shared" },
+  ];
+  const t = (id: string, accountId: string, personId: string, over: Partial<Transaction> = {}): Transaction => ({
+    id, date: "2026-01-01", type: "expense", accountId, personId, amount: 1, currency: "INR", updatedAt: "", ...over,
+  });
+  const txns = [
+    t("a", "asha-bank", "ravi"),
+    t("b", "ravi-bank", "ravi"),
+    t("c", "joint", "asha"),
+    t("d", "ravi-bank", "ravi", { type: "transfer", transferToAccountId: "asha-bank" }),
+    t("e", "gone", "asha"), // its account was deleted
+  ];
+  const ids = (f: TxnFilter): string => filterTransactions(txns, f, accounts).map((x) => x.id).sort().join(",");
+  eq(ids({ personId: "ravi" }), "a,b,d", "owner filter reads the transaction's own person");
+  eq(ids({ accountHolderId: "asha" }), "a,d", "holder filter reads the account's person; a transfer INTO her account counts");
+  eq(ids({ accountHolderId: "ravi" }), "b,d", "a transfer OUT of his account counts for him too");
+  eq(ids({ accountHolderId: "shared" }), "c", "a shared account is its own holder");
+  eq(ids({ personId: "ravi", accountHolderId: "asha" }), "a,d", "the two compose: Ravi's money through Asha's account");
+  eq(ids({}), "a,b,c,d,e", "no holder filter leaves an account-less transaction in");
+  eq(
+    filterTransactions([t("x", "asha-bank", "ravi", { transferToAccountId: "ravi-bank" })], { accountHolderId: "ravi" }, accounts).length,
+    0,
+    "a stray destination on a NON-transfer is not read",
+  );
+  eq(filterTransactions(txns, { accountHolderId: "asha" }).length, 0, "without the accounts list a holder filter matches nothing");
+}
+
+section("[ledger] ledgerFilter: what the toolbar applies to rows AND totals");
+{
+  const ctx: LedgerContext = {
+    currencies: ["INR", "AED"],
+    people: [{ id: "asha" }, { id: "ravi" }],
+    categories: [{ id: "food" }, { id: "dining", parentId: "food" }, { id: "rent" }, { id: "deposit", parentId: "rent" }],
+    hasAccounts: true,
+  };
+  const sel = (over: Partial<LedgerSelection> = {}): LedgerSelection => ({
+    filter: {}, year: "", month: "", rangeFrom: "", rangeTo: "", categoryId: "", subcategoryId: "", ...over,
+  });
+  const f = (over: Partial<LedgerSelection> = {}, c: Partial<LedgerContext> = {}): TxnFilter => ledgerFilter(sel(over), { ...ctx, ...c });
+
+  // Period.
+  let r = f({ year: "2026", month: "03" });
+  eq(`${r.from}|${r.to}|${r.month}`, "2026-01-01|2026-12-31|03", "a year becomes inclusive bounds, and the month composes");
+  r = f({ year: LEDGER_CUSTOM, month: "03", rangeFrom: "2026-02-01", rangeTo: "2026-05-31" });
+  eq(`${r.from}|${r.to}|${r.month}`, "2026-02-01|2026-05-31|undefined", "a custom range uses its own bounds and ignores the month");
+  r = f({ year: LEDGER_CUSTOM, rangeFrom: "2026-02-01" });
+  eq(`${r.from}|${r.to}`, "2026-02-01|undefined", "an empty side of a custom range is open");
+  r = f({ year: LEDGER_CUSTOM, filter: { from: "1999-01-01", month: "07" } });
+  eq(`${r.from}|${r.month}`, "undefined|undefined", "stale bounds or month inside the raw filter never leak through");
+  eq(f({ month: "03" }).from, undefined, "all years + a month: no bounds");
+  r = f({ filter: { from: "1999-01-01", to: "1999-12-31", categoryIds: ["rent"] } });
+  eq(`${r.from}|${r.to}|${r.categoryIds}`, "undefined|undefined|undefined", "stale bounds and categories in the raw filter are stripped outside custom mode too");
+
+  // Owner and account holder.
+  eq(f({ filter: { personId: "ravi", accountHolderId: "asha" } }).accountHolderId, "asha", "a live holder is kept");
+  eq(f({ filter: { personId: "gone" } }).personId, undefined, "a deleted owner is dropped");
+  eq(f({ filter: { accountHolderId: "gone" } }).accountHolderId, undefined, "a deleted holder is dropped");
+  eq(f({ filter: { accountHolderId: "shared" } }).accountHolderId, "shared", "Shared always resolves");
+  eq(f({ filter: { accountHolderId: "asha" } }, { hasAccounts: false }).accountHolderId, undefined, "no accounts: the holder select is hidden, so its pick is dropped");
+
+  // Currency.
+  eq(f({ filter: { currency: "AED" } }).currency, "AED", "a present currency is kept");
+  eq(f({ filter: { currency: "USD" } }).currency, undefined, "a currency no longer present is dropped");
+  eq(f({ filter: { currency: "INR" } }, { currencies: ["INR"] }).currency, undefined, "one currency left: its select hides, so the pick is dropped");
+
+  // Category.
+  eq(f({ categoryId: "food" }).categoryIds?.join(","), "food,dining", "a parent matches itself and ONLY its own subcategories");
+  eq(f({ categoryId: "food", subcategoryId: "dining" }).categoryIds?.join(","), "dining", "a subcategory narrows to exactly itself");
+  eq(f().categoryIds, undefined, "no category: no category filter");
+
+  // The count behind the Filters button reads the EFFECTIVE filter.
+  eq(secondaryFilterCount(f({ categoryId: "rent", filter: { personId: "ravi", accountHolderId: "asha", currency: "AED" } })), 4, "all four secondary filters count");
+  eq(secondaryFilterCount(f({ filter: { personId: "gone", currency: "USD", type: "expense", text: "x" } })), 0, "dropped picks don't count, nor do the main-row type and search");
+  eq(secondaryFilterCount(f({ year: "2026", month: "01" })), 0, "the period is not a secondary filter");
 }
 
 section("[networth] cross-currency transfer credits the explicit transferToAmount (bypasses FX)");
