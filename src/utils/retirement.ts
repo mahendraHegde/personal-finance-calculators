@@ -6,8 +6,65 @@ import type {
   PostRetirementBucketAllocation,
   RetirementCalculationParams,
   RetirementCalculationsResult,
+  TaxSettings,
+  TaxTreatment,
+  WithdrawalStrategy,
   YearlyProjection,
 } from "../types/retirement";
+
+// ---------------------------------------------------------------------------
+// Modelling conventions (read this before changing the maths)
+// ---------------------------------------------------------------------------
+//
+// * Every return the user enters is a long-run annualised return (CAGR), the
+//   way fund factsheets and FD rates are quoted.  A lump sum at r% grows by
+//   (1 + r) a year, and a monthly SIP in the same asset compounds at the
+//   equivalent monthly rate (1 + r)^(1/12) - 1, so both grow identically.
+//   (The common "r / 12" shortcut quietly turns 12% into 12.68% a year.)
+//   A SIP's monthly amount can step up by a fixed % every year.
+//
+// * Before retirement, living costs are assumed to be paid from income; the
+//   corpus only receives SIP contributions and pays one-time goals.
+//
+// * In retirement, each month's living cost is base spending (× the spending
+//   phase for that age) plus healthcare (its own inflation), minus income
+//   (pension, rent, ...).  What income doesn't cover is withdrawn at the
+//   START of the month; spare income is invested.  Prices rise monthly.
+//
+// * A one-time goal "N years from now" is paid at exactly t = N years, i.e.
+//   at the end of simulation year N.  Goals beyond the simulated horizon
+//   (targetAge + HORIZON_BUFFER_YEARS) are left out of the plan.
+//
+// * A SIP linked to post-retirement goals keeps aside, at retirement, only
+//   what those goals need: their cost discounted at the SIP's expected rate
+//   path.  The rest joins the main corpus.  The earmarked pool is reserved
+//   while the main corpus can pay living costs; once the main corpus cannot
+//   cover a month, living costs draw on the pools before the plan counts as
+//   having run out.  "Runs out" therefore means all money is gone.
+//
+// * Tax applies to post-retirement buckets only.  Pre-retirement returns
+//   are entered after tax, so the corpus starts retirement with its cost
+//   equal to its value (no gain taxed twice).  From then on each bucket
+//   tracks its cost and withdrawals realise the gain part: equity gains
+//   above the yearly exemption are taxed at the LTCG rate, "slabOnSale"
+//   gains and "slabYearly" growth (taxed as it accrues) at the income-tax
+//   rate.  Tax is settled from the corpus at the end of each year; gains
+//   realised to pay it count toward the next year.
+//
+// * Monte Carlo: each year draws one market shock z shared by all buckets
+//   (a single market factor, so buckets are perfectly correlated, which is
+//   conservative).  A bucket's gross yearly factor is lognormal:
+//       G = (1 + r) · exp(s · z)
+//   whose MEDIAN is exactly (1 + r) and whose standard deviation equals the
+//   bucket's volatility.  The median path therefore matches the deterministic
+//   projection.  z is standard normal, or optionally a fat-tailed mixture
+//   (calm years and rarer crisis years); s is calibrated for whichever is
+//   used, so each bucket's volatility stays as entered.  Each simulated path
+//   has its own random stream, so changing one input never reshuffles the
+//   luck of other paths (the solver relies on this).
+//   Inflation is mean-reverting: each year's surprise carries over by the
+//   persistence factor (AR(1)); every year, including the first, has the
+//   yearly spread entered.
 
 // ---------------------------------------------------------------------------
 // Internal mutable state types
@@ -16,17 +73,21 @@ import type {
 interface ExistingBucketState {
   amount: number;
   rate: number;
+  vol: number;
 }
 
 interface SavingsBucketState {
   id: number;
   name: string;
+  // This year's monthly contribution (rises by stepUp every year).
   monthly: number;
+  stepUp: number;
   rate: number;
+  vol: number;
   // Optional glide settings copied from the user-supplied SIP definition.
-  // When both are positive, advanceSavings uses an effective rate that
-  // linearly transitions from `rate` toward `targetRate` over the final
-  // `glideYears` before the SIP's earliest pending linked goal.
+  // When both are positive, the SIP's rate linearly transitions from `rate`
+  // toward `targetRate` over the final `glideYears` before the SIP's
+  // earliest pending linked goal.
   targetRate?: number;
   glideYears?: number;
   accumulated: number;
@@ -39,22 +100,197 @@ interface RetirementBucketState {
   name: string;
   amount: number;
   rate: number;
+  vol: number;
+  // Volatility used to rank buckets from safest to riskiest ("buckets"
+  // strategy).  Unlike `vol` it resolves a blank to the default volatility
+  // even on the expected path, so the ranking is the same in both views.
+  riskRank: number;
+  tax: TaxTreatment;
+  // Amount invested (cost), for tax.
+  basis: number;
+}
+
+interface GainsLedger {
+  equity: number;
+  slab: number;
 }
 
 // ---------------------------------------------------------------------------
 // Numeric helpers
 // ---------------------------------------------------------------------------
 
-const finiteOr = (v: number | undefined | null, fallback: number): number =>
-  typeof v === "number" && Number.isFinite(v) ? v : fallback;
+export const finiteOr = (
+  v: number | undefined | null,
+  fallback: number,
+): number => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
 
-const cloneBuckets = (buckets: InvestmentBucket[]): ExistingBucketState[] =>
+export const clampNum = (v: number, lo: number, hi: number): number =>
+  Math.min(hi, Math.max(lo, v));
+
+// A bucket's own volatility when it has a usable one, else the default.
+export const resolveVol = (v: number | undefined, fallback: number): number =>
+  typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback;
+
+// Inflation floor: -5%/yr deflation cap.  Worse than any modern economy.
+const INFLATION_FLOOR = -0.05;
+
+// Volatility assumed for money that a glide path has moved into a "safe"
+// asset (debt fund / FD-like).  A glide blends the SIP's volatility toward
+// this as it blends the return toward the target rate.
+export const DERISKED_VOLATILITY = 2;
+
+// Volatility for a bucket left blank (roughly a balanced equity/debt mix).
+export const DEFAULT_VOLATILITY = 12;
+
+// Indian rules as of FY 2025-26; editable in the UI.
+export const DEFAULT_TAX: TaxSettings = {
+  incomeTaxRate: 20,
+  ltcgRate: 12.5,
+  ltcgExemption: 125_000,
+};
+
+export const DEFAULT_CASH_BUFFER_YEARS = 2;
+
+// Fat-tailed market shocks: a calm/crisis mixture of normals with unit
+// variance overall (so the volatility the user entered is unchanged) and
+// excess kurtosis of 3.
+const CRISIS_PROBABILITY = 0.1;
+const CRISIS_SCALE = 2;
+const CALM_SCALE = Math.sqrt(
+  (1 - CRISIS_PROBABILITY * CRISIS_SCALE * CRISIS_SCALE) /
+    (1 - CRISIS_PROBABILITY),
+);
+export const MAX_INFLATION_PERSISTENCE = 0.95;
+
+// Scale s such that base·exp(s·z) has standard deviation volPct/100.
+// Normal z: Var = base² · x · (x − 1) with x = exp(s²), solved in closed
+// form.  Fat-tailed mixture z: Var/base² = M(2s) − M(s)² with
+// M(t) = p·exp(t²k²/2) + (1 − p)·exp(t²l²/2); solved by bisection and
+// memoised (it is called per bucket per simulated year).
+const fatScaleCache = new Map<string, number>();
+const shockScale = (base: number, volPct: number, fat: boolean): number => {
+  const rel = volPct / 100 / base;
+  if (!fat) {
+    const x = (1 + Math.sqrt(1 + 4 * rel * rel)) / 2;
+    return Math.sqrt(Math.log(x));
+  }
+  const key = `${base}|${volPct}`;
+  const cached = fatScaleCache.get(key);
+  if (cached !== undefined) return cached;
+  const mgf = (t: number) =>
+    CRISIS_PROBABILITY * Math.exp((t * t * CRISIS_SCALE * CRISIS_SCALE) / 2) +
+    (1 - CRISIS_PROBABILITY) * Math.exp((t * t * CALM_SCALE * CALM_SCALE) / 2);
+  const relVar = (s: number) => mgf(2 * s) - mgf(s) ** 2;
+  const want = rel * rel;
+  let lo = 0;
+  let hi = 1;
+  while (relVar(hi) < want && hi < 64) hi *= 2;
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2;
+    if (relVar(mid) < want) lo = mid;
+    else hi = mid;
+  }
+  const s = (lo + hi) / 2;
+  if (fatScaleCache.size > 10_000) fatScaleCache.clear();
+  fatScaleCache.set(key, s);
+  return s;
+};
+
+// Gross yearly growth factor for a bucket.  Deterministic when z = 0 or the
+// bucket has no volatility.  See the conventions note at the top.
+const grossFactor = (
+  ratePct: number,
+  volPct: number,
+  z: number,
+  fat = false,
+): number => {
+  const base = 1 + Math.max(-0.99, ratePct / 100);
+  if (z === 0 || !(volPct > 0)) return base;
+  return base * Math.exp(shockScale(base, volPct, fat) * z);
+};
+
+export interface SanitizedAges {
+  currentAge: number;
+  retirementAge: number;
+  targetAge: number;
+  // Last age simulated: targetAge plus a few years, so depletion just after
+  // the plan age is still detected.
+  horizonAge: number;
+}
+
+// Simulated years beyond the plan age.
+export const HORIZON_BUFFER_YEARS = 5;
+// Upper bounds on ages.  A typo like 600 would otherwise simulate hundreds of
+// years on every keystroke.
+const MAX_CURRENT_OR_RETIREMENT_AGE = 110;
+const MAX_TARGET_AGE = 120;
+
+// Ages are whole years.  A fractional age used to make every post-retirement
+// simulation year fractional, so post-retirement one-time goals (indexed by
+// whole years) were silently never applied.
+export const sanitizeAges = (
+  params: Pick<
+    RetirementCalculationParams,
+    "currentAge" | "retirementAge" | "targetAge"
+  >,
+): SanitizedAges => {
+  const clamp = (v: number, lo: number, hi: number) =>
+    Math.min(hi, Math.max(lo, Math.round(v)));
+  const currentAge = clamp(
+    finiteOr(params.currentAge, 0),
+    0,
+    MAX_CURRENT_OR_RETIREMENT_AGE,
+  );
+  const retirementAge = clamp(
+    finiteOr(params.retirementAge, currentAge),
+    currentAge,
+    MAX_CURRENT_OR_RETIREMENT_AGE,
+  );
+  const targetAge = clamp(
+    finiteOr(params.targetAge, 90),
+    retirementAge + 1,
+    MAX_TARGET_AGE,
+  );
+  return {
+    currentAge,
+    retirementAge,
+    targetAge,
+    horizonAge: targetAge + HORIZON_BUFFER_YEARS,
+  };
+};
+
+const resolveTax = (t: TaxSettings | undefined): TaxSettings => ({
+  incomeTaxRate: clampNum(finiteOr(t?.incomeTaxRate, DEFAULT_TAX.incomeTaxRate), 0, 100),
+  ltcgRate: clampNum(finiteOr(t?.ltcgRate, DEFAULT_TAX.ltcgRate), 0, 100),
+  ltcgExemption: Math.max(0, finiteOr(t?.ltcgExemption, DEFAULT_TAX.ltcgExemption)),
+});
+
+const resolveStrategy = (s: WithdrawalStrategy | undefined): WithdrawalStrategy =>
+  s === "rebalance" || s === "buckets" ? s : "proRata";
+
+const TAX_TREATMENTS: readonly TaxTreatment[] = [
+  "none",
+  "equity",
+  "slabOnSale",
+  "slabYearly",
+];
+const resolveTreatment = (t: TaxTreatment | undefined): TaxTreatment =>
+  t !== undefined && TAX_TREATMENTS.includes(t) ? t : "none";
+
+const cloneBuckets = (
+  buckets: InvestmentBucket[],
+  defaultVol: number,
+): ExistingBucketState[] =>
   buckets.map((b) => ({
     amount: Math.max(0, finiteOr(b.amount, 0)),
     rate: finiteOr(b.return, 0),
+    vol: resolveVol(b.volatility, defaultVol),
   }));
 
-const cloneSavings = (buckets: InvestmentBucket[]): SavingsBucketState[] =>
+const cloneSavings = (
+  buckets: InvestmentBucket[],
+  defaultVol: number,
+): SavingsBucketState[] =>
   buckets.map((b) => {
     const targetRate =
       b.targetRate !== undefined && Number.isFinite(b.targetRate)
@@ -68,7 +304,9 @@ const cloneSavings = (buckets: InvestmentBucket[]): SavingsBucketState[] =>
       id: b.id,
       name: b.name,
       monthly: Math.max(0, finiteOr(b.amount, 0)),
+      stepUp: clampNum(finiteOr(b.stepUpPct, 0) / 100, -0.99, 1),
       rate: finiteOr(b.return, 0),
+      vol: resolveVol(b.volatility, defaultVol),
       targetRate,
       glideYears,
       accumulated: 0,
@@ -81,76 +319,91 @@ const sumExisting = (buckets: ExistingBucketState[]): number =>
 const sumSavings = (buckets: SavingsBucketState[]): number =>
   buckets.reduce((s, b) => s + b.accumulated, 0);
 
-// Hard floor on annual return: ‑95%/yr.  Even 2008-style crashes were ‑40%, so
-// this only kicks in for absurd shock draws (≥6 sigma at vol=15%).  Without it
-// extreme negative MC draws can flip bucket values negative.
-const RETURN_FLOOR = -0.95;
-// Inflation floor: ‑5%/yr deflation cap.  Worse than any modern economy.
-const INFLATION_FLOOR = -0.05;
-
-const growExisting = (buckets: ExistingBucketState[], shock: number) => {
+// Returns the investment growth earned.
+const growExisting = (
+  buckets: ExistingBucketState[],
+  z: number,
+  fat: boolean,
+): number => {
+  let growth = 0;
   for (const b of buckets) {
-    const r = Math.max(RETURN_FLOOR, b.rate / 100 + shock);
-    b.amount *= 1 + r;
+    const before = b.amount;
+    b.amount *= grossFactor(b.rate, b.vol, z, fat);
+    growth += b.amount - before;
   }
+  return growth;
 };
 
-// Compute the effective annual rate (in %) for a SIP at the given simulation
-// year, taking the optional glide-path into account.  If glide is configured
-// AND there is an upcoming linked goal within glideYears years, the rate
-// linearly interpolates from the SIP's normal rate toward targetRate; outside
-// the glide window the SIP uses its normal rate.
-const effectiveSipRate = (
-  bucket: SavingsBucketState,
+// How far through its glide a SIP is in the given simulation year: 0 outside
+// the glide window (or with no glide / no pending linked goal), rising
+// linearly to 1 in the goal year itself.
+const glideProgress = (
+  bucket: Pick<SavingsBucketState, "glideYears" | "targetRate">,
   currentYear: number,
   nextGoalYear: number | undefined,
 ): number => {
   const glide = bucket.glideYears;
-  const target = bucket.targetRate;
   if (
     glide === undefined ||
     glide <= 0 ||
-    target === undefined ||
+    bucket.targetRate === undefined ||
     nextGoalYear === undefined
   ) {
-    return bucket.rate;
+    return 0;
   }
   const yearsToGoal = nextGoalYear - currentYear;
-  if (yearsToGoal >= glide) return bucket.rate;
-  if (yearsToGoal <= 0) return target;
-  // progress is the fraction of the glide already completed: 0 at the start
-  // of the window, 1 at the goal year.
-  const progress = 1 - yearsToGoal / glide;
-  return bucket.rate + (target - bucket.rate) * progress;
+  if (yearsToGoal >= glide) return 0;
+  if (yearsToGoal <= 0) return 1;
+  return 1 - yearsToGoal / glide;
 };
 
-// One year of monthly contributions + true monthly compounding for savings.
-// Same formula in deterministic (shock=0) and MC paths: this guarantees that
-// MC at sigma=0 collapses exactly to the deterministic projection.  An
-// optional `effectiveRates` map overrides each bucket's per-year rate (used
-// to apply glide-path settings); when not supplied each bucket uses its own
-// `rate` as before.
+// Return and volatility for a SIP (or its earmarked pool) at a given glide
+// progress.  The glide is modelled as moving a growing share of the money
+// into a low-volatility asset that earns targetRate.
+const glidedRateAndVol = (
+  bucket: Pick<SavingsBucketState, "rate" | "vol" | "targetRate">,
+  progress: number,
+): { rate: number; vol: number } => {
+  if (!(progress > 0) || bucket.targetRate === undefined) {
+    return { rate: bucket.rate, vol: bucket.vol };
+  }
+  const safeVol = Math.min(bucket.vol, DERISKED_VOLATILITY);
+  return {
+    rate: bucket.rate + (bucket.targetRate - bucket.rate) * progress,
+    vol: bucket.vol + (safeVol - bucket.vol) * progress,
+  };
+};
+
+// One year of end-of-month contributions with monthly compounding at the
+// CAGR-consistent monthly rate, then the yearly step-up.  Same formula in
+// deterministic (z = 0) and Monte Carlo paths, so MC at zero volatility
+// collapses exactly to the deterministic projection.
 const advanceSavings = (
   buckets: SavingsBucketState[],
-  shock: number,
-  effectiveRates?: Map<number, number>,
-) => {
+  z: number,
+  progressById: Map<number, number>,
+  fat: boolean,
+): { growth: number; contributions: number } => {
+  let growth = 0;
+  let contributions = 0;
   for (const b of buckets) {
-    const baseRate = effectiveRates?.get(b.id) ?? b.rate;
-    const annualR = Math.max(RETURN_FLOOR, baseRate / 100 + shock);
-    const r = annualR / 12;
-    if (r === 0) {
-      b.accumulated += b.monthly * 12;
-    } else {
-      const annualFactor = Math.pow(1 + r, 12);
-      b.accumulated =
-        b.accumulated * annualFactor +
-        b.monthly * ((annualFactor - 1) / r);
-    }
+    const { rate, vol } = glidedRateAndVol(b, progressById.get(b.id) ?? 0);
+    const yearly = grossFactor(rate, vol, z, fat);
+    const monthly = Math.pow(yearly, 1 / 12);
+    // Σ_{j=0}^{11} monthly^j: contribution j months before year end grows j
+    // months.
+    const annuity =
+      Math.abs(monthly - 1) < 1e-12 ? 12 : (yearly - 1) / (monthly - 1);
+    const paidIn = b.monthly * 12;
+    growth += b.accumulated * (yearly - 1) + b.monthly * (annuity - 12);
+    b.accumulated = b.accumulated * yearly + b.monthly * annuity;
+    contributions += paidIn;
+    b.monthly *= 1 + b.stepUp;
   }
+  return { growth, contributions };
 };
 
-// Withdraw a one-time expense pro-rata across all buckets.
+// Withdraw a one-time expense pro-rata across all accumulation buckets.
 // Returns the unfunded shortfall (positive when corpus could not cover it).
 const withdrawProRata = (
   existing: ExistingBucketState[],
@@ -165,140 +418,150 @@ const withdrawProRata = (
     for (const b of savings) b.accumulated = 0;
     return amount - total;
   }
-  const ratio = amount / total;
-  for (const b of existing) b.amount *= 1 - ratio;
-  for (const b of savings) b.accumulated *= 1 - ratio;
+  const keep = 1 - amount / total;
+  for (const b of existing) b.amount *= keep;
+  for (const b of savings) b.accumulated *= keep;
   return 0;
 };
 
 // ---- Decumulation-phase helpers (operate on RetirementBucketState[]) -----
 
-const sumRetBuckets = (buckets: RetirementBucketState[]): number =>
-  buckets.reduce((s, b) => s + b.amount, 0);
+const sumRetBuckets = (buckets: RetirementBucketState[]): number => {
+  let s = 0;
+  for (const b of buckets) s += b.amount;
+  return s;
+};
 
-const growRetBuckets = (
-  buckets: RetirementBucketState[],
-  shock: number,
+// Sell `amount` (≤ b.amount) from a bucket, recording the realised gain.
+const sellFrom = (
+  b: RetirementBucketState,
+  amount: number,
+  gains: GainsLedger,
 ) => {
-  for (const b of buckets) {
-    const r = Math.max(RETURN_FLOOR, b.rate / 100 + shock);
-    b.amount *= 1 + r;
+  if (!(amount > 0) || !(b.amount > 0)) return;
+  let gain: number;
+  if (amount >= b.amount) {
+    gain = b.amount - b.basis;
+    b.amount = 0;
+    b.basis = 0;
+  } else {
+    const basisSold = b.basis * (amount / b.amount);
+    gain = amount - basisSold;
+    b.basis -= basisSold;
+    b.amount -= amount;
   }
+  if (b.tax === "equity") gains.equity += gain;
+  else if (b.tax === "slabOnSale") gains.slab += gain;
+  // "slabYearly" growth is taxed as it accrues; "none" is untaxed.
 };
 
-// Pro-rata withdrawal across post-retirement buckets.  Returns shortfall.
-const withdrawRetProRata = (
-  buckets: RetirementBucketState[],
-  amount: number,
-): number => {
-  if (!(amount > 0)) return 0;
-  const total = sumRetBuckets(buckets);
-  if (total <= 0) return amount;
-  if (amount >= total) {
-    for (const b of buckets) b.amount = 0;
-    return amount - total;
-  }
-  const ratio = amount / total;
-  for (const b of buckets) b.amount *= 1 - ratio;
-  return 0;
+const buyInto = (b: RetirementBucketState, amount: number) => {
+  if (!(amount > 0)) return;
+  b.amount += amount;
+  b.basis += amount;
 };
 
-// Add money to retirement buckets pro-rata to current values.  Used when
-// an earmarked pool's last linked expense has fired and any leftover is
-// returned to the main corpus.  When all buckets happen to be at zero
-// (corpus depleted), distribute equally so the money isn't lost.
-const addToRetBucketsProRata = (
+// Below this the main corpus counts as empty: rounding dust (a few paise
+// left by an exactly-sized earmark) must not decide how new money is split.
+const EMPTY_CORPUS_RUPEES = 1;
+// A shortfall smaller than one paisa is floating-point dust (e.g. a pension
+// exactly equal to spending), not money running out.
+const MONEY_EPSILON = 0.01;
+
+// Add new money to the main corpus (spare income, or a pool's leftover after
+// its last goal): pro-rata to current values, i.e. the current mix; when the
+// main corpus is empty, by the user's allocation.
+const addToRetBuckets = (
   buckets: RetirementBucketState[],
   amount: number,
+  allocationShares: number[],
 ) => {
   if (!(amount > 0) || buckets.length === 0) return;
   const total = sumRetBuckets(buckets);
-  if (total <= 0) {
-    const each = amount / buckets.length;
-    for (const b of buckets) b.amount += each;
-    return;
-  }
-  for (const b of buckets) {
-    b.amount += amount * (b.amount / total);
+  const byMix = total > EMPTY_CORPUS_RUPEES;
+  for (let i = 0; i < buckets.length; i++) {
+    const share = byMix ? buckets[i].amount / total : allocationShares[i];
+    buyInto(buckets[i], amount * share);
   }
 };
 
 // Build the decumulation buckets from user-supplied allocations.  If no
-// buckets are configured, falls back to a single synthetic bucket with the
-// at-retirement weighted return — this preserves the legacy single-aggregate
-// behaviour and keeps everything per-bucket internally.
+// buckets are configured (or every allocation is 0%), falls back to a single
+// synthetic bucket with the at-retirement weighted return and volatility.
 const allocatePostRetirement = (
   corpusAtRetirement: number,
   weightedReturnAtRetirement: number,
+  weightedVolAtRetirement: number,
   postRetirementBuckets: PostRetirementBucket[] | undefined,
+  defaultVol: number,
+  rankDefaultVol: number,
 ): {
   buckets: RetirementBucketState[];
   allocation: PostRetirementBucketAllocation[];
 } => {
+  const corpus = Math.max(0, corpusAtRetirement);
+  const aggregated = (allocationPct: number) => ({
+    buckets: [
+      {
+        id: 0,
+        name: "Aggregated",
+        amount: corpus,
+        rate: weightedReturnAtRetirement,
+        vol: weightedVolAtRetirement,
+        riskRank: weightedVolAtRetirement,
+        tax: "none" as TaxTreatment,
+        basis: corpus,
+      },
+    ],
+    allocation: [
+      {
+        id: 0,
+        name: "Aggregated",
+        allocationPct,
+        normalizedPct: 100,
+        amount: corpus,
+        return: weightedReturnAtRetirement,
+      },
+    ],
+  });
   if (!postRetirementBuckets || postRetirementBuckets.length === 0) {
-    return {
-      buckets: [
-        {
-          id: 0,
-          name: "Aggregated",
-          amount: Math.max(0, corpusAtRetirement),
-          rate: weightedReturnAtRetirement,
-        },
-      ],
-      allocation: [
-        {
-          id: 0,
-          name: "Aggregated",
-          allocationPct: 100,
-          normalizedPct: 100,
-          amount: Math.max(0, corpusAtRetirement),
-          return: weightedReturnAtRetirement,
-        },
-      ],
-    };
+    return aggregated(100);
   }
   const sanitized = postRetirementBuckets.map((b) => ({
     id: b.id,
     name: b.name,
     rate: finiteOr(b.return, 0),
+    vol: resolveVol(b.volatility, defaultVol),
+    riskRank: resolveVol(b.volatility, rankDefaultVol),
+    tax: resolveTreatment(b.taxTreatment),
     pct: Math.max(0, finiteOr(b.allocationPct, 0)),
   }));
   const totalPct = sanitized.reduce((s, b) => s + b.pct, 0);
-  const norm = totalPct > 0 ? totalPct : 1;
+  // All allocations zero: fall back to a single aggregate so the user doesn't
+  // get a stuck-at-zero corpus that ignores what they accumulated.
+  if (totalPct === 0) return aggregated(0);
   const buckets: RetirementBucketState[] = [];
   const allocation: PostRetirementBucketAllocation[] = [];
   for (const b of sanitized) {
-    const normalisedPct = totalPct > 0 ? (b.pct / norm) * 100 : 0;
-    const amount = Math.max(0, corpusAtRetirement) * (b.pct / norm);
-    buckets.push({ id: b.id, name: b.name, amount, rate: b.rate });
+    const share = b.pct / totalPct;
+    const amount = corpus * share;
+    buckets.push({
+      id: b.id,
+      name: b.name,
+      amount,
+      rate: b.rate,
+      vol: b.vol,
+      riskRank: b.riskRank,
+      tax: b.tax,
+      basis: amount,
+    });
     allocation.push({
       id: b.id,
       name: b.name,
       allocationPct: b.pct,
-      normalizedPct: normalisedPct,
+      normalizedPct: share * 100,
       amount,
       return: b.rate,
-    });
-  }
-  // Edge case: all allocations are zero.  Fall back to single aggregate
-  // so the user doesn't get a stuck-at-zero corpus that fails to track
-  // the actual savings they accumulated.
-  if (totalPct === 0) {
-    buckets.length = 0;
-    buckets.push({
-      id: 0,
-      name: "Aggregated",
-      amount: Math.max(0, corpusAtRetirement),
-      rate: weightedReturnAtRetirement,
-    });
-    allocation.length = 0;
-    allocation.push({
-      id: 0,
-      name: "Aggregated",
-      allocationPct: 0,
-      normalizedPct: 100,
-      amount: Math.max(0, corpusAtRetirement),
-      return: weightedReturnAtRetirement,
     });
   }
   return { buckets, allocation };
@@ -348,8 +611,8 @@ const applyAccumulationExpense = (
   };
 };
 
-// Box-Muller standard-normal draw.  Exported so monteCarlo.ts can share it.
-export const standardNormal = (rng: () => number): number => {
+// Box-Muller standard-normal draw.
+const standardNormal = (rng: () => number): number => {
   let u1 = rng();
   while (u1 <= Number.EPSILON) u1 = rng();
   const u2 = rng();
@@ -363,10 +626,12 @@ export const standardNormal = (rng: () => number): number => {
 const buildFutureOneTimeExpenses = (
   oneTimeExpenses: RetirementCalculationParams["oneTimeExpenses"],
   currentAge: number,
+  lastSimulatedYear: number,
 ): FutureOneTimeExpense[] =>
   oneTimeExpenses.map((expense) => {
     const yearsFromNow = Math.max(0, Math.round(finiteOr(expense.yearsFromNow, 0)));
-    const inflationRate = finiteOr(expense.inflationRate, 0);
+    // At or below -100% a "price" would go negative or flip sign.
+    const inflationRate = Math.max(-100, finiteOr(expense.inflationRate, 0));
     const currentCost = Math.max(0, finiteOr(expense.currentCost, 0));
     return {
       ...expense,
@@ -376,6 +641,7 @@ const buildFutureOneTimeExpenses = (
       futureValue:
         currentCost * Math.pow(1 + inflationRate / 100, yearsFromNow),
       ageWhenDue: currentAge + yearsFromNow,
+      withinHorizon: yearsFromNow <= lastSimulatedYear,
     };
   });
 
@@ -397,29 +663,41 @@ const indexByYear = (
 
 export interface SimulationOptions {
   rng?: () => number;
-  // Annualised stdev of portfolio returns, in percent (e.g., 12 = 12%).
-  // Ignored when rng is undefined.
+  // Default annualised stdev of returns, in percent (e.g., 12 = 12%), for
+  // buckets that have no volatility of their own.  Ignored when rng is
+  // undefined.
   portfolioVolatility?: number;
   // Annualised stdev of inflation, in percent.  Ignored when rng is undefined.
   inflationVolatility?: number;
+  // 0..0.95, see MonteCarloParams.  Ignored when rng is undefined.
+  inflationPersistence?: number;
+  // Fat-tailed market shocks.  Ignored when rng is undefined.
+  fatTails?: boolean;
 }
 
-export interface SimulationResult {
+export interface SimulationResult extends SanitizedAges {
   steps: YearlyProjection[];
+  // Corpus today after any "due now" (year-0) one-time expenses.
+  startingCorpus: number;
+  annualExpenses: number;
+  // Living costs and income per year at the start of retirement.
+  annualLivingAtRetirement: number;
+  annualIncomeAtRetirement: number;
   // Total at-retirement wealth: existing buckets + ALL SIPs (incl earmarked).
   corpusAtRetirement: number;
   // Slice that flows into the post-retirement decumulation pool.  Equals
   // corpusAtRetirement minus earmarkedAtRetirement.
   mainCorpusAtRetirement: number;
-  // Sum of earmarked SIP balances at the retirement transition.  Each pool
-  // continues to compound at its SIP's rate during retirement until the
-  // linked one-time expense fires; any leftover then rolls into the main
-  // corpus.
+  // Sum of earmarked pools at the retirement transition.
   earmarkedAtRetirement: number;
+  // Value-weighted return of everything accumulated at retirement.
   weightedReturnAtRetirement: number;
+  // Blended return of the decumulation buckets at retirement.
+  postRetirementReturn: number;
   yearsAfterRetirement: number;
   survivalAge: number;
   depleted: boolean;
+  incomeCoverageAtDepletion?: number;
   finalCorpus: number;
   yearsToRetirement: number;
   futureOneTimeExpenses: FutureOneTimeExpense[];
@@ -427,8 +705,7 @@ export interface SimulationResult {
   // deterministic case this is (1 + inflation)^yearsToRetirement.
   cumulativeInflationToRetirement: number;
   // The per-bucket post-retirement allocation snapshotted at the moment of
-  // retirement.  Useful for the UI to show ₹ amounts derived from the user's
-  // %s and the actual at-retirement main corpus.
+  // retirement.
   postRetirementAllocation: PostRetirementBucketAllocation[];
   // Per-expense funding breakdown — see ExpenseFundingSnapshot.
   expenseFundings: ExpenseFundingSnapshot[];
@@ -439,38 +716,103 @@ export function simulateRetirementPath(
   opts: SimulationOptions = {},
 ): SimulationResult {
   // ---- Sanitize inputs ---------------------------------------------------
-  const currentAge = Math.max(0, finiteOr(params.currentAge, 0));
-  const retirementAge = Math.max(currentAge, finiteOr(params.retirementAge, currentAge));
+  const { currentAge, retirementAge, targetAge, horizonAge } =
+    sanitizeAges(params);
   const inflation = finiteOr(params.inflation, 0);
-  const monthlyExpensesInput = Math.max(0, finiteOr(params.monthlyExpenses, 0));
-  const expenseType = params.expenseType === "yearly" ? "yearly" : "monthly";
-  const targetAge = Math.max(
-    retirementAge + 1,
-    finiteOr(params.targetAge, 90),
+  const expectedInflation = Math.max(INFLATION_FLOOR, inflation / 100);
+  const expenseInput = Math.max(0, finiteOr(params.monthlyExpenses, 0));
+  const annualExpenses =
+    params.expenseType === "yearly" ? expenseInput : expenseInput * 12;
+  const yearsToRetirement = retirementAge - currentAge;
+  const tax = resolveTax(params.tax);
+  const strategy = resolveStrategy(params.withdrawalStrategy);
+  const cashBufferYears = Math.max(
+    0,
+    finiteOr(params.cashBufferYears, DEFAULT_CASH_BUFFER_YEARS),
   );
 
-  const annualExpenses =
-    expenseType === "monthly" ? monthlyExpensesInput * 12 : monthlyExpensesInput;
-  const yearsToRetirement = retirementAge - currentAge;
+  // Spending phases, sorted; the factor for an age is the latest phase that
+  // has started (100% before the first one).
+  const phases = (params.spendingPhases ?? [])
+    .map((p) => ({
+      fromAge: finiteOr(p.fromAge, Infinity),
+      factor: Math.max(0, finiteOr(p.percentOfBase, 100)) / 100,
+    }))
+    .filter((p) => Number.isFinite(p.fromAge))
+    .sort((a, b) => a.fromAge - b.fromAge);
+  const phaseFactor = (age: number): number => {
+    let f = 1;
+    for (const p of phases) if (p.fromAge <= age) f = p.factor;
+    return f;
+  };
 
-  // Run the simulation a few years past the user's target so we can detect
-  // depletion that happens just *after* targetAge — better UX than truncating
-  // exactly at the boundary.
-  const horizonAge = targetAge + 5;
+  // Healthcare: today's monthly cost growing at its own inflation.  In
+  // Monte Carlo it rides on realised general inflation plus a fixed premium.
+  const healthMonthlyToday = Math.max(0, finiteOr(params.healthcare?.monthlyCost, 0));
+  const healthInflation = Math.max(-0.99, finiteOr(params.healthcare?.inflation, 0) / 100);
+  const healthStartAge = finiteOr(params.healthcare?.startAge, retirementAge);
+  const healthPremium = (1 + healthInflation) / (1 + expectedInflation);
+  const healthPremiumMonthly = Math.pow(healthPremium, 1 / 12);
+
+  // Paid while startAge <= age < endAge.  An end age at or before the start
+  // age means the income is never paid (the UI flags it); only a blank end
+  // age means "for life".
+  const incomeStreams = (params.incomeStreams ?? []).map((s) => {
+    const startAge = finiteOr(s.startAge, retirementAge);
+    return {
+      monthly:
+        Math.max(0, finiteOr(s.monthlyAmount, 0)) *
+        (s.taxable ? 1 - tax.incomeTaxRate / 100 : 1),
+      startAge,
+      endAge: finiteOr(s.endAge, Infinity),
+      growth: s.growth === "fixed" || s.growth === "custom" ? s.growth : "inflation",
+      growthRate: Math.max(-0.99, finiteOr(s.growthRate, 0) / 100),
+    };
+  });
+
+  // Monthly living cost and income at the START of the year in which you are
+  // `age`, `yearsFromNow` years from today, when the price level is
+  // `priceIndex`.  Shared by the year loop and the cash-buffer refill (which
+  // sizes next year's need).
+  const incomeAmount = (s: (typeof incomeStreams)[number], age: number, priceIndex: number) =>
+    s.growth === "inflation"
+      ? s.monthly * priceIndex
+      : s.growth === "fixed"
+        ? s.monthly
+        : s.monthly * Math.pow(1 + s.growthRate, age - s.startAge);
+  const incomeActive = (s: (typeof incomeStreams)[number], age: number) =>
+    s.startAge <= age && age < s.endAge;
+  const monthlyFlows = (age: number, yearsFromNow: number, priceIndex: number) => {
+    let income = 0;
+    for (const s of incomeStreams) if (incomeActive(s, age)) income += incomeAmount(s, age, priceIndex);
+    return {
+      base: (annualExpenses / 12) * priceIndex * phaseFactor(age),
+      health:
+        age >= healthStartAge
+          ? healthMonthlyToday * priceIndex * Math.pow(healthPremium, yearsFromNow)
+          : 0,
+      income,
+    };
+  };
+
+  // The simulation runs to horizonAge (a few years past the user's target) so
+  // depletion just *after* targetAge is still detected.
   const maxYearsAfterRetirement = Math.max(1, horizonAge - retirementAge);
+  const lastSimulatedYear = yearsToRetirement + maxYearsAfterRetirement;
 
   const futureOneTimeExpenses = buildFutureOneTimeExpenses(
     params.oneTimeExpenses,
     currentAge,
+    lastSimulatedYear,
   );
   const oneTimeByYear = indexByYear(futureOneTimeExpenses);
 
   // For each SIP, the *sorted* list of years at which one of its linked
-  // expenses fires.  Used by the glide-path logic to find the next pending
-  // goal each year.
+  // in-horizon expenses fires.  Used by the glide-path logic to find the
+  // next pending goal each year.
   const linkedGoalsBySipId = new Map<number, number[]>();
   for (const e of futureOneTimeExpenses) {
-    if (e.linkedSavingsBucketId === undefined) continue;
+    if (e.linkedSavingsBucketId === undefined || !e.withinHorizon) continue;
     const list = linkedGoalsBySipId.get(e.linkedSavingsBucketId) ?? [];
     list.push(e.yearsFromNow);
     linkedGoalsBySipId.set(e.linkedSavingsBucketId, list);
@@ -478,8 +820,6 @@ export function simulateRetirementPath(
   for (const list of linkedGoalsBySipId.values()) {
     list.sort((a, b) => a - b);
   }
-  // Returns the *next* linked-goal year >= currentYear for the given SIP,
-  // or undefined if the SIP has no pending linked goal.
   const nextGoalYearForSip = (
     sipId: number,
     currentYear: number,
@@ -491,216 +831,373 @@ export function simulateRetirementPath(
 
   // ---- Stochastic settings ----------------------------------------------
   const { rng } = opts;
-  const sigmaR = rng
-    ? Math.max(0, finiteOr(opts.portfolioVolatility, 0)) / 100
-    : 0;
+  const defaultVol = rng ? Math.max(0, finiteOr(opts.portfolioVolatility, 0)) : 0;
   const sigmaI = rng
     ? Math.max(0, finiteOr(opts.inflationVolatility, 0)) / 100
     : 0;
+  const persistence = rng
+    ? clampNum(finiteOr(opts.inflationPersistence, 0), 0, MAX_INFLATION_PERSISTENCE)
+    : 0;
+  const fatTails = Boolean(rng && opts.fatTails);
+  const drawMarket = (): number => {
+    if (!rng) return 0;
+    const z = standardNormal(rng);
+    if (!fatTails) return z;
+    return z * (rng() < CRISIS_PROBABILITY ? CRISIS_SCALE : CALM_SCALE);
+  };
+  // AR(1) on the deviation from expected inflation, scaled so each year's
+  // spread is sigmaI.  It starts from a random point of its long-run range,
+  // so the first years are as uncertain as later ones.
+  let inflationDeviation = sigmaI > 0 && rng ? sigmaI * standardNormal(rng) : 0;
+  const innovationScale = Math.sqrt(1 - persistence * persistence);
+  const drawInflation = (): number => {
+    if (sigmaI > 0 && rng) {
+      inflationDeviation =
+        persistence * inflationDeviation +
+        sigmaI * innovationScale * standardNormal(rng);
+    }
+    return Math.max(INFLATION_FLOOR, inflation / 100 + inflationDeviation);
+  };
 
   // ---- Mutable corpus state + output buffers ---------------------------
-  const existing = cloneBuckets(params.investmentBuckets);
-  const savings = cloneSavings(params.monthlySavingsBuckets);
+  const existing = cloneBuckets(params.investmentBuckets, defaultVol);
+  const savings = cloneSavings(params.monthlySavingsBuckets, defaultVol);
   const steps: YearlyProjection[] = [];
   const expenseFundings: ExpenseFundingSnapshot[] = [];
-  let nominalAnnualExpenses = annualExpenses;
   let cumulativeInflation = 1;
 
   // Apply any "due now" expenses (yearsFromNow == 0) before the year-1 step.
-  // Without this, immediate big purchases (e.g., wedding due this year) would
-  // be silently dropped because the main loop starts at year=1.  Note: a
-  // year-0 expense linked to a SIP gets ~no benefit from the link because the
-  // SIP has not had time to accumulate — but it's harmless.
   const yr0 = oneTimeByYear.get(0);
   if (yr0) {
     for (const e of yr0) {
-      expenseFundings.push(
-        applyAccumulationExpense(existing, savings, e),
-      );
+      expenseFundings.push(applyAccumulationExpense(existing, savings, e));
     }
   }
+  const startingCorpus = sumExisting(existing) + sumSavings(savings);
 
   // ---- Accumulation phase ------------------------------------------------
+  const progress = new Map<number, number>();
   for (let year = 1; year <= yearsToRetirement; year++) {
-    const age = currentAge + year;
+    const z = drawMarket();
+    const realisedInflation = drawInflation();
 
-    const rShock = sigmaR > 0 && rng ? standardNormal(rng) * sigmaR : 0;
-    const iShock = sigmaI > 0 && rng ? standardNormal(rng) * sigmaI : 0;
-    const realisedInflation = Math.max(INFLATION_FLOOR, inflation / 100 + iShock);
-
-    growExisting(existing, rShock);
-    const savingsBefore = sumSavings(savings);
-    // Per-SIP effective rate for this year (factors in any glide).
-    const sipRatesThisYear = new Map<number, number>();
+    let growth = growExisting(existing, z, fatTails);
     for (const sb of savings) {
-      sipRatesThisYear.set(
-        sb.id,
-        effectiveSipRate(sb, year, nextGoalYearForSip(sb.id, year)),
-      );
+      progress.set(sb.id, glideProgress(sb, year, nextGoalYearForSip(sb.id, year)));
     }
-    advanceSavings(savings, rShock, sipRatesThisYear);
-    const contributions = sumSavings(savings) - savingsBefore;
+    const saved = advanceSavings(savings, z, progress, fatTails);
+    growth += saved.growth;
 
     const oneTimeForYear = oneTimeByYear.get(year) ?? [];
     let oneTimeAmount = 0;
     for (const e of oneTimeForYear) {
-      expenseFundings.push(
-        applyAccumulationExpense(existing, savings, e),
-      );
-      oneTimeAmount += e.futureValue;
+      const f = applyAccumulationExpense(existing, savings, e);
+      expenseFundings.push(f);
+      oneTimeAmount += f.futureValue;
     }
 
-    const corpus = sumExisting(existing) + sumSavings(savings);
+    cumulativeInflation *= 1 + realisedInflation;
     steps.push({
       year,
-      age,
+      age: currentAge + year,
       isRetired: false,
-      corpus,
+      corpus: sumExisting(existing) + sumSavings(savings),
       regularExpenses: 0,
       oneTimeExpenses: oneTimeAmount,
       oneTimeItems: oneTimeForYear,
-      contributions,
+      contributions: saved.contributions,
+      growth,
+      incomeReceived: 0,
+      healthcareExpenses: 0,
+      taxPaid: 0,
+      livingCostsFromEarmarked: 0,
+      inflationIndex: cumulativeInflation,
     });
-
-    nominalAnnualExpenses *= 1 + realisedInflation;
-    cumulativeInflation *= 1 + realisedInflation;
   }
+  const cumulativeInflationToRetirement = cumulativeInflation;
 
-  // ---- Identify earmarked SIPs (those linked to a *post-retirement* one-time
-  // expense).  Pre-retirement linked expenses already drained their SIP
-  // during accumulation, so they don't earmark anything for the future. ----
-  const earmarkedSipIds = new Set<number>();
+  // ---- Earmarked pools ---------------------------------------------------
+  // A SIP linked to post-retirement goals inside the horizon keeps aside only
+  // what those goals need: each goal's cost discounted back to retirement
+  // along the SIP's expected (deterministic, glided) rate path.  The rest of
+  // the SIP joins the main corpus.  Pre-retirement linked goals already
+  // drained their SIP during accumulation.
+  interface EarmarkedPool {
+    sip: SavingsBucketState;
+    amount: number;
+    pendingExpenseCount: number;
+    // This year's monthly growth factor (set at the start of each year).
+    monthlyFactor: number;
+  }
+  const goalsBySip = new Map<number, FutureOneTimeExpense[]>();
   for (const e of futureOneTimeExpenses) {
     if (
       e.linkedSavingsBucketId !== undefined &&
       e.yearsFromNow > yearsToRetirement &&
+      e.withinHorizon &&
       savings.some((s) => s.id === e.linkedSavingsBucketId)
     ) {
-      earmarkedSipIds.add(e.linkedSavingsBucketId);
+      const list = goalsBySip.get(e.linkedSavingsBucketId) ?? [];
+      list.push(e);
+      goalsBySip.set(e.linkedSavingsBucketId, list);
     }
   }
-
-  // ---- Build the earmarked pools at the retirement transition ----
-  // Each earmarked SIP's at-retirement balance becomes a separate pool that
-  // continues to compound at the SIP's rate (no contributions — those stop at
-  // retirement).  The pool tracks how many post-retirement linked expenses
-  // are still pending; once that count reaches zero, any leftover rolls back
-  // into the main corpus pro-rata.
-  interface EarmarkedPool {
-    sipId: number;
-    name: string;
-    amount: number;
-    rate: number;
-    targetRate?: number;
-    glideYears?: number;
-    pendingExpenseCount: number;
-  }
-
   const earmarkedPools = new Map<number, EarmarkedPool>();
+  // Non-earmarked part of each earmarked SIP: joins the main corpus.
+  const sipExcess: { amount: number; rate: number; vol: number }[] = [];
   for (const sb of savings) {
-    if (!earmarkedSipIds.has(sb.id)) continue;
-    let pendingCount = 0;
-    for (const e of futureOneTimeExpenses) {
-      if (
-        e.linkedSavingsBucketId === sb.id &&
-        e.yearsFromNow > yearsToRetirement
-      ) {
-        pendingCount++;
+    const goals = goalsBySip.get(sb.id);
+    if (!goals) continue;
+    goals.sort((a, b) => a.yearsFromNow - b.yearsFromNow);
+    let factor = 1;
+    let required = 0;
+    let gi = 0;
+    const lastGoalYear = goals[goals.length - 1].yearsFromNow;
+    for (let y = yearsToRetirement + 1; y <= lastGoalYear; y++) {
+      const { rate } = glidedRateAndVol(
+        sb,
+        glideProgress(sb, y, nextGoalYearForSip(sb.id, y)),
+      );
+      factor *= 1 + Math.max(-0.99, rate / 100);
+      while (gi < goals.length && goals[gi].yearsFromNow === y) {
+        required += Math.max(0, goals[gi].futureValue) / factor;
+        gi++;
       }
     }
-    if (pendingCount > 0) {
-      earmarkedPools.set(sb.id, {
-        sipId: sb.id,
-        name: sb.name ?? "",
-        amount: sb.accumulated,
-        rate: sb.rate,
-        targetRate: sb.targetRate,
-        glideYears: sb.glideYears,
-        pendingExpenseCount: pendingCount,
-      });
-    }
+    const poolAmount = Math.min(sb.accumulated, required);
+    earmarkedPools.set(sb.id, {
+      sip: sb,
+      amount: poolAmount,
+      pendingExpenseCount: goals.length,
+      monthlyFactor: 1,
+    });
+    sipExcess.push({ amount: sb.accumulated - poolAmount, rate: sb.rate, vol: sb.vol });
   }
 
   // ---- Lock in retirement-time state -----------------------------------
-  // corpusAtRetirement is the *total* at retirement (incl. earmarked) — the
-  // headline number the user accumulated.  The main corpus excludes
-  // earmarked balances and is what flows into the decumulation pool.  The
-  // weighted return is computed on the main-corpus components (existing +
-  // non-earmarked savings) and used as the fallback rate when no
-  // post-retirement allocation is configured.
-  const existingValue = sumExisting(existing);
-  const existingWeightedSum = existing.reduce(
-    (s, b) => s + b.amount * b.rate,
-    0,
-  );
-  let nonEarmarkedSavingsValue = 0;
-  let nonEarmarkedSavingsWeightedSum = 0;
-  let earmarkedSavingsValue = 0;
+  let mainCorpusAtRetirement = 0;
+  let rateSum = 0;
+  let volSum = 0;
+  const addMain = (amount: number, rate: number, vol: number) => {
+    mainCorpusAtRetirement += amount;
+    rateSum += amount * rate;
+    volSum += amount * vol;
+  };
+  for (const b of existing) addMain(b.amount, b.rate, b.vol);
   for (const sb of savings) {
-    if (earmarkedSipIds.has(sb.id)) {
-      earmarkedSavingsValue += sb.accumulated;
-    } else {
-      nonEarmarkedSavingsValue += sb.accumulated;
-      nonEarmarkedSavingsWeightedSum += sb.accumulated * sb.rate;
-    }
+    if (!earmarkedPools.has(sb.id)) addMain(sb.accumulated, sb.rate, sb.vol);
   }
-  const earmarkedAtRetirement = earmarkedSavingsValue;
-  const corpusAtRetirement =
-    existingValue + nonEarmarkedSavingsValue + earmarkedSavingsValue;
-  const mainCorpusAtRetirement = existingValue + nonEarmarkedSavingsValue;
+  for (const x of sipExcess) addMain(x.amount, x.rate, x.vol);
+  let earmarkedAtRetirement = 0;
+  for (const pool of earmarkedPools.values()) {
+    earmarkedAtRetirement += pool.amount;
+    rateSum += pool.amount * pool.sip.rate;
+    volSum += pool.amount * pool.sip.vol;
+  }
+  const corpusAtRetirement = mainCorpusAtRetirement + earmarkedAtRetirement;
+  // The whole pre-retirement mix (pools included, since their leftovers join
+  // the main corpus later).  Used when no allocation is configured.
   const weightedReturnAtRetirement =
-    mainCorpusAtRetirement > 0
-      ? (existingWeightedSum + nonEarmarkedSavingsWeightedSum) /
-        mainCorpusAtRetirement
-      : 0;
+    corpusAtRetirement > 0 ? rateSum / corpusAtRetirement : 0;
+  const weightedVolAtRetirement =
+    corpusAtRetirement > 0 ? volSum / corpusAtRetirement : defaultVol;
 
   // ---- Build per-bucket decumulation state ------------------------------
   const { buckets: retBuckets, allocation: postRetirementAllocation } =
     allocatePostRetirement(
       mainCorpusAtRetirement,
       weightedReturnAtRetirement,
+      weightedVolAtRetirement,
       params.postRetirementBuckets,
+      defaultVol,
+      Math.max(0, finiteOr(params.defaultVolatility, DEFAULT_VOLATILITY)),
     );
+  const postRetirementReturn = postRetirementAllocation.reduce(
+    (s, a) => s + (a.normalizedPct / 100) * a.return,
+    0,
+  );
+  // Same order as retBuckets (both built in one pass).
+  const allocationShares = postRetirementAllocation.map(
+    (a) => a.normalizedPct / 100,
+  );
+  // "buckets" strategy: spend from the safest bucket first; refill it from
+  // the riskiest bucket that didn't lose money this year.
+  const bySafety = retBuckets
+    .map((b, i) => ({ i, rank: b.riskRank, rate: b.rate }))
+    .sort((a, b) => a.rank - b.rank || a.rate - b.rate)
+    .map((x) => x.i);
+  const refillSources = bySafety.slice(1).reverse();
+
+  let gains: GainsLedger = { equity: 0, slab: 0 };
+  // Withdraw from the main corpus following the strategy; returns the amount
+  // actually withdrawn (≤ amount).  Realised gains go to the current ledger.
+  const withdrawMain = (amount: number): number => {
+    const total = sumRetBuckets(retBuckets);
+    if (!(amount > 0) || total <= 0) return 0;
+    const take = Math.min(amount, total);
+    if (strategy === "buckets") {
+      let left = take;
+      for (const i of bySafety) {
+        if (left <= 0) break;
+        const t = Math.min(left, retBuckets[i].amount);
+        sellFrom(retBuckets[i], t, gains);
+        left -= t;
+      }
+      return take - Math.max(0, left);
+    }
+    const ratio = take / total;
+    for (const b of retBuckets) sellFrom(b, b.amount * ratio, gains);
+    return take;
+  };
+  const poolTotal = (): number => {
+    let s = 0;
+    for (const p of earmarkedPools.values()) s += p.amount;
+    return s;
+  };
+  // Pro-rata draw from the earmarked pools (untaxed: pools use the SIP's
+  // after-tax return).  Caller checks there is enough.
+  const drawPools = (amount: number, total: number) => {
+    const keep = total > 0 ? Math.max(0, 1 - amount / total) : 0;
+    for (const p of earmarkedPools.values()) p.amount *= keep;
+  };
 
   let depleted = false;
+  let depletionYear = Infinity;
   let yearsAfterRetirement = maxYearsAfterRetirement;
-  let lastCorpus = sumRetBuckets(retBuckets) + earmarkedAtRetirement;
+  let incomeCoverageAtDepletion: number | undefined;
+  let lastCorpus = corpusAtRetirement;
+  let annualLivingAtRetirement = 0;
+  let annualIncomeAtRetirement = 0;
+  const monthlyFactors = new Array<number>(retBuckets.length).fill(1);
+  const yearlyGross = new Array<number>(retBuckets.length).fill(1);
+  const accruedGrowth = new Array<number>(retBuckets.length).fill(0);
+  const incomeAmounts: number[] = [];
+  const incomeFactors: number[] = [];
 
   for (let k = 1; k <= maxYearsAfterRetirement; k++) {
     const year = yearsToRetirement + k;
-    const age = currentAge + year;
+    const ageAtStart = retirementAge + k - 1;
+    const z = drawMarket();
+    const realisedInflation = drawInflation();
+    const monthlyInflation = Math.pow(1 + realisedInflation, 1 / 12);
 
-    const rShock = sigmaR > 0 && rng ? standardNormal(rng) * sigmaR : 0;
-    const iShock = sigmaI > 0 && rng ? standardNormal(rng) * sigmaI : 0;
-    const realisedInflation = Math.max(INFLATION_FLOOR, inflation / 100 + iShock);
-
-    // Grow main corpus and earmarked pools (single-factor shock applies to
-    // both — same realised market in any given year).
-    growRetBuckets(retBuckets, rShock);
-    for (const pool of earmarkedPools.values()) {
-      // The pool inherits the SIP's glide-path settings.  We mirror the
-      // accumulation-phase logic by treating the pool as a degenerate
-      // SIP (no contributions) for rate calculation.
-      const baseRate = effectiveSipRate(
-        {
-          id: pool.sipId,
-          name: pool.name,
-          monthly: 0,
-          rate: pool.rate,
-          targetRate: pool.targetRate,
-          glideYears: pool.glideYears,
-          accumulated: pool.amount,
-        },
-        year,
-        nextGoalYearForSip(pool.sipId, year),
+    for (let i = 0; i < retBuckets.length; i++) {
+      yearlyGross[i] = grossFactor(retBuckets[i].rate, retBuckets[i].vol, z, fatTails);
+      monthlyFactors[i] = Math.pow(yearlyGross[i], 1 / 12);
+      accruedGrowth[i] = 0;
+    }
+    const pools = [...earmarkedPools.values()];
+    for (const pool of pools) {
+      const { rate, vol } = glidedRateAndVol(
+        pool.sip,
+        glideProgress(pool.sip, year, nextGoalYearForSip(pool.sip.id, year)),
       );
-      const r = Math.max(RETURN_FLOOR, baseRate / 100 + rShock);
-      pool.amount *= 1 + r;
+      pool.monthlyFactor = Math.pow(grossFactor(rate, vol, z, fatTails), 1 / 12);
     }
 
-    // Process one-time expenses for the year.  Linked expenses drain their
-    // pool first; any shortfall is pulled pro-rata from the main corpus.
-    const oneTimeForYear = oneTimeByYear.get(year) ?? [];
+    // Living costs and income for the first month of this year
+    // (cumulativeInflation is the price level at the start of the year);
+    // each then grows month by month at its own rate.
+    const start = monthlyFlows(ageAtStart, year - 1, cumulativeInflation);
+    let baseMonthly = start.base;
+    let healthMonthly = start.health;
+    const healthMonthlyFactor = monthlyInflation * healthPremiumMonthly;
+    incomeAmounts.length = 0;
+    incomeFactors.length = 0;
+    for (const s of incomeStreams) {
+      if (!incomeActive(s, ageAtStart)) continue;
+      incomeAmounts.push(incomeAmount(s, ageAtStart, cumulativeInflation));
+      incomeFactors.push(
+        s.growth === "inflation"
+          ? monthlyInflation
+          : s.growth === "fixed"
+            ? 1
+            : Math.pow(1 + s.growthRate, 1 / 12),
+      );
+    }
+    if (k === 1) {
+      annualLivingAtRetirement = 12 * (start.base + start.health);
+      annualIncomeAtRetirement = 12 * start.income;
+    }
+
+    let livingPaid = 0;
+    let healthPaid = 0;
+    let incomeReceived = 0;
+    let livingFromEarmarked = 0;
+    // Investment growth actually earned this year, tracked per bucket (not
+    // backed out of the corpus change, so the yearly ledger is a real
+    // conservation check).
+    let growth = 0;
+    for (let m = 0; m < 12; m++) {
+      const living = baseMonthly + healthMonthly;
+      let income = 0;
+      for (const a of incomeAmounts) income += a;
+      incomeReceived += income;
+      const need = living - income;
+      if (need <= 0) {
+        addToRetBuckets(retBuckets, -need, allocationShares);
+        livingPaid += living;
+        healthPaid += healthMonthly;
+      } else {
+        const fromMain = withdrawMain(need);
+        const short = need - fromMain;
+        // Unpaid rounding dust (< 1 paisa); kept out of livingPaid so the
+        // yearly ledger stays exact.
+        let dust = 0;
+        if (short > 0) {
+          // The main corpus can't cover this month.  Living costs come
+          // before a future goal, so dip into the earmarked pools before
+          // declaring the money gone; the goal then shows the shortfall.
+          const pt = poolTotal();
+          if (pt > 0 && short <= pt) {
+            drawPools(short, pt);
+            livingFromEarmarked += short;
+          } else if (short - pt <= MONEY_EPSILON) {
+            for (const p of earmarkedPools.values()) p.amount = 0;
+            livingFromEarmarked += pt;
+            dust = short - pt;
+          } else {
+            // Depletion = living costs can no longer be funded from
+            // anything.  A shortfall on a one-time goal alone is not.
+            for (const p of earmarkedPools.values()) p.amount = 0;
+            livingFromEarmarked += pt;
+            const covered = income + fromMain + pt;
+            livingPaid += covered;
+            healthPaid += healthMonthly * (covered / living);
+            depleted = true;
+            depletionYear = year;
+            // The money ran out part-way through this month's withdrawal
+            // (income keeps paying its share, but the savings are gone).
+            yearsAfterRetirement = k - 1 + (m + (fromMain + pt) / need) / 12;
+            incomeCoverageAtDepletion = Math.min(1, income / living);
+            break;
+          }
+        }
+        livingPaid += living - dust;
+        healthPaid += healthMonthly * ((living - dust) / living);
+      }
+      for (let i = 0; i < retBuckets.length; i++) {
+        const b = retBuckets[i];
+        const before = b.amount;
+        b.amount *= monthlyFactors[i];
+        const g = b.amount - before;
+        growth += g;
+        accruedGrowth[i] += g;
+      }
+      for (const pool of pools) {
+        const before = pool.amount;
+        pool.amount *= pool.monthlyFactor;
+        growth += pool.amount - before;
+      }
+      baseMonthly *= monthlyInflation;
+      healthMonthly *= healthMonthlyFactor;
+      for (let s = 0; s < incomeAmounts.length; s++) {
+        incomeAmounts[s] *= incomeFactors[s];
+      }
+    }
+
+    // ---- Year end: goals, pool leftovers, strategy, tax -----------------
+    const oneTimeForYear = depleted ? [] : (oneTimeByYear.get(year) ?? []);
     let totalOneTimeAmount = 0;
     for (const e of oneTimeForYear) {
       let remaining = e.futureValue;
@@ -718,28 +1215,17 @@ export function simulateRetirementPath(
             remaining -= drained;
             drainedFromLinked = drained;
           }
-          pool.pendingExpenseCount = Math.max(
-            0,
-            pool.pendingExpenseCount - 1,
-          );
-          // If this was the LAST pending linked expense for the pool, any
-          // leftover will roll back into the main corpus below — record it
-          // here so the user can see the surplus attached to this expense.
-          if (pool.pendingExpenseCount === 0 && pool.amount > 0) {
+          pool.pendingExpenseCount = Math.max(0, pool.pendingExpenseCount - 1);
+          // Leftover after the LAST linked goal rolls into the main corpus
+          // below.  Ignore rounding dust from an exactly-sized pool.
+          if (pool.pendingExpenseCount === 0 && pool.amount > 1) {
             surplusRolledOver = pool.amount;
           }
         }
       }
 
-      let drainedFromMain = 0;
-      let shortfall = 0;
-      if (remaining > 0) {
-        // Shortfall absorbed by main corpus.  Note: this can drive the main
-        // corpus to zero but does NOT trigger depletion on its own — only
-        // failure to fund regular expenses does (see below).
-        shortfall = withdrawRetProRata(retBuckets, remaining);
-        drainedFromMain = remaining - shortfall;
-      }
+      const drainedFromMain = remaining > 0 ? withdrawMain(remaining) : 0;
+      const shortfall = Math.max(0, remaining - drainedFromMain);
 
       expenseFundings.push({
         expenseId: e.id,
@@ -756,80 +1242,149 @@ export function simulateRetirementPath(
       totalOneTimeAmount += e.futureValue;
     }
 
-    // Roll any pool whose linked expenses are all done into the main corpus.
-    // Done in the same year so the leftover becomes available immediately —
-    // matches the real-world expectation that money set aside for a goal
-    // becomes ordinary spending money once the goal is funded.
     for (const [id, pool] of [...earmarkedPools]) {
       if (pool.pendingExpenseCount <= 0) {
-        if (pool.amount > 0) {
-          addToRetBucketsProRata(retBuckets, pool.amount);
-        }
+        addToRetBuckets(retBuckets, pool.amount, allocationShares);
         earmarkedPools.delete(id);
       }
     }
 
-    // Process regular expenses — always from the main corpus.  Earmarked
-    // pools are reserved for their linked goals and don't fund daily living.
-    const regularShortfall = withdrawRetProRata(
-      retBuckets,
-      nominalAnnualExpenses,
-    );
+    let taxPaid = 0;
+    if (!depleted) {
+      if (strategy === "rebalance") {
+        const total = sumRetBuckets(retBuckets);
+        const deficits: number[] = [];
+        for (let i = 0; i < retBuckets.length; i++) {
+          const excess = retBuckets[i].amount - total * allocationShares[i];
+          if (excess > 0) sellFrom(retBuckets[i], excess, gains);
+          deficits.push(Math.max(0, -excess));
+        }
+        for (let i = 0; i < retBuckets.length; i++) buyInto(retBuckets[i], deficits[i]);
+      } else if (strategy === "buckets" && retBuckets.length > 1) {
+        // Refill the safe bucket to `cashBufferYears` of next year's net
+        // spending (next year's spending phase, healthcare and income, at
+        // next year's prices), selling only from buckets that didn't lose
+        // money this year.
+        const next = monthlyFlows(ageAtStart + 1, year, cumulativeInflation * (1 + realisedInflation));
+        const safe = retBuckets[bySafety[0]];
+        let deficit =
+          cashBufferYears * 12 * Math.max(0, next.base + next.health - next.income) -
+          safe.amount;
+        for (const i of refillSources) {
+          if (deficit <= 0) break;
+          if (yearlyGross[i] < 1) continue;
+          const t = Math.min(deficit, retBuckets[i].amount);
+          sellFrom(retBuckets[i], t, gains);
+          buyInto(safe, t);
+          deficit -= t;
+        }
+      }
 
-    const regularThisYear = nominalAnnualExpenses;
-    const earmarkedSumNow = Array.from(earmarkedPools.values()).reduce(
-      (s, p) => s + p.amount,
-      0,
-    );
-    const corpusEnd = sumRetBuckets(retBuckets) + earmarkedSumNow;
+      // Interest-type buckets are taxed on the year's growth, withdrawn or
+      // not (sales from them record no gain, so nothing is taxed twice).
+      for (let i = 0; i < retBuckets.length; i++) {
+        if (retBuckets[i].tax === "slabYearly") gains.slab += accruedGrowth[i];
+      }
+      const taxDue =
+        (Math.max(0, gains.equity - tax.ltcgExemption) * tax.ltcgRate) / 100 +
+        (Math.max(0, gains.slab) * tax.incomeTaxRate) / 100;
+      // Gains realised while paying this tax count toward next year.
+      gains = { equity: 0, slab: 0 };
+      if (taxDue > 0) {
+        taxPaid = withdrawMain(taxDue);
+        const unpaid = taxDue - taxPaid;
+        if (unpaid > 0) {
+          const pt = poolTotal();
+          if (pt > 0 && unpaid <= pt) {
+            drawPools(unpaid, pt);
+            taxPaid += unpaid;
+          } else if (unpaid - pt <= MONEY_EPSILON) {
+            // Sub-paisa rounding dust left unpaid.
+            for (const p of earmarkedPools.values()) p.amount = 0;
+            taxPaid += pt;
+          } else {
+            for (const p of earmarkedPools.values()) p.amount = 0;
+            taxPaid += pt;
+            depleted = true;
+            depletionYear = year + 1;
+            yearsAfterRetirement = k;
+            const living = baseMonthly + healthMonthly;
+            let income = 0;
+            for (const a of incomeAmounts) income += a;
+            incomeCoverageAtDepletion = living > 0 ? Math.min(1, income / living) : 1;
+          }
+        }
+      }
+    }
+
+    cumulativeInflation *= 1 + realisedInflation;
+    const corpusEnd = sumRetBuckets(retBuckets) + poolTotal();
     lastCorpus = corpusEnd;
 
     steps.push({
       year,
-      age,
+      age: currentAge + year,
       isRetired: true,
       corpus: corpusEnd,
-      regularExpenses: regularThisYear,
+      regularExpenses: livingPaid,
+      livingCostsFromEarmarked: livingFromEarmarked,
       oneTimeExpenses: totalOneTimeAmount,
       oneTimeItems: oneTimeForYear,
       contributions: 0,
+      growth,
+      incomeReceived,
+      healthcareExpenses: healthPaid,
+      taxPaid,
+      inflationIndex: cumulativeInflation,
     });
 
-    // Depletion = the user can no longer fund regular expenses.  A
-    // shortfall in funding a one-time goal isn't depletion (the user
-    // simply couldn't fully meet that specific goal).
-    if (regularShortfall > 0 && !depleted) {
-      depleted = true;
-      const fraction =
-        nominalAnnualExpenses > 0
-          ? Math.max(
-              0,
-              Math.min(1, 1 - regularShortfall / nominalAnnualExpenses),
-            )
-          : 1;
-      yearsAfterRetirement = k - 1 + fraction;
-      break;
-    }
-
-    nominalAnnualExpenses *= 1 + realisedInflation;
+    if (depleted) break;
   }
 
-  const finalCorpus = Math.max(0, lastCorpus);
-  const survivalAge = retirementAge + yearsAfterRetirement;
+  // Goals that came due after the money ran out were never paid.  Report
+  // them instead of letting them silently vanish from the breakdown.
+  if (depleted) {
+    const unpaid = futureOneTimeExpenses
+      .filter((e) => e.yearsFromNow >= depletionYear && e.withinHorizon)
+      .sort((a, b) => a.yearsFromNow - b.yearsFromNow);
+    for (const e of unpaid) {
+      expenseFundings.push({
+        expenseId: e.id,
+        expenseName: e.name,
+        yearsFromNow: e.yearsFromNow,
+        ageWhenDue: e.ageWhenDue,
+        futureValue: e.futureValue,
+        drainedFromLinked: 0,
+        drainedFromMain: 0,
+        shortfall: e.futureValue,
+        afterDepletion: true,
+      });
+    }
+  }
 
   return {
+    currentAge,
+    retirementAge,
+    targetAge,
+    horizonAge,
     steps,
+    startingCorpus,
+    annualExpenses,
+    annualLivingAtRetirement,
+    annualIncomeAtRetirement,
     corpusAtRetirement,
     mainCorpusAtRetirement,
     earmarkedAtRetirement,
     weightedReturnAtRetirement,
+    postRetirementReturn,
     yearsAfterRetirement,
-    survivalAge,
+    survivalAge: retirementAge + yearsAfterRetirement,
     depleted,
-    finalCorpus,
+    incomeCoverageAtDepletion,
+    finalCorpus: Math.max(0, lastCorpus),
     yearsToRetirement,
     futureOneTimeExpenses,
-    cumulativeInflationToRetirement: cumulativeInflation,
+    cumulativeInflationToRetirement,
     postRetirementAllocation,
     expenseFundings,
   };
@@ -839,34 +1394,51 @@ export function simulateRetirementPath(
 // Public deterministic API
 // ---------------------------------------------------------------------------
 
+// Fisher real return, in percent: (1 + nominal) / (1 + inflation) - 1.
+export const realReturnPct = (nominalPct: number, inflationPct: number): number =>
+  ((1 + nominalPct / 100) / (1 + inflationPct / 100) - 1) * 100;
+
 export function calculateRetirement(
   params: RetirementCalculationParams,
 ): RetirementCalculationsResult {
   const sim = simulateRetirementPath(params);
-
-  const annualExpenses =
-    params.expenseType === "monthly"
-      ? Math.max(0, finiteOr(params.monthlyExpenses, 0)) * 12
-      : Math.max(0, finiteOr(params.monthlyExpenses, 0));
-  const annualExpensesAtRetirement =
-    annualExpenses * sim.cumulativeInflationToRetirement;
+  // Same floor the simulation applies.
+  const inflation = Math.max(INFLATION_FLOOR * 100, finiteOr(params.inflation, 0));
+  const netNeed = Math.max(0, sim.annualLivingAtRetirement - sim.annualIncomeAtRetirement);
 
   return {
     totalCorpus: sim.corpusAtRetirement,
     corpusAtRetirement: sim.corpusAtRetirement,
     mainCorpusAtRetirement: sim.mainCorpusAtRetirement,
     earmarkedAtRetirement: sim.earmarkedAtRetirement,
+    inflationIndexAtRetirement: sim.cumulativeInflationToRetirement,
     weightedReturn: sim.weightedReturnAtRetirement,
-    realReturn:
-      sim.weightedReturnAtRetirement - finiteOr(params.inflation, 0),
+    realReturn: realReturnPct(sim.weightedReturnAtRetirement, inflation),
+    postRetirementReturn: sim.postRetirementReturn,
+    postRetirementRealReturn: realReturnPct(sim.postRetirementReturn, inflation),
+    initialWithdrawalRate:
+      sim.mainCorpusAtRetirement > 0
+        ? netNeed / sim.mainCorpusAtRetirement
+        : netNeed > 0
+          ? Infinity
+          : 0,
+    annualIncomeAtRetirement: sim.annualIncomeAtRetirement,
+    incomeCoverageAtDepletion: sim.incomeCoverageAtDepletion,
+    currentAge: sim.currentAge,
+    retirementAge: sim.retirementAge,
+    targetAge: sim.targetAge,
+    horizonAge: sim.horizonAge,
+    startingCorpus: sim.startingCorpus,
+    inflation,
     yearsToRetirement: sim.yearsToRetirement,
     yearsAfterRetirement: sim.yearsAfterRetirement,
-    annualExpenses,
-    annualExpensesAtRetirement,
+    annualExpenses: sim.annualExpenses,
+    annualExpensesAtRetirement: sim.annualLivingAtRetirement,
     futureOneTimeExpenses: sim.futureOneTimeExpenses,
     yearlyData: sim.steps,
     survivalAge: sim.survivalAge,
     corpusLastsBeyondHorizon: !sim.depleted,
+    lastsToTargetAge: !sim.depleted || sim.survivalAge >= sim.targetAge,
     postRetirementAllocation: sim.postRetirementAllocation,
     expenseFundings: sim.expenseFundings,
   };

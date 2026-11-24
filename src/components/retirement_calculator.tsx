@@ -1,992 +1,711 @@
 import {
   AlertCircle,
   Calculator,
+  CheckCircle2,
+  Download,
   PiggyBank,
   Plus,
   Sparkles,
-  Trash2,
   TrendingUp,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Component, useEffect, useMemo, useState, type ErrorInfo, type ReactNode } from "react";
 import type {
-  FutureOneTimeExpense,
   InvestmentBucket,
-  MonteCarloResult,
   OneTimeExpense,
   PostRetirementBucket,
-  RetirementCalculationsResult,
-  YearlyProjection,
+  TaxTreatment,
 } from "../types/retirement";
-import { runMonteCarloSimulation } from "../utils/monteCarlo";
-import { calculateRetirement } from "../utils/retirement";
+import {
+  calculateRetirement,
+  DERISKED_VOLATILITY,
+  MAX_INFLATION_PERSISTENCE,
+} from "../utils/retirement";
 import {
   getInitialRetirementConfig,
+  normalizeConfig,
   saveRetirementConfig,
   type RetirementCalculatorConfig,
 } from "../utils/storage";
+import { PercentileBandChart } from "./retirement/PercentileBandChart";
+import { IncomeSection } from "./retirement/IncomeSection";
+import { PortfolioImportPanel, type ImportedBucket } from "./retirement/PortfolioImportPanel";
+import { ScenarioPanel } from "./retirement/ScenarioPanel";
+import { SolverPanel } from "./retirement/SolverPanel";
+import { SpendingSection } from "./retirement/SpendingSection";
+import { TaxSection } from "./retirement/TaxSection";
+import {
+  formatCurrency,
+  formatPct,
+  GOOD_SUCCESS_RATE,
+  inputCls,
+  optNum,
+  patchById,
+} from "./retirement/format";
+import { HELP } from "./retirement/help";
+import { toMcParams, toParams, type SetConfig } from "./retirement/params";
+import {
+  AddButton,
+  BucketRow,
+  Field,
+  InfoTip,
+  Metric,
+  NumberField,
+  OptionalNumberField,
+  RemoveButton,
+  Section,
+  TextField,
+} from "./retirement/ui";
+import { useMonteCarlo, useWorkerClient } from "./retirement/workerClient";
+
+const TAX_LABEL: Record<TaxTreatment, string> = {
+  none: "No tax (return is after tax)",
+  equity: "Equity (LTCG)",
+  slabOnSale: "Debt fund (taxed on withdrawal)",
+  slabYearly: "FD / interest (taxed yearly)",
+};
 
 const RetirementCalculator = () => {
-  const initialConfig: RetirementCalculatorConfig =
-    getInitialRetirementConfig();
+  const [config, setConfigState] = useState<RetirementCalculatorConfig>(
+    getInitialRetirementConfig,
+  );
+  const setConfig: SetConfig = setConfigState;
+  const set = <K extends keyof RetirementCalculatorConfig>(
+    key: K,
+    value: RetirementCalculatorConfig[K],
+  ) => setConfigState((c) => ({ ...c, [key]: value }));
 
-  const [currentAge, setCurrentAge] = useState<number>(
-    initialConfig.currentAge,
-  );
-  const [retirementAge, setRetirementAge] = useState<number>(
-    initialConfig.retirementAge || 60,
-  );
-  const [inflation, setInflation] = useState<number>(initialConfig.inflation);
-  const [monthlyExpenses, setMonthlyExpenses] = useState<number>(
-    initialConfig.monthlyExpenses,
-  );
-  const [expenseType, setExpenseType] = useState<"monthly" | "yearly">(
-    initialConfig.expenseType,
-  );
+  // Autosave (debounced) to this browser.
+  const [saveFailed, setSaveFailed] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setSaveFailed(!saveRetirementConfig(config)), 400);
+    return () => clearTimeout(t);
+  }, [config]);
 
-  const [investmentBuckets, setInvestmentBuckets] = useState<
-    InvestmentBucket[]
-  >(initialConfig.investmentBuckets);
+  const params = useMemo(() => toParams(config), [config]);
+  const mcParams = useMemo(() => toMcParams(config), [config]);
+  const calculations = useMemo(() => calculateRetirement(params), [params]);
+  const client = useWorkerClient();
+  const { result: monteCarlo, pending: mcPending, error: mcError } = useMonteCarlo(client, mcParams);
 
-  const [monthlySavingsBuckets, setMonthlySavingsBuckets] = useState<
-    InvestmentBucket[]
-  >(initialConfig.monthlySavingsBuckets || []);
+  const [showReal, setShowReal] = useState(true);
+  const [importOpen, setImportOpen] = useState(false);
 
-  const [oneTimeExpenses, setOneTimeExpenses] = useState<OneTimeExpense[]>(
-    initialConfig.oneTimeExpenses,
-  );
+  // ---- List helpers ------------------------------------------------------
+  const patchInvestment = (id: number, p: Partial<InvestmentBucket>) =>
+    setConfig((c) => ({ ...c, investmentBuckets: patchById(c.investmentBuckets, id, p) }));
+  const patchSaving = (id: number, p: Partial<InvestmentBucket>) =>
+    setConfig((c) => ({ ...c, monthlySavingsBuckets: patchById(c.monthlySavingsBuckets, id, p) }));
+  const patchExpense = (id: number, p: Partial<OneTimeExpense>) =>
+    setConfig((c) => ({ ...c, oneTimeExpenses: patchById(c.oneTimeExpenses, id, p) }));
+  const patchAllocation = (id: number, p: Partial<PostRetirementBucket>) =>
+    setConfig((c) => ({ ...c, postRetirementBuckets: patchById(c.postRetirementBuckets, id, p) }));
 
-  const [postRetirementBuckets, setPostRetirementBuckets] = useState<
-    PostRetirementBucket[]
-  >(initialConfig.postRetirementBuckets ?? []);
-
-  const [nextBucketId, setNextBucketId] = useState<number>(
-    initialConfig.nextBucketId,
-  );
-  const [nextSavingsBucketId, setNextSavingsBucketId] = useState<number>(
-    initialConfig.nextSavingsBucketId || 1,
-  );
-  const [nextExpenseId, setNextExpenseId] = useState<number>(
-    initialConfig.nextExpenseId,
-  );
-  const [nextPostRetirementBucketId, setNextPostRetirementBucketId] =
-    useState<number>(initialConfig.nextPostRetirementBucketId ?? 1);
-
-  // Monte Carlo controls
-  const [targetAge, setTargetAge] = useState<number>(
-    initialConfig.targetAge ?? 90,
-  );
-  const [portfolioVolatility, setPortfolioVolatility] = useState<number>(
-    initialConfig.portfolioVolatility ?? 12,
-  );
-  const [inflationVolatility, setInflationVolatility] = useState<number>(
-    initialConfig.inflationVolatility ?? 1.5,
-  );
-  const [monteCarloIterations, setMonteCarloIterations] = useState<number>(
-    initialConfig.monteCarloIterations ?? 2000,
-  );
-
-  const [saveStatus, setSaveStatus] = useState<"idle" | "saved">("idle");
-
-  const handleSave = () => {
-    saveRetirementConfig({
-      currentAge,
-      retirementAge,
-      inflation,
-      monthlyExpenses,
-      expenseType,
-      investmentBuckets,
-      monthlySavingsBuckets,
-      oneTimeExpenses,
-      postRetirementBuckets,
-      nextBucketId,
-      nextSavingsBucketId,
-      nextExpenseId,
-      nextPostRetirementBucketId,
-      targetAge,
-      portfolioVolatility,
-      inflationVolatility,
-      monteCarloIterations,
+  const importBuckets = (buckets: ImportedBucket[], mode: "replace" | "add") => {
+    setConfig((c) => {
+      const start = c.nextBucketId;
+      const added = buckets.map((b, i) => ({
+        id: start + i,
+        name: b.name,
+        amount: b.amount,
+        return: b.return,
+        volatility: b.volatility,
+      }));
+      return {
+        ...c,
+        investmentBuckets: mode === "replace" ? added : [...c.investmentBuckets, ...added],
+        nextBucketId: start + added.length,
+      };
     });
-    setSaveStatus("saved");
-    setTimeout(() => setSaveStatus("idle"), 2000);
+    setImportOpen(false);
   };
 
-  const SaveButton = () => (
-    <div className="flex items-center gap-2">
-      <button
-        onClick={handleSave}
-        className="px-4 cursor-pointer py-1 bg-blue-600 text-white rounded hover:bg-blue-700 transition"
-        type="button"
-      >
-        Save
-      </button>
-      {saveStatus === "saved" && (
-        <span className="text-green-600 text-sm font-medium">Saved!</span>
-      )}
-    </div>
+  // Sanitised values the engine actually used.
+  const planAge = calculations.targetAge;
+  const retireAge = calculations.retirementAge;
+  const horizonAge = calculations.horizonAge;
+  const toToday = (amount: number, index: number) => (index > 0 ? amount / index : amount);
+  const corpusTodayAtRetirement = toToday(
+    calculations.corpusAtRetirement,
+    calculations.inflationIndexAtRetirement,
   );
 
-  const addMonthlySavingsBucket = () => {
-    setMonthlySavingsBuckets((prev) => [
-      ...prev,
-      { id: nextSavingsBucketId, name: "New Savings", amount: 0, return: 0 },
-    ]);
-    setNextSavingsBucketId((prev) => prev + 1);
-  };
-
-  const updateMonthlySavingsBucket = (
-    id: number,
-    field: keyof InvestmentBucket,
-    value: string | number | undefined,
-  ) => {
-    setMonthlySavingsBuckets((buckets) =>
-      buckets.map((bucket) =>
-        bucket.id === id ? { ...bucket, [field]: value } : bucket,
-      ),
+  // ---- Input sanity notes (typed vs what the engine used) -----------------
+  const inputNotes: string[] = [];
+  const typed = (v: number) => (Number.isFinite(v) ? Math.round(v) : NaN);
+  if (![config.currentAge, config.retirementAge, config.targetAge].every((a) => Number.isInteger(a))) {
+    inputNotes.push("Ages are rounded to whole years.");
+  }
+  if (calculations.currentAge !== typed(config.currentAge)) {
+    inputNotes.push(`Current age is taken as ${calculations.currentAge}.`);
+  }
+  if (calculations.retirementAge !== typed(config.retirementAge)) {
+    inputNotes.push(
+      calculations.retirementAge === calculations.currentAge &&
+        typed(config.retirementAge) < calculations.currentAge
+        ? `Retirement age is below your current age, so the plan treats you as retired from today (age ${calculations.currentAge}).`
+        : `Retirement age is taken as ${calculations.retirementAge}.`,
     );
-  };
-
-  const removeMonthlySavingsBucket = (id: number) => {
-    setMonthlySavingsBuckets((buckets) =>
-      buckets.filter((bucket) => bucket.id !== id),
+  }
+  if (planAge !== typed(config.targetAge)) {
+    inputNotes.push(
+      typed(config.targetAge) <= calculations.retirementAge
+        ? `"Plan until age" has to be after the retirement age (${calculations.retirementAge}), so ${planAge} is used.`
+        : `"Plan until age" is capped at ${planAge}.`,
     );
-    // Scrub any one-time expense that was linked to this bucket so the
-    // dropdown shows "general corpus" instead of leaving a dangling reference.
-    setOneTimeExpenses((expenses) =>
-      expenses.map((e) =>
-        e.linkedSavingsBucketId === id
-          ? { ...e, linkedSavingsBucketId: undefined }
-          : e,
-      ),
+  }
+  if (calculations.yearsToRetirement === 0 && config.monthlySavingsBuckets.some((b) => b.amount > 0)) {
+    inputNotes.push("You are already retired, so the monthly savings buckets are not used.");
+  }
+  const beyondHorizon = calculations.futureOneTimeExpenses.filter((e) => !e.withinHorizon);
+  if (beyondHorizon.length > 0) {
+    inputNotes.push(
+      `${beyondHorizon.map((e) => e.name || "Unnamed expense").join(", ")} fall${
+        beyondHorizon.length === 1 ? "s" : ""
+      } after age ${horizonAge} and ${beyondHorizon.length === 1 ? "is" : "are"} left out of the plan.`,
     );
-  };
+  }
 
-  const addInvestmentBucket = () => {
-    setInvestmentBuckets((prev) => [
-      ...prev,
-      { id: nextBucketId, name: "New Investment", amount: 0, return: 0 },
-    ]);
-    setNextBucketId((prev) => prev + 1);
-  };
+  // ---- Headline verdict ------------------------------------------------
+  const survivalAgeFloor = Math.floor(calculations.survivalAge);
+  const deterministicLasts = calculations.corpusLastsBeyondHorizon
+    ? `beyond age ${horizonAge}`
+    : `until age ${survivalAgeFloor}`;
+  const verdict: "good" | "fragile" | "fails" | "pending" = !calculations.lastsToTargetAge
+    ? "fails"
+    : !monteCarlo
+      ? "pending"
+      : monteCarlo.successRate >= GOOD_SUCCESS_RATE
+        ? "good"
+        : "fragile";
+  const withdrawalRate = calculations.initialWithdrawalRate;
+  const coverage = calculations.incomeCoverageAtDepletion;
 
-  const updateInvestmentBucket = (
-    id: number,
-    field: keyof InvestmentBucket,
-    value: string | number,
-  ) => {
-    setInvestmentBuckets((buckets) =>
-      buckets.map((bucket) =>
-        bucket.id === id ? { ...bucket, [field]: value } : bucket,
-      ),
-    );
-  };
-
-  const removeInvestmentBucket = (id: number) => {
-    setInvestmentBuckets((buckets) =>
-      buckets.filter((bucket) => bucket.id !== id),
-    );
-  };
-
-  const addOneTimeExpense = () => {
-    setOneTimeExpenses((prev) => [
-      ...prev,
-      {
-        id: nextExpenseId,
-        name: "New Expense",
-        yearsFromNow: 1,
-        currentCost: 0,
-        inflationRate: 6,
-      },
-    ]);
-    setNextExpenseId((prev) => prev + 1);
-  };
-
-  const updateOneTimeExpense = (
-    id: number,
-    field: keyof OneTimeExpense,
-    value: string | number | undefined,
-  ) => {
-    setOneTimeExpenses((expenses) =>
-      expenses.map((expense) =>
-        expense.id === id ? { ...expense, [field]: value } : expense,
-      ),
-    );
-  };
-
-  const removeOneTimeExpense = (id: number) => {
-    setOneTimeExpenses((expenses) =>
-      expenses.filter((expense) => expense.id !== id),
-    );
-  };
-
-  const addPostRetirementBucket = () => {
-    setPostRetirementBuckets((prev) => [
-      ...prev,
-      {
-        id: nextPostRetirementBucketId,
-        name: "New Bucket",
-        allocationPct: 0,
-        return: 8,
-      },
-    ]);
-    setNextPostRetirementBucketId((prev) => prev + 1);
-  };
-
-  const updatePostRetirementBucket = (
-    id: number,
-    field: keyof PostRetirementBucket,
-    value: string | number,
-  ) => {
-    setPostRetirementBuckets((buckets) =>
-      buckets.map((b) => (b.id === id ? { ...b, [field]: value } : b)),
-    );
-  };
-
-  const removePostRetirementBucket = (id: number) => {
-    setPostRetirementBuckets((buckets) => buckets.filter((b) => b.id !== id));
-  };
-
-  const calculations: RetirementCalculationsResult = useMemo(
-    () =>
-      calculateRetirement({
-        currentAge,
-        retirementAge,
-        inflation,
-        monthlyExpenses,
-        expenseType,
-        investmentBuckets,
-        monthlySavingsBuckets,
-        oneTimeExpenses,
-        postRetirementBuckets,
-        targetAge,
-      }),
-    [
-      currentAge,
-      retirementAge,
-      inflation,
-      monthlyExpenses,
-      expenseType,
-      investmentBuckets,
-      monthlySavingsBuckets,
-      oneTimeExpenses,
-      postRetirementBuckets,
-      targetAge,
-    ],
-  );
-
-  // Monte Carlo — recomputes when any of the same inputs change. With the
-  // default 2000 iterations this finishes in well under 100ms in practice,
-  // so running on every input change is acceptable.
-  const monteCarlo: MonteCarloResult = useMemo(
-    () =>
-      runMonteCarloSimulation({
-        currentAge,
-        retirementAge,
-        inflation,
-        monthlyExpenses,
-        expenseType,
-        investmentBuckets,
-        monthlySavingsBuckets,
-        oneTimeExpenses,
-        postRetirementBuckets,
-        targetAge,
-        portfolioVolatility,
-        inflationVolatility,
-        iterations: Math.max(100, Math.min(20000, monteCarloIterations)),
-        seed: 42,
-      }),
-    [
-      currentAge,
-      retirementAge,
-      inflation,
-      monthlyExpenses,
-      expenseType,
-      investmentBuckets,
-      monthlySavingsBuckets,
-      oneTimeExpenses,
-      postRetirementBuckets,
-      targetAge,
-      portfolioVolatility,
-      inflationVolatility,
-      monteCarloIterations,
-    ],
-  );
-
-  const formatCurrency = (amount: number) => {
-    if (amount >= 10000000) {
-      return `₹${(amount / 10000000).toFixed(1)} Cr`;
-    } else if (amount >= 100000) {
-      return `₹${(amount / 100000).toFixed(1)} L`;
-    }
-    return `₹${Math.round(amount).toLocaleString("en-IN")}`;
-  };
+  const finalCorpus = monteCarlo
+    ? showReal
+      ? { p10: monteCarlo.realP10FinalCorpus, p50: monteCarlo.realMedianFinalCorpus, p90: monteCarlo.realP90FinalCorpus }
+      : { p10: monteCarlo.p10FinalCorpus, p50: monteCarlo.medianFinalCorpus, p90: monteCarlo.p90FinalCorpus }
+    : null;
 
   return (
-    <div className="max-w-7xl mx-auto p-6 bg-white">
-      <div className="text-center mb-8">
-        <h1 className="text-3xl font-bold text-gray-800 mb-2 flex items-center justify-center gap-2">
+    <div className="mx-auto max-w-7xl bg-white p-4 sm:p-6">
+      <div className="mb-8 text-center">
+        <h1 className="mb-2 flex items-center justify-center gap-2 text-3xl font-bold text-gray-800">
           <Calculator className="text-blue-600" />
           Retirement Calculator
         </h1>
         <p className="text-gray-600">
           Plan your retirement with dynamic investment buckets, one-time
-          expenses, and Monte Carlo simulation
+          expenses, retirement income, tax and Monte Carlo simulation
         </p>
       </div>
 
-      <div className="grid lg:grid-cols-2 gap-8">
-        {/* Input Section */}
-        <div className="space-y-6">
-          {/* Basic Details */}
-          <div className="bg-blue-50 p-6 rounded-lg">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xl font-semibold text-blue-800">
-                Basic Details
-              </h2>
-              <SaveButton />
-            </div>
+      <div className="grid gap-8 lg:grid-cols-2">
+        {/* ================= Inputs ================= */}
+        <div className="min-w-0 space-y-6">
+          <Section
+            title="Basic Details"
+            help={HELP.basics}
+            tone="bg-blue-50 text-blue-800"
+            actions={
+              <span className={`flex items-center text-xs ${saveFailed ? "text-red-700" : "text-gray-500"}`}>
+                {saveFailed ? "Not saved (browser storage blocked)" : "Saved automatically"}
+                <InfoTip text={HELP.autosave} label="Saved automatically" />
+              </span>
+            }
+          >
             <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Current Age
-                </label>
-                <input
-                  type="number"
-                  value={currentAge}
-                  onChange={(e) => setCurrentAge(Number(e.target.value))}
-                  className="w-full p-2 border border-gray-300 rounded-md"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Retirement Age
-                </label>
-                <input
-                  type="number"
-                  value={retirementAge}
-                  onChange={(e) => setRetirementAge(Number(e.target.value))}
-                  className="w-full p-2 border border-gray-300 rounded-md"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Expected Inflation (%)
-                </label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={inflation}
-                  onChange={(e) => setInflation(Number(e.target.value))}
-                  className="w-full p-2 border border-gray-300 rounded-md"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Expense Type
-                </label>
-                <select
-                  value={expenseType}
-                  onChange={(e) =>
-                    setExpenseType(e.target.value as "monthly" | "yearly")
+              <NumberField
+                label="Current Age"
+                help={HELP.currentAge}
+                labelClassName="text-sm font-medium text-gray-700"
+                value={config.currentAge}
+                onChange={(v) => set("currentAge", v)}
+              />
+              <NumberField
+                label="Retirement Age"
+                help={HELP.retirementAge}
+                labelClassName="text-sm font-medium text-gray-700"
+                value={config.retirementAge}
+                onChange={(v) => set("retirementAge", v)}
+              />
+              <NumberField
+                label="Expected Inflation (%)"
+                help={HELP.inflation}
+                labelClassName="text-sm font-medium text-gray-700"
+                step="0.1"
+                value={config.inflation}
+                onChange={(v) => set("inflation", v)}
+              />
+              <Field label="Expense Type" help={HELP.expenseType} labelClassName="text-sm font-medium text-gray-700">
+                {(id) => (
+                  <select
+                    id={id}
+                    value={config.expenseType}
+                    onChange={(e) => set("expenseType", e.target.value as "monthly" | "yearly")}
+                    className={inputCls}
+                  >
+                    <option value="monthly">Monthly</option>
+                    <option value="yearly">Yearly</option>
+                  </select>
+                )}
+              </Field>
+              <NumberField
+                label={`${config.expenseType === "monthly" ? "Monthly" : "Yearly"} spend in retirement, today's ₹ (${formatCurrency(config.monthlyExpenses)})`}
+                help={HELP.spend}
+                labelClassName="text-sm font-medium text-gray-700"
+                value={config.monthlyExpenses}
+                onChange={(v) => set("monthlyExpenses", v)}
+              />
+              <NumberField
+                label="Plan Until Age"
+                help={HELP.planAge}
+                labelClassName="text-sm font-medium text-gray-700"
+                value={config.targetAge}
+                onChange={(v) => set("targetAge", v)}
+              />
+            </div>
+            {inputNotes.length > 0 && (
+              <ul className="mt-3 space-y-1 rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800">
+                {inputNotes.map((note) => (
+                  <li key={note} className="flex gap-1">
+                    <AlertCircle size={14} className="mt-px shrink-0" />
+                    {note}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Section>
+
+          {/* Existing investments */}
+          <Section
+            title="Existing Investment Buckets"
+            help={HELP.existing}
+            tone="bg-green-50 text-green-800"
+            actions={
+              <>
+                <button
+                  type="button"
+                  onClick={() => setImportOpen((o) => !o)}
+                  className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md border border-green-600 bg-white px-3 py-1 text-sm text-green-800 hover:bg-green-100"
+                >
+                  <Download size={16} />
+                  Import from Portfolio
+                </button>
+                <AddButton
+                  onClick={() =>
+                    setConfig((c) => ({
+                      ...c,
+                      investmentBuckets: [...c.investmentBuckets, { id: c.nextBucketId, name: "New Investment", amount: 0, return: 0 }],
+                      nextBucketId: c.nextBucketId + 1,
+                    }))
                   }
-                  className="w-full p-2 border border-gray-300 rounded-md"
+                  tone="bg-green-600 hover:bg-green-700"
                 >
-                  <option value="monthly">Monthly</option>
-                  <option value="yearly">Yearly</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Expected {expenseType === "monthly" ? "Monthly" : "Yearly"}{" "}
-                  Expenses ({formatCurrency(monthlyExpenses)})
-                </label>
-                <input
-                  type="number"
-                  value={monthlyExpenses}
-                  onChange={(e) => setMonthlyExpenses(Number(e.target.value))}
-                  className="w-full p-2 border border-gray-300 rounded-md"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Plan Until Age
-                </label>
-                <input
-                  type="number"
-                  value={targetAge}
-                  onChange={(e) => setTargetAge(Number(e.target.value))}
-                  className="w-full p-2 border border-gray-300 rounded-md"
-                />
-              </div>
-            </div>
-          </div>
-
-          {/* Existing Investment Buckets */}
-          <div className="bg-green-50 p-6 rounded-lg">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xl font-semibold text-green-800">
-                Existing Investment Buckets
-              </h2>
-              <button
-                onClick={addInvestmentBucket}
-                className="flex items-center gap-1 px-3 py-1 bg-green-600 text-white rounded-md hover:bg-green-700 text-sm"
-              >
-                <Plus size={16} />
-                Add Bucket
-              </button>
-            </div>
-
-            {investmentBuckets.map((bucket) => (
-              <div
+                  <Plus size={16} />
+                  Add Bucket
+                </AddButton>
+              </>
+            }
+          >
+            {importOpen && (
+              <PortfolioImportPanel
+                onImport={importBuckets}
+                onClose={() => setImportOpen(false)}
+                defaultTaxRate={config.tax.incomeTaxRate}
+              />
+            )}
+            {config.investmentBuckets.map((bucket) => (
+              <BucketRow
                 key={bucket.id}
-                className="mb-4 p-4 bg-white rounded-md border"
-              >
-                <div className="grid grid-cols-12 gap-3 items-center">
-                  <div className="col-span-4">
-                    <label className="block text-xs text-gray-600 mb-1">
-                      Investment Name
-                    </label>
-                    <input
-                      type="text"
-                      value={bucket.name}
-                      onChange={(e) =>
-                        updateInvestmentBucket(
-                          bucket.id,
-                          "name",
-                          e.target.value,
-                        )
-                      }
-                      className="w-full p-2 text-sm border border-gray-300 rounded"
-                      placeholder="e.g., Crypto, Gold, etc."
-                    />
-                  </div>
-                  <div className="col-span-3">
-                    <label className="block text-xs text-gray-600 mb-1">
-                      Amount ({formatCurrency(bucket.amount)})
-                    </label>
-                    <input
-                      type="number"
-                      value={bucket.amount}
-                      onChange={(e) =>
-                        updateInvestmentBucket(
-                          bucket.id,
-                          "amount",
-                          Number(e.target.value),
-                        )
-                      }
-                      className="w-full p-2 text-sm border border-gray-300 rounded"
-                    />
-                  </div>
-                  <div className="col-span-3">
-                    <label className="block text-xs text-gray-600 mb-1">
-                      Post-tax Return (%)
-                    </label>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={bucket.return}
-                      onChange={(e) =>
-                        updateInvestmentBucket(
-                          bucket.id,
-                          "return",
-                          Number(e.target.value),
-                        )
-                      }
-                      className="w-full p-2 text-sm border border-gray-300 rounded"
-                    />
-                  </div>
-                  <div className="col-span-2">
-                    <button
-                      onClick={() => removeInvestmentBucket(bucket.id)}
-                      className="w-full p-2 text-red-600 hover:bg-red-50 rounded"
-                      disabled={investmentBuckets.length === 1}
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                  </div>
-                </div>
-              </div>
+                nameLabel="Investment Name"
+                name={bucket.name}
+                namePlaceholder="e.g., Crypto, Gold, etc."
+                onName={(v) => patchInvestment(bucket.id, { name: v })}
+                middle={
+                  <NumberField
+                    label={`Amount (${formatCurrency(bucket.amount)})`}
+                    help={HELP.amount}
+                    value={bucket.amount}
+                    onChange={(v) => patchInvestment(bucket.id, { amount: v })}
+                  />
+                }
+                rate={bucket.return}
+                onRate={(v) => patchInvestment(bucket.id, { return: v })}
+                volatility={bucket.volatility}
+                onVolatility={(v) => patchInvestment(bucket.id, { volatility: v })}
+                defaultVolatility={config.portfolioVolatility}
+                onRemove={() =>
+                  setConfig((c) => ({ ...c, investmentBuckets: c.investmentBuckets.filter((b) => b.id !== bucket.id) }))
+                }
+                removeDisabled={config.investmentBuckets.length === 1}
+              />
             ))}
-          </div>
+          </Section>
 
-          {/* Monthly Savings Buckets */}
-          <div className="bg-indigo-50 p-6 rounded-lg">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xl font-semibold text-indigo-800">
-                Monthly Savings Buckets
-              </h2>
-              <button
-                onClick={addMonthlySavingsBucket}
-                className="flex items-center gap-1 px-3 py-1 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 text-sm"
+          {/* Monthly savings */}
+          <Section
+            title="Monthly Savings Buckets"
+            help={HELP.savings}
+            tone="bg-indigo-50 text-indigo-800"
+            actions={
+              <AddButton
+                onClick={() =>
+                  setConfig((c) => ({
+                    ...c,
+                    monthlySavingsBuckets: [
+                      ...c.monthlySavingsBuckets,
+                      { id: c.nextSavingsBucketId, name: "New Savings", amount: 0, return: 0 },
+                    ],
+                    nextSavingsBucketId: c.nextSavingsBucketId + 1,
+                  }))
+                }
+                tone="bg-indigo-600 hover:bg-indigo-700"
               >
                 <Plus size={16} />
                 Add Bucket
-              </button>
-            </div>
-            {monthlySavingsBuckets.map((bucket) => {
-              const linkedExpenses = oneTimeExpenses.filter(
-                (e) => e.linkedSavingsBucketId === bucket.id,
-              );
+              </AddButton>
+            }
+          >
+            {config.monthlySavingsBuckets.length === 0 && (
+              <p className="text-xs text-gray-600">
+                No monthly savings added. Add your SIPs, RDs or PF contributions.
+              </p>
+            )}
+            {config.monthlySavingsBuckets.map((bucket) => {
+              const linkedExpenses = config.oneTimeExpenses.filter((e) => e.linkedSavingsBucketId === bucket.id);
               const hasGlide =
-                bucket.targetRate !== undefined &&
-                bucket.glideYears !== undefined &&
-                bucket.glideYears > 0;
+                bucket.targetRate !== undefined && bucket.glideYears !== undefined && bucket.glideYears > 0;
               return (
-                <div
+                <BucketRow
                   key={bucket.id}
-                  className="mb-4 p-4 bg-white rounded-md border"
+                  nameLabel="Bucket Name"
+                  name={bucket.name}
+                  namePlaceholder="e.g., SIP, Recurring Deposit, etc."
+                  onName={(v) => patchSaving(bucket.id, { name: v })}
+                  middle={
+                    <NumberField
+                      label={`Per month (${formatCurrency(bucket.amount)})`}
+                      help={HELP.monthly}
+                      value={bucket.amount}
+                      onChange={(v) => patchSaving(bucket.id, { amount: v })}
+                    />
+                  }
+                  rate={bucket.return}
+                  onRate={(v) => patchSaving(bucket.id, { return: v })}
+                  volatility={bucket.volatility}
+                  onVolatility={(v) => patchSaving(bucket.id, { volatility: v })}
+                  defaultVolatility={config.portfolioVolatility}
+                  onRemove={() =>
+                    setConfig((c) => ({
+                      ...c,
+                      monthlySavingsBuckets: c.monthlySavingsBuckets.filter((b) => b.id !== bucket.id),
+                      // Unlink goals that pointed at this bucket.
+                      oneTimeExpenses: c.oneTimeExpenses.map((e) =>
+                        e.linkedSavingsBucketId === bucket.id ? { ...e, linkedSavingsBucketId: undefined } : e,
+                      ),
+                    }))
+                  }
                 >
-                  <div className="grid grid-cols-12 gap-3 items-center">
-                    <div className="col-span-4">
-                      <label className="block text-xs text-gray-600 mb-1">
-                        Bucket Name
-                      </label>
-                      <input
-                        type="text"
-                        value={bucket.name}
-                        onChange={(e) =>
-                          updateMonthlySavingsBucket(
-                            bucket.id,
-                            "name",
-                            e.target.value,
-                          )
-                        }
-                        className="w-full p-2 text-sm border border-gray-300 rounded"
-                        placeholder="e.g., SIP, Recurring Deposit, etc."
-                      />
-                    </div>
-                    <div className="col-span-3">
-                      <label className="block text-xs text-gray-600 mb-1">
-                        Monthly Amount: {formatCurrency(bucket.amount)}
-                      </label>
-                      <input
-                        type="number"
-                        value={bucket.amount}
-                        onChange={(e) =>
-                          updateMonthlySavingsBucket(
-                            bucket.id,
-                            "amount",
-                            Number(e.target.value),
-                          )
-                        }
-                        className="w-full p-2 text-sm border border-gray-300 rounded"
-                      />
-                    </div>
-                    <div className="col-span-3">
-                      <label className="block text-xs text-gray-600 mb-1">
-                        Expected Return (%)
-                      </label>
-                      <input
-                        type="number"
-                        step="0.1"
-                        value={bucket.return}
-                        onChange={(e) =>
-                          updateMonthlySavingsBucket(
-                            bucket.id,
-                            "return",
-                            Number(e.target.value),
-                          )
-                        }
-                        className="w-full p-2 text-sm border border-gray-300 rounded"
-                      />
-                    </div>
-                    <div className="col-span-2">
-                      <button
-                        onClick={() => removeMonthlySavingsBucket(bucket.id)}
-                        className="w-full p-2 text-red-600 hover:bg-red-50 rounded"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* De-risk-before-goal sub-row */}
-                  <div className="mt-3 pt-3 border-t border-gray-100">
-                    <div className="flex items-center gap-2 mb-2">
+                  <div className="mt-3 grid grid-cols-12 items-end gap-3 border-t border-gray-100 pt-3">
+                    <OptionalNumberField
+                      className="col-span-6 sm:col-span-4"
+                      label="Yearly increase %"
+                      help={HELP.stepUp}
+                      step="1"
+                      placeholder="0"
+                      value={bucket.stepUpPct}
+                      onChange={(v) => patchSaving(bucket.id, { stepUpPct: v })}
+                    />
+                    <div className="col-span-6 flex items-center gap-2 pb-2 sm:col-span-8">
                       <input
                         type="checkbox"
                         id={`glide-toggle-${bucket.id}`}
                         checked={hasGlide}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            // Enable: prefill safer default rate (6%) and a
-                            // 3-year glide window if not already configured.
-                            updateMonthlySavingsBucket(
-                              bucket.id,
-                              "targetRate",
-                              bucket.targetRate ?? 6,
-                            );
-                            updateMonthlySavingsBucket(
-                              bucket.id,
-                              "glideYears",
-                              bucket.glideYears && bucket.glideYears > 0
-                                ? bucket.glideYears
-                                : 3,
-                            );
-                          } else {
-                            updateMonthlySavingsBucket(
-                              bucket.id,
-                              "targetRate",
-                              undefined,
-                            );
-                            updateMonthlySavingsBucket(
-                              bucket.id,
-                              "glideYears",
-                              undefined,
-                            );
-                          }
-                        }}
+                        onChange={(e) =>
+                          patchSaving(
+                            bucket.id,
+                            e.target.checked
+                              ? {
+                                  targetRate: bucket.targetRate ?? 6,
+                                  glideYears: bucket.glideYears && bucket.glideYears > 0 ? bucket.glideYears : 3,
+                                }
+                              : { targetRate: undefined, glideYears: undefined },
+                          )
+                        }
                       />
-                      <label
-                        htmlFor={`glide-toggle-${bucket.id}`}
-                        className="text-xs text-gray-700 font-medium"
-                      >
+                      <label htmlFor={`glide-toggle-${bucket.id}`} className="text-xs font-medium text-gray-700">
                         De-risk before goal
                       </label>
+                      <InfoTip text={HELP.glide} label="De-risk before goal" />
                     </div>
-                    {hasGlide && (
-                      <div className="grid grid-cols-12 gap-3 items-center">
-                        <div className="col-span-5">
-                          <label className="block text-xs text-gray-600 mb-1">
-                            Target rate (%) near goal
-                          </label>
-                          <input
-                            type="number"
-                            step="0.1"
-                            value={bucket.targetRate ?? ""}
-                            onChange={(e) =>
-                              updateMonthlySavingsBucket(
-                                bucket.id,
-                                "targetRate",
-                                e.target.value === ""
-                                  ? undefined
-                                  : Number(e.target.value),
-                              )
-                            }
-                            className="w-full p-2 text-sm border border-gray-300 rounded"
-                          />
-                        </div>
-                        <div className="col-span-5">
-                          <label className="block text-xs text-gray-600 mb-1">
-                            Glide window (years)
-                          </label>
-                          <input
-                            type="number"
-                            step="1"
-                            min={1}
-                            value={bucket.glideYears ?? ""}
-                            onChange={(e) =>
-                              updateMonthlySavingsBucket(
-                                bucket.id,
-                                "glideYears",
-                                e.target.value === ""
-                                  ? undefined
-                                  : Math.max(1, Math.floor(Number(e.target.value))),
-                              )
-                            }
-                            className="w-full p-2 text-sm border border-gray-300 rounded"
-                          />
-                        </div>
-                      </div>
-                    )}
-                    {hasGlide && linkedExpenses.length === 0 && (
-                      <p className="text-xs text-amber-700 mt-1">
-                        Link a one-time expense (below) for this glide to
-                        kick in. Without a linked goal, the glide has no
-                        effect.
+                  </div>
+                  {hasGlide && (
+                    <div className="mt-2 grid grid-cols-2 items-end gap-3">
+                      <OptionalNumberField
+                        label="Target rate (%) near goal"
+                        help={HELP.targetRate}
+                        step="0.1"
+                        value={bucket.targetRate}
+                        onChange={(v) => patchSaving(bucket.id, { targetRate: v })}
+                      />
+                      <OptionalNumberField
+                        label="Glide window (years)"
+                        help={HELP.glideYears}
+                        step="1"
+                        min={1}
+                        value={bucket.glideYears}
+                        onChange={(v) =>
+                          patchSaving(bucket.id, { glideYears: v === undefined ? undefined : Math.max(1, Math.floor(v)) })
+                        }
+                      />
+                    </div>
+                  )}
+                  {hasGlide && linkedExpenses.length === 0 && (
+                    <p className="mt-1 text-xs text-amber-700">
+                      Link a one-time expense (below) for this glide to kick in.
+                      Without a linked goal, the glide has no effect.
+                    </p>
+                  )}
+                  {hasGlide && linkedExpenses.length > 0 && (
+                    <p className="mt-1 text-xs text-gray-500">
+                      Over the last {bucket.glideYears} year(s) before the next
+                      pending goal ({linkedExpenses.map((e) => e.name).join(", ")}),
+                      the money moves into a safer asset: the return slides from{" "}
+                      {bucket.return}% to {bucket.targetRate}% and the Monte Carlo
+                      volatility drops toward {DERISKED_VOLATILITY}%.
+                    </p>
+                  )}
+                </BucketRow>
+              );
+            })}
+          </Section>
+
+          {/* One-time expenses */}
+          <Section
+            title="One-Time Expenses"
+            help={HELP.oneTime}
+            tone="bg-orange-50 text-orange-800"
+            actions={
+              <AddButton
+                onClick={() =>
+                  setConfig((c) => ({
+                    ...c,
+                    oneTimeExpenses: [
+                      ...c.oneTimeExpenses,
+                      { id: c.nextExpenseId, name: "New Expense", yearsFromNow: 1, currentCost: 0, inflationRate: 6 },
+                    ],
+                    nextExpenseId: c.nextExpenseId + 1,
+                  }))
+                }
+                tone="bg-orange-600 hover:bg-orange-700"
+              >
+                <Plus size={16} />
+                Add Expense
+              </AddButton>
+            }
+          >
+            {config.oneTimeExpenses.map((expense) => {
+              const future = calculations.futureOneTimeExpenses.find((e) => e.id === expense.id);
+              const earmarked =
+                expense.linkedSavingsBucketId !== undefined &&
+                future !== undefined &&
+                future.withinHorizon &&
+                future.yearsFromNow > calculations.yearsToRetirement;
+              return (
+                <div key={expense.id} className="mb-4 rounded-md border bg-white p-4">
+                  <div className="grid grid-cols-12 items-end gap-3">
+                    <TextField
+                      className="order-1 col-span-10 sm:order-none sm:col-span-3"
+                      label="Expense Name"
+                      value={expense.name}
+                      onChange={(v) => patchExpense(expense.id, { name: v })}
+                      placeholder="e.g., Car, Education"
+                    />
+                    <NumberField
+                      className="order-3 col-span-4 sm:order-none sm:col-span-2"
+                      label="Years from now"
+                      help={HELP.yearsFromNow}
+                      value={expense.yearsFromNow}
+                      onChange={(v) => patchExpense(expense.id, { yearsFromNow: v })}
+                    />
+                    <NumberField
+                      className="order-4 col-span-5 sm:order-none sm:col-span-3"
+                      label={`Cost today (${formatCurrency(expense.currentCost)})`}
+                      help={HELP.costToday}
+                      value={expense.currentCost}
+                      onChange={(v) => patchExpense(expense.id, { currentCost: v })}
+                    />
+                    <NumberField
+                      className="order-5 col-span-3 sm:order-none sm:col-span-3"
+                      label="Inflation %"
+                      help={HELP.expenseInflation}
+                      step="0.1"
+                      value={expense.inflationRate}
+                      onChange={(v) => patchExpense(expense.id, { inflationRate: v })}
+                    />
+                    <div className="order-2 col-span-2 sm:order-none sm:col-span-1">
+                      <RemoveButton
+                        onClick={() =>
+                          setConfig((c) => ({ ...c, oneTimeExpenses: c.oneTimeExpenses.filter((e) => e.id !== expense.id) }))
+                        }
+                        name={expense.name}
+                      />
+                    </div>
+                  </div>
+                  {future && (
+                    <p className="mt-2 text-xs text-gray-500">
+                      Due at age {future.ageWhenDue}, costing about {formatCurrency(future.futureValue)} then.
+                    </p>
+                  )}
+                  <div className="mt-3 border-t border-gray-100 pt-3">
+                    <div className="flex items-center gap-2">
+                      <label htmlFor={`fund-${expense.id}`} className="whitespace-nowrap text-xs text-gray-600">
+                        Funded by:
+                      </label>
+                      <InfoTip text={HELP.fundedBy} label="Funded by" />
+                      <select
+                        id={`fund-${expense.id}`}
+                        value={expense.linkedSavingsBucketId ?? ""}
+                        onChange={(ev) => patchExpense(expense.id, { linkedSavingsBucketId: optNum(ev.target.value) })}
+                        disabled={config.monthlySavingsBuckets.length === 0}
+                        className="min-w-0 flex-1 rounded border border-gray-300 bg-white p-2 text-sm disabled:bg-gray-100 disabled:text-gray-400"
+                      >
+                        <option value="">(general corpus, pro-rata)</option>
+                        {config.monthlySavingsBuckets.map((b) => (
+                          <option key={b.id} value={b.id}>
+                            {b.name || `Bucket #${b.id}`}: {formatCurrency(b.amount)}/mo @ {b.return}%
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    {config.monthlySavingsBuckets.length === 0 ? (
+                      <p className="mt-1 text-xs text-gray-500">
+                        Tip: add a Monthly Savings Bucket above to earmark funds for
+                        this expense (sinking fund). Without a link, the cost is
+                        pulled pro-rata from your existing investments.
                       </p>
-                    )}
-                    {hasGlide && linkedExpenses.length > 0 && (
-                      <p className="text-xs text-gray-500 mt-1">
-                        Rate transitions from {bucket.return}% → {bucket.targetRate}%
-                        over the last {bucket.glideYears} year(s) before the
-                        next pending goal (
-                        {linkedExpenses
-                          .map((e) => e.name)
-                          .join(", ")}
-                        ).
+                    ) : expense.linkedSavingsBucketId !== undefined && future !== undefined && !future.withinHorizon ? (
+                      <p className="mt-1 text-xs text-amber-700">
+                        This expense falls after age {horizonAge}, so it is left out
+                        of the plan and doesn't hold any money back for it.
                       </p>
-                    )}
+                    ) : earmarked ? (
+                      <p className="mt-1 text-xs text-gray-500">
+                        This expense is after retirement. On your retirement day,
+                        only what it needs (its cost discounted at the SIP's rate)
+                        is set aside from the SIP and keeps growing until the
+                        expense is paid; the rest joins your retirement money.
+                        The set-aside money only pays living costs if everything
+                        else runs out first.
+                      </p>
+                    ) : null}
                   </div>
                 </div>
               );
             })}
-          </div>
+          </Section>
 
-          {/* One-Time Expenses */}
-          <div className="bg-orange-50 p-6 rounded-lg">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xl font-semibold text-orange-800">
-                One-Time Expenses
-              </h2>
-              <button
-                onClick={addOneTimeExpense}
-                className="flex items-center gap-1 px-3 py-1 bg-orange-600 text-white rounded-md hover:bg-orange-700 text-sm"
-              >
-                <Plus size={16} />
-                Add Expense
-              </button>
-            </div>
+          <IncomeSection config={config} setConfig={setConfig} />
+          <SpendingSection config={config} setConfig={setConfig} />
 
-            {oneTimeExpenses.map((expense) => (
-              <div
-                key={expense.id}
-                className="mb-4 p-4 bg-white rounded-md border"
-              >
-                <div className="grid grid-cols-12 gap-3 items-center">
-                  <div className="col-span-3">
-                    <label className="block text-xs text-gray-600 mb-1">
-                      Expense Name
-                    </label>
-                    <input
-                      type="text"
-                      value={expense.name}
-                      onChange={(e) =>
-                        updateOneTimeExpense(
-                          expense.id,
-                          "name",
-                          e.target.value,
-                        )
-                      }
-                      className="w-full p-2 text-sm border border-gray-300 rounded"
-                      placeholder="e.g., Car, Education"
-                    />
-                  </div>
-                  <div className="col-span-2">
-                    <label className="block text-xs text-gray-600 mb-1">
-                      Years from Now
-                    </label>
-                    <input
-                      type="number"
-                      value={expense.yearsFromNow}
-                      onChange={(e) =>
-                        updateOneTimeExpense(
-                          expense.id,
-                          "yearsFromNow",
-                          Number(e.target.value),
-                        )
-                      }
-                      className="w-full p-2 text-sm border border-gray-300 rounded"
-                    />
-                  </div>
-                  <div className="col-span-3">
-                    <label className="block text-xs text-gray-600 mb-1">
-                      Current Cost ({formatCurrency(expense.currentCost)})
-                    </label>
-                    <input
-                      type="number"
-                      value={expense.currentCost}
-                      onChange={(e) =>
-                        updateOneTimeExpense(
-                          expense.id,
-                          "currentCost",
-                          Number(e.target.value),
-                        )
-                      }
-                      className="w-full p-2 text-sm border border-gray-300 rounded"
-                    />
-                  </div>
-                  <div className="col-span-2">
-                    <label className="block text-xs text-gray-600 mb-1">
-                      Inflation (%)
-                    </label>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={expense.inflationRate}
-                      onChange={(e) =>
-                        updateOneTimeExpense(
-                          expense.id,
-                          "inflationRate",
-                          Number(e.target.value),
-                        )
-                      }
-                      className="w-full p-2 text-sm border border-gray-300 rounded"
-                    />
-                  </div>
-                  <div className="col-span-2">
-                    <button
-                      onClick={() => removeOneTimeExpense(expense.id)}
-                      className="w-full p-2 text-red-600 hover:bg-red-50 rounded"
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                  </div>
-                </div>
-
-                <div className="mt-3 pt-3 border-t border-gray-100">
-                  <div className="flex items-center gap-2">
-                    <label className="text-xs text-gray-600 whitespace-nowrap">
-                      Funded by:
-                    </label>
-                    <select
-                      value={expense.linkedSavingsBucketId ?? ""}
-                      onChange={(ev) =>
-                        updateOneTimeExpense(
-                          expense.id,
-                          "linkedSavingsBucketId",
-                          ev.target.value === ""
-                            ? undefined
-                            : Number(ev.target.value),
-                        )
-                      }
-                      disabled={monthlySavingsBuckets.length === 0}
-                      className="flex-1 p-2 text-sm border border-gray-300 rounded bg-white disabled:bg-gray-100 disabled:text-gray-400"
-                    >
-                      <option value="">(general corpus, pro-rata)</option>
-                      {monthlySavingsBuckets.map((b) => (
-                        <option key={b.id} value={b.id}>
-                          {b.name || `Bucket #${b.id}`} —{" "}
-                          {formatCurrency(b.amount)}/mo @ {b.return}%
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  {monthlySavingsBuckets.length === 0 ? (
-                    <p className="text-xs text-gray-500 mt-1">
-                      Tip: add a Monthly Savings Bucket above to earmark
-                      funds for this expense (sinking fund). Without a
-                      link, the cost is pulled pro-rata from your existing
-                      investments.
-                    </p>
-                  ) : expense.linkedSavingsBucketId !== undefined &&
-                    expense.yearsFromNow >
-                      Math.max(0, retirementAge - currentAge) ? (
-                    <p className="text-xs text-gray-500 mt-1">
-                      This expense is post-retirement. Contributions stop
-                      at retirement, but the SIP balance is held aside and
-                      keeps compounding at its rate until this expense
-                      fires; any leftover then rolls into the corpus.
-                    </p>
-                  ) : null}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* Post-Retirement Allocation */}
-          <div className="bg-teal-50 p-6 rounded-lg">
-            <div className="flex justify-between items-center mb-2">
-              <h2 className="text-xl font-semibold text-teal-800">
-                Post-Retirement Allocation
-              </h2>
-              <button
-                onClick={addPostRetirementBucket}
-                className="flex items-center gap-1 px-3 py-1 bg-teal-600 text-white rounded-md hover:bg-teal-700 text-sm"
+          {/* Post-retirement allocation */}
+          <Section
+            title="Post-Retirement Allocation"
+            help={HELP.allocationSection}
+            tone="bg-teal-50 text-teal-800"
+            actions={
+              <AddButton
+                onClick={() =>
+                  setConfig((c) => ({
+                    ...c,
+                    postRetirementBuckets: [
+                      ...c.postRetirementBuckets,
+                      { id: c.nextPostRetirementBucketId, name: "New Bucket", allocationPct: 0, return: 8 },
+                    ],
+                    nextPostRetirementBucketId: c.nextPostRetirementBucketId + 1,
+                  }))
+                }
+                tone="bg-teal-600 hover:bg-teal-700"
               >
                 <Plus size={16} />
                 Add Bucket
-              </button>
-            </div>
-            <p className="text-xs text-gray-600 mb-4">
-              How your corpus is reallocated at retirement. Each bucket
-              compounds at its own rate during decumulation; expenses are
-              pulled pro-rata. Allocations are normalised — exact 100% is
-              not required, but recommended.
+              </AddButton>
+            }
+          >
+            <p className="mb-4 text-xs text-gray-600">
+              How your corpus is reallocated at retirement. Allocations are
+              normalised, so exact 100% is not required, but recommended.
               {calculations.earmarkedAtRetirement > 0 && (
                 <>
                   {" "}
-                  <span className="text-teal-700 font-medium">
-                    Earmarked SIPs ({formatCurrency(
-                      calculations.earmarkedAtRetirement,
-                    )}
-                    ) are held aside for their linked goals and not
-                    included here.
+                  <span className="font-medium text-teal-700">
+                    Money set aside for goals ({formatCurrency(calculations.earmarkedAtRetirement)})
+                    is not included here.
                   </span>
                 </>
               )}
             </p>
             {(() => {
-              const totalPct = postRetirementBuckets.reduce(
-                (s, b) => s + (Number.isFinite(b.allocationPct) ? b.allocationPct : 0),
+              // Shares come from the engine's own split (it clamps negative
+              // percentages and normalises), so labels match what is modelled.
+              const amountById = new Map(calculations.postRetirementAllocation.map((a) => [a.id, a.amount]));
+              const totalPct = config.postRetirementBuckets.reduce(
+                (s, b) => s + (Number.isFinite(b.allocationPct) ? Math.max(0, b.allocationPct) : 0),
                 0,
               );
-              const mainCorpus = calculations.mainCorpusAtRetirement;
-              const norm = totalPct > 0 ? totalPct : 1;
               return (
                 <>
-                  {postRetirementBuckets.map((bucket) => {
-                    const share =
-                      totalPct > 0
-                        ? (bucket.allocationPct / norm) * mainCorpus
-                        : 0;
-                    return (
-                      <div
-                        key={bucket.id}
-                        className="mb-4 p-4 bg-white rounded-md border"
-                      >
-                        <div className="grid grid-cols-12 gap-3 items-center">
-                          <div className="col-span-4">
-                            <label className="block text-xs text-gray-600 mb-1">
-                              Bucket Name
-                            </label>
-                            <input
-                              type="text"
-                              value={bucket.name}
-                              onChange={(e) =>
-                                updatePostRetirementBucket(
-                                  bucket.id,
-                                  "name",
-                                  e.target.value,
-                                )
-                              }
-                              className="w-full p-2 text-sm border border-gray-300 rounded"
-                              placeholder="e.g., Cash, Debt, Equity"
-                            />
-                          </div>
-                          <div className="col-span-3">
-                            <label className="block text-xs text-gray-600 mb-1">
-                              Allocation (%) — {formatCurrency(share)}
-                            </label>
-                            <input
-                              type="number"
-                              step="1"
-                              min={0}
-                              value={bucket.allocationPct}
-                              onChange={(e) =>
-                                updatePostRetirementBucket(
-                                  bucket.id,
-                                  "allocationPct",
-                                  Number(e.target.value),
-                                )
-                              }
-                              className="w-full p-2 text-sm border border-gray-300 rounded"
-                            />
-                          </div>
-                          <div className="col-span-3">
-                            <label className="block text-xs text-gray-600 mb-1">
-                              Expected Return (%)
-                            </label>
-                            <input
-                              type="number"
-                              step="0.1"
-                              value={bucket.return}
-                              onChange={(e) =>
-                                updatePostRetirementBucket(
-                                  bucket.id,
-                                  "return",
-                                  Number(e.target.value),
-                                )
-                              }
-                              className="w-full p-2 text-sm border border-gray-300 rounded"
-                            />
-                          </div>
-                          <div className="col-span-2">
-                            <button
-                              onClick={() =>
-                                removePostRetirementBucket(bucket.id)
-                              }
-                              className="w-full p-2 text-red-600 hover:bg-red-50 rounded"
-                            >
-                              <Trash2 size={16} />
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
+                  {config.postRetirementBuckets.map((bucket) => (
+                    <BucketRow
+                      key={bucket.id}
+                      nameLabel="Bucket Name"
+                      name={bucket.name}
+                      namePlaceholder="e.g., Cash, Debt, Equity"
+                      onName={(v) => patchAllocation(bucket.id, { name: v })}
+                      middle={
+                        <NumberField
+                          label={`Allocation % (${formatCurrency(totalPct > 0 ? (amountById.get(bucket.id) ?? 0) : 0)})`}
+                          help={HELP.allocation}
+                          step="1"
+                          min={0}
+                          value={bucket.allocationPct}
+                          onChange={(v) => patchAllocation(bucket.id, { allocationPct: v })}
+                        />
+                      }
+                      rate={bucket.return}
+                      onRate={(v) => patchAllocation(bucket.id, { return: v })}
+                      rateHelp={HELP.returnPreTax}
+                      volatilityHelp={HELP.volatilityRetirement}
+                      volatility={bucket.volatility}
+                      onVolatility={(v) => patchAllocation(bucket.id, { volatility: v })}
+                      defaultVolatility={config.portfolioVolatility}
+                      onRemove={() =>
+                        setConfig((c) => ({
+                          ...c,
+                          postRetirementBuckets: c.postRetirementBuckets.filter((b) => b.id !== bucket.id),
+                        }))
+                      }
+                    >
+                      <Field className="mt-3 border-t border-gray-100 pt-3" label="Tax treatment" help={HELP.taxTreatment}>
+                        {(id) => (
+                          <select
+                            id={id}
+                            value={bucket.taxTreatment ?? "none"}
+                            onChange={(e) => patchAllocation(bucket.id, { taxTreatment: e.target.value as TaxTreatment })}
+                            className={inputCls}
+                          >
+                            {(Object.keys(TAX_LABEL) as TaxTreatment[]).map((t) => (
+                              <option key={t} value={t}>
+                                {TAX_LABEL[t]}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                      </Field>
+                    </BucketRow>
+                  ))}
                   <div
-                    className={`flex justify-between items-center p-2 rounded text-sm font-medium ${
+                    className={`flex items-center justify-between gap-2 rounded p-2 text-sm font-medium ${
                       Math.abs(totalPct - 100) < 0.01
                         ? "bg-green-100 text-green-800"
                         : totalPct === 0
@@ -997,277 +716,372 @@ const RetirementCalculator = () => {
                     <span>
                       Total allocation: {totalPct.toFixed(1)}%
                       {totalPct === 0 && (
-                        <> — falls back to single aggregated corpus</>
+                        <> (falls back to your pre-retirement mix at {calculations.weightedReturn.toFixed(1)}%)</>
                       )}
-                      {Math.abs(totalPct - 100) > 0.01 && totalPct > 0 && (
-                        <> — normalised to 100% internally</>
-                      )}
+                      {Math.abs(totalPct - 100) > 0.01 && totalPct > 0 && <> (normalised to 100% internally)</>}
                     </span>
-                    <span>{formatCurrency(mainCorpus)}</span>
+                    <span>{formatCurrency(calculations.mainCorpusAtRetirement)}</span>
                   </div>
                 </>
               );
             })()}
-          </div>
+          </Section>
 
-          {/* Monte Carlo controls */}
-          <div className="bg-pink-50 p-6 rounded-lg">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xl font-semibold text-pink-800 flex items-center gap-2">
+          <TaxSection config={config} setConfig={setConfig} />
+
+          {/* Monte Carlo settings */}
+          <Section
+            title={
+              <span className="flex items-center gap-2">
                 <Sparkles size={20} />
                 Monte Carlo Settings
-              </h2>
-            </div>
+              </span>
+            }
+            help={HELP.mcSettings}
+            helpLabel="Monte Carlo Settings"
+            tone="bg-pink-50 text-pink-800"
+          >
             <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Portfolio Volatility (% std dev)
-                </label>
+              <NumberField
+                label="Default volatility (% std dev)"
+                help={HELP.defaultVolatility}
+                labelClassName="text-sm font-medium text-gray-700"
+                step="0.5"
+                min={0}
+                value={config.portfolioVolatility}
+                onChange={(v) => set("portfolioVolatility", v)}
+              />
+              <NumberField
+                label="Inflation volatility (% std dev)"
+                help={HELP.inflationVolatility}
+                labelClassName="text-sm font-medium text-gray-700"
+                step="0.1"
+                min={0}
+                value={config.inflationVolatility}
+                onChange={(v) => set("inflationVolatility", v)}
+              />
+              <NumberField
+                label={`Inflation persistence (0 to ${MAX_INFLATION_PERSISTENCE})`}
+                help={HELP.inflationPersistence}
+                labelClassName="text-sm font-medium text-gray-700"
+                step="0.05"
+                min={0}
+                max={MAX_INFLATION_PERSISTENCE}
+                value={config.inflationPersistence}
+                onChange={(v) => set("inflationPersistence", Math.min(MAX_INFLATION_PERSISTENCE, Math.max(0, v)))}
+              />
+              <NumberField
+                label="Iterations"
+                help={HELP.iterations}
+                labelClassName="text-sm font-medium text-gray-700"
+                step="500"
+                min={100}
+                max={20000}
+                value={config.monteCarloIterations}
+                onChange={(v) => set("monteCarloIterations", v)}
+              />
+              <div className="col-span-2 flex items-center gap-2">
                 <input
-                  type="number"
-                  step="0.5"
-                  value={portfolioVolatility}
-                  onChange={(e) =>
-                    setPortfolioVolatility(Number(e.target.value))
-                  }
-                  className="w-full p-2 border border-gray-300 rounded-md"
+                  id="fat-tails"
+                  type="checkbox"
+                  checked={config.fatTails}
+                  onChange={(e) => set("fatTails", e.target.checked)}
                 />
-                <p className="text-xs text-gray-500 mt-1">
-                  Typical: 5% (debt) to 18% (equity-heavy)
-                </p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Inflation Volatility (% std dev)
+                <label htmlFor="fat-tails" className="text-sm text-gray-700">
+                  Include occasional crash and boom years (fat tails)
                 </label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={inflationVolatility}
-                  onChange={(e) =>
-                    setInflationVolatility(Number(e.target.value))
-                  }
-                  className="w-full p-2 border border-gray-300 rounded-md"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Typical: 1.0% to 2.5%
-                </p>
-              </div>
-              <div className="col-span-2">
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Iterations
-                </label>
-                <input
-                  type="number"
-                  step="500"
-                  min={100}
-                  max={20000}
-                  value={monteCarloIterations}
-                  onChange={(e) =>
-                    setMonteCarloIterations(Number(e.target.value))
-                  }
-                  className="w-full p-2 border border-gray-300 rounded-md"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  More iterations → smoother bands, slower recompute (100 to
-                  20,000)
-                </p>
+                <InfoTip text={HELP.fatTails} label="Fat tails" />
               </div>
             </div>
-          </div>
+          </Section>
         </div>
 
-        {/* Results Section */}
-        <div className="space-y-6">
-          {/* Summary Cards */}
-          <div className="grid grid-cols-2 gap-4">
-            <div className="bg-gradient-to-r from-blue-500 to-blue-600 text-white p-4 rounded-lg">
-              <div className="flex items-center gap-2 mb-2">
+        {/* ================= Results ================= */}
+        <div className="min-w-0 space-y-6">
+          {/* Headline verdict */}
+          <div
+            className={`rounded-lg border p-4 ${
+              verdict === "good"
+                ? "border-green-200 bg-green-50"
+                : verdict === "fails"
+                  ? "border-red-200 bg-red-50"
+                  : "border-amber-200 bg-amber-50"
+            }`}
+          >
+            <div
+              className={`mb-1 flex items-center gap-2 font-semibold ${
+                verdict === "good" ? "text-green-800" : verdict === "fails" ? "text-red-800" : "text-amber-800"
+              }`}
+            >
+              {verdict === "good" ? <CheckCircle2 size={20} /> : <AlertCircle size={20} />}
+              {verdict === "good"
+                ? `On track to age ${planAge}`
+                : verdict === "fragile"
+                  ? "Works on average, but fragile"
+                  : verdict === "pending"
+                    ? "Works on the expected path; simulating…"
+                    : `Money runs out at age ${survivalAgeFloor}`}
+              <InfoTip text={HELP.verdict} label="Plan verdict" />
+            </div>
+            <p className="text-sm text-gray-700">
+              If every year delivers exactly the returns you entered, your money
+              lasts <strong>{deterministicLasts}</strong>.
+              {monteCarlo && (
+                <>
+                  {" "}
+                  Across {monteCarlo.iterations.toLocaleString("en-IN")} simulated markets it lasts to
+                  age {planAge} in <strong>{formatPct(monteCarlo.successRate, 0)}</strong> of cases.
+                </>
+              )}
+              {verdict === "fragile" && monteCarlo && (
+                <>
+                  {" "}
+                  A poor run of returns (before or early in retirement), or higher
+                  inflation, breaks the plan in the other {formatPct(1 - monteCarlo.successRate, 0)}.
+                </>
+              )}
+              {verdict === "fails" && ` That is ${planAge - survivalAgeFloor} year(s) short of your plan age.`}
+              {verdict === "fails" && coverage !== undefined && coverage > 0 && (
+                <> After that, your income still covers about {formatPct(coverage, 0)} of your spending.</>
+              )}
+            </p>
+          </div>
+
+          {/* Summary cards */}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="rounded-lg bg-gradient-to-r from-blue-500 to-blue-600 p-4 text-white">
+              <div className="mb-2 flex items-center gap-2">
                 <PiggyBank size={20} />
-                <span className="text-sm opacity-90">
-                  Corpus at Retirement
+                <span className="text-sm opacity-90">Corpus at Retirement</span>
+                <span className="text-white/80">
+                  <InfoTip text={HELP.corpusAtRetirement} label="Corpus at Retirement" />
                 </span>
               </div>
-              <div className="text-2xl font-bold">
-                {formatCurrency(calculations.corpusAtRetirement)}
-              </div>
-              <div className="text-xs opacity-80 mt-1">
-                in {calculations.yearsToRetirement} years (deterministic)
+              <div className="text-2xl font-bold">{formatCurrency(calculations.corpusAtRetirement)}</div>
+              <div className="mt-1 text-xs opacity-90">
+                ≈ {formatCurrency(corpusTodayAtRetirement)} in today's money, at age {retireAge}
               </div>
               {calculations.earmarkedAtRetirement > 0 && (
-                <div className="text-xs opacity-90 mt-2 pt-2 border-t border-white/20">
-                  <div>
-                    Earmarked for goals:{" "}
-                    {formatCurrency(calculations.earmarkedAtRetirement)}
-                  </div>
-                  <div>
-                    Available for retirement:{" "}
-                    {formatCurrency(calculations.mainCorpusAtRetirement)}
-                  </div>
+                <div className="mt-2 border-t border-white/20 pt-2 text-xs opacity-90">
+                  <div>Set aside for goals: {formatCurrency(calculations.earmarkedAtRetirement)}</div>
+                  <div>Available for retirement: {formatCurrency(calculations.mainCorpusAtRetirement)}</div>
                 </div>
               )}
             </div>
-            <div className="bg-gradient-to-r from-green-500 to-green-600 text-white p-4 rounded-lg">
-              <div className="flex items-center gap-2 mb-2">
+            <div className="rounded-lg bg-gradient-to-r from-green-500 to-green-600 p-4 text-white">
+              <div className="mb-2 flex items-center gap-2">
                 <TrendingUp size={20} />
-                <span className="text-sm opacity-90">Weighted Return</span>
+                <span className="text-sm opacity-90">Return in retirement</span>
+                <span className="text-white/80">
+                  <InfoTip text={HELP.returnInRetirement} label="Return in retirement" />
+                </span>
               </div>
-              <div className="text-2xl font-bold">
-                {calculations.weightedReturn.toFixed(1)}%
+              <div className="text-2xl font-bold">{calculations.postRetirementReturn.toFixed(1)}%</div>
+              <div className="mt-1 text-xs opacity-90">
+                Real (after {calculations.inflation}% inflation): {calculations.postRetirementRealReturn.toFixed(1)}%
               </div>
-              <div className="text-xs opacity-80 mt-1">
-                Real: {calculations.realReturn.toFixed(1)}%
+              <div className="mt-1 flex items-center text-xs opacity-80">
+                Mix just before retirement: {calculations.weightedReturn.toFixed(1)}% (real{" "}
+                {calculations.realReturn.toFixed(1)}%)
+                <InfoTip text={HELP.mixBeforeRetirement} label="Mix just before retirement" />
               </div>
             </div>
           </div>
 
-          {/* Key Metrics */}
-          <div className="bg-yellow-50 p-6 rounded-lg">
-            <h2 className="text-xl font-semibold mb-4 text-yellow-800">
-              Key Metrics (Deterministic)
+          {/* Key metrics */}
+          <div className="rounded-lg bg-yellow-50 p-4 sm:p-6">
+            <h2 className="mb-4 flex items-center text-xl font-semibold text-yellow-800">
+              Key Metrics (expected path)
+              <InfoTip text={HELP.keyMetrics} label="Key Metrics" />
             </h2>
             <div className="space-y-3">
-              <div className="flex justify-between">
-                <span className="text-gray-700">Annual Expenses (today):</span>
-                <span className="font-semibold">
-                  {formatCurrency(calculations.annualExpenses)}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-700">
-                  Annual Expenses at Retirement:
-                </span>
-                <span className="font-semibold">
-                  {formatCurrency(calculations.annualExpensesAtRetirement)}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-700">
-                  Real Return (after inflation):
-                </span>
-                <span
-                  className={`font-semibold ${
-                    calculations.realReturn >= 0
-                      ? "text-green-600"
-                      : "text-red-600"
-                  }`}
-                >
-                  {calculations.realReturn.toFixed(1)}%
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-700">
-                  Corpus Lasts Post-Retirement:
-                </span>
-                <span className="font-semibold text-blue-600">
-                  {calculations.corpusLastsBeyondHorizon
-                    ? `Beyond age ${targetAge}+`
-                    : `${calculations.yearsAfterRetirement.toFixed(1)} years`}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-700">Money lasts until age:</span>
-                <span className="font-semibold text-purple-600">
-                  {calculations.corpusLastsBeyondHorizon
-                    ? `${targetAge}+`
-                    : Math.round(calculations.survivalAge)}
-                </span>
-              </div>
+              <Metric label="Annual spend (today):" help={HELP.spendToday}>
+                {formatCurrency(calculations.annualExpenses)}
+              </Metric>
+              <Metric label={`Annual spend at retirement (age ${retireAge}):`} help={HELP.spendAtRetirement}>
+                {formatCurrency(calculations.annualExpensesAtRetirement)}
+              </Metric>
+              {calculations.annualIncomeAtRetirement > 0 && (
+                <Metric label="Annual income at retirement:" help={HELP.incomeAtRetirement}>
+                  {formatCurrency(calculations.annualIncomeAtRetirement)}
+                </Metric>
+              )}
+              <Metric
+                label="First-year withdrawal rate:"
+                help={HELP.withdrawalRate}
+                valueClass={
+                  withdrawalRate <= 0.035 ? "text-green-600" : withdrawalRate <= 0.045 ? "text-amber-600" : "text-red-600"
+                }
+              >
+                {formatPct(withdrawalRate)}
+              </Metric>
+              <Metric label="Corpus lasts after retirement:" help={HELP.lastsYears} valueClass="text-blue-600">
+                {calculations.corpusLastsBeyondHorizon
+                  ? `${horizonAge - retireAge}+ years`
+                  : `${calculations.yearsAfterRetirement.toFixed(1)} years`}
+              </Metric>
+              <Metric
+                label="Money lasts until age:"
+                help={HELP.lastsAge}
+                valueClass={calculations.lastsToTargetAge ? "text-purple-600" : "text-red-600"}
+              >
+                {calculations.corpusLastsBeyondHorizon ? `${horizonAge}+` : survivalAgeFloor}
+              </Metric>
             </div>
           </div>
 
-          {/* Monte Carlo Results */}
-          <div className="bg-pink-50 p-6 rounded-lg">
-            <h2 className="text-xl font-semibold mb-4 text-pink-800 flex items-center gap-2">
-              <Sparkles size={20} />
-              Monte Carlo Simulation
-            </h2>
-            <div className="grid grid-cols-2 gap-4 mb-4">
-              <div className="bg-white p-3 rounded">
-                <div className="text-xs text-gray-500 uppercase">
-                  Success Rate
-                </div>
-                <div
-                  className={`text-2xl font-bold ${
-                    monteCarlo.successRate >= 0.85
-                      ? "text-green-600"
-                      : monteCarlo.successRate >= 0.6
-                        ? "text-yellow-600"
-                        : "text-red-600"
-                  }`}
-                >
-                  {(monteCarlo.successRate * 100).toFixed(1)}%
-                </div>
-                <div className="text-xs text-gray-500 mt-1">
-                  Paths solvent at age {targetAge} ({monteCarlo.iterations}{" "}
-                  runs)
-                </div>
-              </div>
-              <div className="bg-white p-3 rounded">
-                <div className="text-xs text-gray-500 uppercase">
-                  Median Survival Age
-                </div>
-                <div className="text-2xl font-bold text-blue-600">
-                  {monteCarlo.medianDepletionAge >= targetAge
-                    ? `${targetAge}+`
-                    : Math.round(monteCarlo.medianDepletionAge)}
-                </div>
-                <div className="text-xs text-gray-500 mt-1">
-                  When 50% of paths run out
-                </div>
-              </div>
-              <div className="bg-white p-3 rounded">
-                <div className="text-xs text-gray-500 uppercase">
-                  P10 Final Corpus
-                </div>
-                <div className="text-lg font-semibold text-red-600">
-                  {formatCurrency(monteCarlo.p10FinalCorpus)}
-                </div>
-                <div className="text-xs text-gray-500 mt-1">
-                  Pessimistic (10th percentile)
-                </div>
-              </div>
-              <div className="bg-white p-3 rounded">
-                <div className="text-xs text-gray-500 uppercase">
-                  P90 Final Corpus
-                </div>
-                <div className="text-lg font-semibold text-green-600">
-                  {formatCurrency(monteCarlo.p90FinalCorpus)}
-                </div>
-                <div className="text-xs text-gray-500 mt-1">
-                  Optimistic (90th percentile)
-                </div>
-              </div>
-            </div>
-
-            <PercentileBandChart
-              percentiles={monteCarlo.percentiles}
-              retirementAge={retirementAge}
-            />
-          </div>
-
-          {/* Future One-Time Expenses with funding status */}
-          {calculations.expenseFundings.length > 0 && (
-            <div className="bg-red-50 p-6 rounded-lg">
-              <h2 className="text-xl font-semibold mb-4 text-red-800">
-                Future One-Time Expenses
+          {/* Monte Carlo results */}
+          <div className={`rounded-lg bg-pink-50 p-4 transition-opacity sm:p-6 ${mcPending && monteCarlo ? "opacity-60" : ""}`}>
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+              <h2 className="flex items-center gap-2 text-xl font-semibold text-pink-800">
+                <Sparkles size={20} />
+                Monte Carlo Simulation
+                <InfoTip text={HELP.mcSettings} label="Monte Carlo Simulation" />
+                {mcPending && <span className="text-xs font-normal text-gray-500">updating…</span>}
               </h2>
-              <div className="space-y-3 max-h-72 overflow-y-auto">
-                {calculations.expenseFundings.map((f, index) => {
-                  const fullyLinked =
-                    f.drainedFromLinked > 0 && f.drainedFromMain === 0 && f.shortfall === 0;
-                  const partial =
-                    f.drainedFromLinked > 0 && (f.drainedFromMain > 0 || f.shortfall > 0);
+              <div className="flex items-center">
+                <div className="flex overflow-hidden rounded-md border border-pink-200 text-xs" role="group" aria-label="Show amounts in">
+                  <button
+                    type="button"
+                    onClick={() => setShowReal(true)}
+                    aria-pressed={showReal}
+                    className={`px-2 py-1 ${showReal ? "bg-pink-600 text-white" : "bg-white text-gray-700"}`}
+                  >
+                    Today's ₹
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowReal(false)}
+                    aria-pressed={!showReal}
+                    className={`px-2 py-1 ${!showReal ? "bg-pink-600 text-white" : "bg-white text-gray-700"}`}
+                  >
+                    Future ₹
+                  </button>
+                </div>
+                <InfoTip text={HELP.todayVsFuture} label="Today's ₹ or Future ₹" />
+              </div>
+            </div>
+            {mcError && (
+              <p className="mb-2 text-sm text-red-700">
+                The latest simulation failed ({mcError}); the numbers below are from your previous inputs.
+              </p>
+            )}
+            {!monteCarlo ? (
+              <p className="text-sm text-gray-600">Simulating {mcParams.iterations.toLocaleString("en-IN")} futures…</p>
+            ) : (
+              <>
+                <div className="mb-4 grid grid-cols-2 gap-4">
+                  <div className="rounded bg-white p-3">
+                    <div className="flex items-center text-xs uppercase text-gray-500">
+                      Success Rate
+                      <InfoTip text={HELP.successRate} label="Success rate" />
+                    </div>
+                    <div
+                      className={`text-2xl font-bold ${
+                        monteCarlo.successRate >= GOOD_SUCCESS_RATE
+                          ? "text-green-600"
+                          : monteCarlo.successRate >= 0.6
+                            ? "text-yellow-600"
+                            : "text-red-600"
+                      }`}
+                    >
+                      {formatPct(monteCarlo.successRate)}
+                    </div>
+                    <div className="mt-1 text-xs text-gray-500">
+                      Paths that fund living costs to age {planAge} ({monteCarlo.iterations.toLocaleString("en-IN")} runs)
+                    </div>
+                  </div>
+                  <div className="rounded bg-white p-3">
+                    <div className="flex items-center text-xs uppercase text-gray-500">
+                      Bad case lasts until
+                      <InfoTip text={HELP.badCase} label="Bad case" />
+                    </div>
+                    <div className="text-2xl font-bold text-blue-600">
+                      {monteCarlo.p10DepletionAge >= monteCarlo.targetAge
+                        ? `${monteCarlo.targetAge}+`
+                        : Math.floor(monteCarlo.p10DepletionAge)}
+                    </div>
+                    <div className="mt-1 text-xs text-gray-500">Age by which the worst 10% of paths run out</div>
+                  </div>
+                </div>
+                {finalCorpus && (
+                  <>
+                    <div className="mb-1 flex items-center text-xs font-medium text-gray-600">
+                      Left at age {planAge} ({showReal ? "today's ₹" : "future ₹"})
+                      <InfoTip text={HELP.finalCorpus} label="Left at plan age" />
+                    </div>
+                    <div className="mb-4 grid grid-cols-3 gap-2">
+                      {(
+                        [
+                          ["P10", finalCorpus.p10, "text-red-600", "Pessimistic"],
+                          ["Median", finalCorpus.p50, "text-gray-800", "Typical"],
+                          ["P90", finalCorpus.p90, "text-green-600", "Optimistic"],
+                        ] as const
+                      ).map(([label, value, cls, hint]) => (
+                        <div key={label} className="rounded bg-white p-2">
+                          <div className="text-[11px] uppercase text-gray-500">{label}</div>
+                          <div className={`text-base font-semibold ${cls}`}>{formatCurrency(value)}</div>
+                          <div className="text-[11px] text-gray-500">{hint}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+                <PercentileBandChart
+                  percentiles={showReal ? monteCarlo.realPercentiles : monteCarlo.percentiles}
+                  deterministic={[
+                    { age: calculations.currentAge, value: calculations.startingCorpus },
+                    ...calculations.yearlyData
+                      .filter((d) => d.age <= monteCarlo.targetAge)
+                      .map((d) => ({ age: d.age, value: showReal ? toToday(d.corpus, d.inflationIndex) : d.corpus })),
+                  ]}
+                  retirementAge={retireAge}
+                  unitLabel={showReal ? "today's ₹" : "future ₹"}
+                />
+              </>
+            )}
+          </div>
+
+          <SolverPanel
+            client={client}
+            params={mcParams}
+            target={config.solverTargetSuccess}
+            onTarget={(t) => set("solverTargetSuccess", t)}
+            plannedRetirementAge={retireAge}
+            alreadyRetired={calculations.yearsToRetirement === 0}
+            currentSpend={config.monthlyExpenses}
+            expenseType={config.expenseType}
+          />
+
+          <ScenarioPanel
+            config={config}
+            onLoad={(c) => setConfigState(normalizeConfig(c))}
+            client={client}
+          />
+
+          {/* Goal funding */}
+          {calculations.expenseFundings.length > 0 && (
+            <div className="rounded-lg bg-red-50 p-4 sm:p-6">
+              <h2 className="mb-4 flex items-center text-xl font-semibold text-red-800">
+                Future One-Time Expenses
+                <InfoTip text={HELP.goalsResult} label="Future One-Time Expenses" />
+              </h2>
+              <div className="max-h-72 space-y-3 overflow-y-auto">
+                {calculations.expenseFundings.map((f) => {
+                  const fullyLinked = f.drainedFromLinked > 0 && f.drainedFromMain === 0 && f.shortfall === 0;
+                  const partial = f.drainedFromLinked > 0 && (f.drainedFromMain > 0 || f.shortfall > 0);
                   const unlinked = f.drainedFromLinked === 0;
-                  const status = f.shortfall > 0
-                    ? "shortfall"
-                    : fullyLinked
-                      ? "fully-linked"
-                      : partial
-                        ? "partial"
-                        : "unlinked";
+                  const status = f.afterDepletion
+                    ? "unpaid"
+                    : f.shortfall > 0
+                      ? "shortfall"
+                      : fullyLinked
+                        ? "fully-linked"
+                        : partial
+                          ? "partial"
+                          : "unlinked";
                   const statusColor =
-                    status === "shortfall"
+                    status === "unpaid" || status === "shortfall"
                       ? "border-red-400 bg-red-100"
                       : status === "fully-linked"
                         ? "border-green-300 bg-green-50"
@@ -1275,71 +1089,49 @@ const RetirementCalculator = () => {
                           ? "border-amber-300 bg-amber-50"
                           : "border-gray-200 bg-white";
                   return (
-                    <div
-                      key={index}
-                      className={`p-3 rounded border ${statusColor}`}
-                    >
-                      <div className="flex justify-between items-baseline">
+                    <div key={`${f.expenseId}-${f.yearsFromNow}`} className={`rounded border p-3 ${statusColor}`}>
+                      <div className="flex items-baseline justify-between gap-2">
                         <span className="font-medium text-gray-800">
-                          {f.expenseName}{" "}
-                          <span className="text-xs text-gray-500">
-                            (Age {f.ageWhenDue})
-                          </span>
+                          {f.expenseName} <span className="text-xs text-gray-500">(Age {f.ageWhenDue})</span>
                         </span>
-                        <span className="font-semibold text-red-600">
-                          {formatCurrency(f.futureValue)}
-                        </span>
+                        <span className="font-semibold text-red-600">{formatCurrency(f.futureValue)}</span>
                       </div>
-                      <div className="text-xs text-gray-600 mt-1 space-y-0.5">
+                      <div className="mt-1 space-y-0.5 text-xs text-gray-600">
+                        {f.afterDepletion && (
+                          <div className="font-medium text-red-700">
+                            Not paid: the money runs out at age {survivalAgeFloor}, before this is due.
+                          </div>
+                        )}
                         {f.drainedFromLinked > 0 && (
                           <div>
-                            From SIP / earmarked pool:{" "}
-                            <span className="font-medium text-green-700">
-                              {formatCurrency(f.drainedFromLinked)}
-                            </span>
+                            From SIP / set-aside money:{" "}
+                            <span className="font-medium text-green-700">{formatCurrency(f.drainedFromLinked)}</span>
                             {f.linkedBalanceBefore !== undefined && (
-                              <span className="text-gray-500">
-                                {" "}
-                                (pool had{" "}
-                                {formatCurrency(f.linkedBalanceBefore)})
-                              </span>
+                              <span className="text-gray-500"> (it had {formatCurrency(f.linkedBalanceBefore)})</span>
                             )}
                           </div>
                         )}
                         {f.drainedFromMain > 0 && (
                           <div>
-                            From main corpus (pro-rata):{" "}
-                            <span
-                              className={`font-medium ${
-                                unlinked ? "text-gray-700" : "text-amber-700"
-                              }`}
-                            >
+                            From main corpus:{" "}
+                            <span className={`font-medium ${unlinked ? "text-gray-700" : "text-amber-700"}`}>
                               {formatCurrency(f.drainedFromMain)}
                             </span>
                           </div>
                         )}
-                        {f.shortfall > 0 && (
+                        {f.shortfall > 0 && !f.afterDepletion && (
                           <div>
-                            <span className="font-medium text-red-700">
-                              Shortfall: {formatCurrency(f.shortfall)}
-                            </span>{" "}
-                            <span className="text-gray-500">
-                              — your savings could not cover this goal in
-                              full.
-                            </span>
+                            <span className="font-medium text-red-700">Shortfall: {formatCurrency(f.shortfall)}</span>{" "}
+                            <span className="text-gray-500">(your savings could not cover this goal in full)</span>
                           </div>
                         )}
-                        {f.surplusRolledOver !== undefined &&
-                          f.surplusRolledOver > 0 && (
-                            <div className="text-emerald-700 font-medium">
-                              Surplus {formatCurrency(f.surplusRolledOver)}{" "}
-                              rolls into your retirement corpus.
-                            </div>
-                          )}
-                        {fullyLinked && f.surplusRolledOver === undefined && (
-                          <div className="text-green-700 text-xs italic">
-                            Fully funded by the linked SIP.
+                        {f.surplusRolledOver !== undefined && f.surplusRolledOver > 0 && (
+                          <div className="font-medium text-emerald-700">
+                            Surplus {formatCurrency(f.surplusRolledOver)} rolls into your retirement corpus.
                           </div>
+                        )}
+                        {fullyLinked && f.surplusRolledOver === undefined && (
+                          <div className="text-xs italic text-green-700">Fully funded by the linked SIP.</div>
                         )}
                       </div>
                     </div>
@@ -1350,121 +1142,116 @@ const RetirementCalculator = () => {
           )}
 
           {/* Warnings */}
-          {calculations.realReturn < 0 && (
-            <div className="bg-red-50 border border-red-200 p-4 rounded-lg">
-              <div className="flex items-center gap-2 text-red-700 mb-2">
+          {calculations.postRetirementRealReturn < 0 && (
+            <div className="rounded-lg border border-red-200 bg-red-50 p-4">
+              <div className="mb-2 flex items-center gap-2 text-red-700">
                 <AlertCircle size={20} />
-                <span className="font-semibold">
-                  Warning: Negative Real Return
-                </span>
+                <span className="font-semibold">Warning: Negative Real Return in Retirement</span>
               </div>
-              <p className="text-red-600 text-sm">
-                Your weighted return ({calculations.weightedReturn.toFixed(1)}%)
-                is lower than inflation ({inflation}%). Consider increasing
-                allocation to higher-return investments.
+              <p className="text-sm text-red-600">
+                Your retirement allocation earns {calculations.postRetirementReturn.toFixed(1)}%, below{" "}
+                {calculations.inflation}% inflation, so the corpus loses buying power every year even
+                before withdrawals.
               </p>
             </div>
           )}
-
-          {monteCarlo.successRate < 0.7 && (
-            <div className="bg-orange-50 border border-orange-200 p-4 rounded-lg">
-              <div className="flex items-center gap-2 text-orange-700 mb-2">
+          {monteCarlo && monteCarlo.successRate < 0.7 && (
+            <div className="rounded-lg border border-orange-200 bg-orange-50 p-4">
+              <div className="mb-2 flex items-center gap-2 text-orange-700">
                 <AlertCircle size={20} />
                 <span className="font-semibold">Low Success Probability</span>
               </div>
-              <p className="text-orange-600 text-sm">
-                Only {(monteCarlo.successRate * 100).toFixed(0)}% of simulated
-                paths fund expenses through age {targetAge}. Consider
-                increasing savings, retiring later, or reducing expenses.
+              <p className="text-sm text-orange-600">
+                Only {formatPct(monteCarlo.successRate, 0)} of simulated paths fund expenses through age{" "}
+                {planAge}. "What would it take?" above shows how much to change to fix it.
               </p>
             </div>
           )}
 
-          {/* Portfolio Allocation */}
-          <div className="bg-purple-50 p-6 rounded-lg">
-            <h2 className="text-xl font-semibold mb-4 text-purple-800">
+          {/* Portfolio allocation today */}
+          <div className="rounded-lg bg-purple-50 p-4 sm:p-6">
+            <h2 className="mb-4 flex items-center text-xl font-semibold text-purple-800">
               Portfolio Allocation (today)
+              <InfoTip text={HELP.portfolioToday} label="Portfolio Allocation (today)" />
             </h2>
             <div className="space-y-2">
               {(() => {
-                const total = investmentBuckets.reduce(
-                  (s, b) => s + b.amount,
-                  0,
-                );
-                return investmentBuckets.map((bucket, index) => {
-                  const pct = total > 0 ? (bucket.amount / total) * 100 : 0;
-                  return (
-                    <div
-                      key={index}
-                      className="flex justify-between items-center"
-                    >
-                      <span className="text-sm text-gray-700">
-                        {bucket.name}:
-                      </span>
-                      <span className="text-sm font-medium">
-                        {pct.toFixed(1)}% ({formatCurrency(bucket.amount)})
-                      </span>
-                    </div>
-                  );
-                });
+                const total = config.investmentBuckets.reduce((s, b) => s + (Number.isFinite(b.amount) ? b.amount : 0), 0);
+                return config.investmentBuckets.map((bucket) => (
+                  <div key={bucket.id} className="flex items-center justify-between gap-2">
+                    <span className="text-sm text-gray-700">{bucket.name}:</span>
+                    <span className="text-sm font-medium">
+                      {(total > 0 ? (bucket.amount / total) * 100 : 0).toFixed(1)}% ({formatCurrency(bucket.amount)})
+                    </span>
+                  </div>
+                ));
               })()}
             </div>
           </div>
 
-          {/* Year-by-year projection */}
-          <div className="bg-gray-50 p-6 rounded-lg">
-            <h2 className="text-xl font-semibold mb-4 text-gray-800">
+          {/* Year-by-year */}
+          <div className="rounded-lg bg-gray-50 p-4 sm:p-6">
+            <h2 className="mb-1 flex items-center text-xl font-semibold text-gray-800">
               Year-by-Year Projection
+              <InfoTip text={HELP.yearByYear} label="Year-by-Year Projection" />
             </h2>
-            <div className="space-y-2 max-h-60 overflow-y-auto">
-              {calculations.yearlyData.map(
-                (data: YearlyProjection, index: number) => (
-                  <div key={index} className="text-sm">
-                    <div className="flex justify-between">
+            <p className="mb-4 text-xs text-gray-500">
+              Expected path. Amounts in future ₹, with today's value in brackets.
+            </p>
+            <div className="max-h-80 space-y-2 overflow-y-auto">
+              {calculations.yearlyData.map((data, index) => {
+                const isDepletionYear =
+                  !calculations.corpusLastsBeyondHorizon && index === calculations.yearlyData.length - 1;
+                return (
+                  <div key={data.year} className="text-sm">
+                    <div className="flex justify-between gap-2">
                       <span className="text-gray-600">
                         Age {data.age}{" "}
-                        <span
-                          className={`text-xs ml-1 ${
-                            data.isRetired
-                              ? "text-purple-600"
-                              : "text-blue-600"
-                          }`}
-                        >
+                        <span className={`ml-1 text-xs ${data.isRetired ? "text-purple-600" : "text-blue-600"}`}>
                           ({data.isRetired ? "retired" : "working"})
                         </span>
                         :
                       </span>
-                      <span className="font-medium">
-                        {formatCurrency(data.corpus)}
+                      <span className="text-right font-medium">
+                        {formatCurrency(data.corpus)}{" "}
+                        <span className="text-xs font-normal text-gray-500">
+                          ({formatCurrency(toToday(data.corpus, data.inflationIndex))})
+                        </span>
                       </span>
                     </div>
-                    <div className="text-xs text-gray-500 ml-4">
+                    <div className="ml-4 flex flex-wrap gap-x-2 text-xs text-gray-500">
                       {data.isRetired ? (
-                        <>Regular: {formatCurrency(data.regularExpenses)}</>
-                      ) : (
-                        <>
-                          Contributions:{" "}
-                          {formatCurrency(data.contributions)}
-                        </>
-                      )}
-                      {data.oneTimeExpenses > 0 && (
-                        <span className="text-red-600 ml-2">
-                          One-time: {formatCurrency(data.oneTimeExpenses)}
-                          {data.oneTimeItems.length > 0 && (
-                            <span className="ml-1">
-                              (
-                              {data.oneTimeItems
-                                .map((item: FutureOneTimeExpense) => item.name)
-                                .join(", ")}
-                              )
+                        <span>
+                          Spent: {formatCurrency(data.regularExpenses)}
+                          {data.healthcareExpenses > 0 && <> (health {formatCurrency(data.healthcareExpenses)})</>}
+                          {data.livingCostsFromEarmarked > 0 && (
+                            <span className="text-amber-700">
+                              {" "}
+                              ({formatCurrency(data.livingCostsFromEarmarked)} from goal savings)
                             </span>
                           )}
                         </span>
+                      ) : (
+                        <span>Saved: {formatCurrency(data.contributions)}</span>
+                      )}
+                      {data.incomeReceived > 0 && <span>Income: {formatCurrency(data.incomeReceived)}</span>}
+                      <span>Growth: {formatCurrency(data.growth)}</span>
+                      {data.taxPaid > 0 && <span>Tax: {formatCurrency(data.taxPaid)}</span>}
+                      {data.oneTimeExpenses > 0 && (
+                        <span className="text-red-600">
+                          One-time: {formatCurrency(data.oneTimeExpenses)}
+                          {data.oneTimeItems.length > 0 && <> ({data.oneTimeItems.map((item) => item.name).join(", ")})</>}
+                        </span>
                       )}
                     </div>
+                    {isDepletionYear && (
+                      <div className="ml-4 text-xs font-medium text-red-700">
+                        Money runs out during this year (age {calculations.survivalAge.toFixed(1)}).
+                      </div>
+                    )}
                   </div>
-                ),
-              )}
+                );
+              })}
             </div>
           </div>
         </div>
@@ -1473,178 +1260,44 @@ const RetirementCalculator = () => {
   );
 };
 
-interface PercentileBandChartProps {
-  percentiles: MonteCarloResult["percentiles"];
-  retirementAge: number;
+// Keeps a crash in the calculator (for example from hand-edited saved data)
+// inside this tab, so it can never take the Portfolio tab down with it.
+class CalculatorErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Retirement calculator crashed:", error, info.componentStack);
+  }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="mx-auto max-w-xl rounded-lg bg-white p-6 text-center">
+        <h2 className="mb-2 text-lg font-semibold text-red-700">The retirement calculator hit a problem</h2>
+        <p className="mb-4 text-sm text-gray-600">
+          This is usually caused by damaged saved inputs. Resetting replaces
+          your inputs with the defaults (your saved plans are kept).
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            saveRetirementConfig(normalizeConfig({}));
+            this.setState({ error: null });
+          }}
+          className="rounded-md bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700"
+        >
+          Reset calculator inputs
+        </button>
+      </div>
+    );
+  }
 }
 
-const PercentileBandChart = ({
-  percentiles,
-  retirementAge,
-}: PercentileBandChartProps) => {
-  if (percentiles.length === 0) return null;
+const RetirementCalculatorWithBoundary = () => (
+  <CalculatorErrorBoundary>
+    <RetirementCalculator />
+  </CalculatorErrorBoundary>
+);
 
-  const width = 480;
-  const height = 200;
-  const padding = { top: 10, right: 12, bottom: 24, left: 48 };
-  const innerW = width - padding.left - padding.right;
-  const innerH = height - padding.top - padding.bottom;
-
-  const minAge = percentiles[0].age;
-  const maxAge = percentiles[percentiles.length - 1].age;
-  const ageRange = Math.max(1, maxAge - minAge);
-
-  const maxValue = Math.max(
-    1,
-    ...percentiles.map((p) => p.p90),
-  );
-
-  const xFor = (age: number) =>
-    padding.left + ((age - minAge) / ageRange) * innerW;
-  const yFor = (v: number) =>
-    padding.top + innerH - (Math.max(0, v) / maxValue) * innerH;
-
-  const buildArea = (
-    upper: (p: MonteCarloResult["percentiles"][number]) => number,
-    lower: (p: MonteCarloResult["percentiles"][number]) => number,
-  ) => {
-    const top = percentiles
-      .map((p) => `${xFor(p.age)},${yFor(upper(p))}`)
-      .join(" ");
-    const bottom = percentiles
-      .slice()
-      .reverse()
-      .map((p) => `${xFor(p.age)},${yFor(lower(p))}`)
-      .join(" ");
-    return `M ${top} L ${bottom} Z`;
-  };
-
-  const linePath = (key: keyof MonteCarloResult["percentiles"][number]) =>
-    percentiles
-      .map(
-        (p, i) =>
-          `${i === 0 ? "M" : "L"} ${xFor(p.age)} ${yFor(p[key] as number)}`,
-      )
-      .join(" ");
-
-  const formatTick = (v: number) => {
-    if (v >= 1e7) return `${(v / 1e7).toFixed(1)}Cr`;
-    if (v >= 1e5) return `${(v / 1e5).toFixed(0)}L`;
-    if (v >= 1e3) return `${(v / 1e3).toFixed(0)}K`;
-    return `${v.toFixed(0)}`;
-  };
-
-  const yTicks = [0, 0.25, 0.5, 0.75, 1].map((f) => f * maxValue);
-
-  return (
-    <div className="bg-white rounded p-2 border border-pink-200">
-      <div className="text-xs text-gray-600 mb-1 font-medium">
-        Corpus distribution by age
-      </div>
-      <svg
-        width="100%"
-        viewBox={`0 0 ${width} ${height}`}
-        preserveAspectRatio="xMidYMid meet"
-      >
-        {/* y-axis ticks */}
-        {yTicks.map((t, i) => (
-          <g key={i}>
-            <line
-              x1={padding.left}
-              x2={width - padding.right}
-              y1={yFor(t)}
-              y2={yFor(t)}
-              stroke="#f1f5f9"
-            />
-            <text
-              x={padding.left - 4}
-              y={yFor(t) + 3}
-              fontSize="9"
-              textAnchor="end"
-              fill="#64748b"
-            >
-              {formatTick(t)}
-            </text>
-          </g>
-        ))}
-
-        {/* P10–P90 band */}
-        <path
-          d={buildArea(
-            (p) => p.p90,
-            (p) => p.p10,
-          )}
-          fill="#fbcfe8"
-          opacity="0.6"
-        />
-        {/* P25–P75 band */}
-        <path
-          d={buildArea(
-            (p) => p.p75,
-            (p) => p.p25,
-          )}
-          fill="#f9a8d4"
-          opacity="0.7"
-        />
-        {/* Median line */}
-        <path
-          d={linePath("p50")}
-          fill="none"
-          stroke="#be185d"
-          strokeWidth="1.5"
-        />
-
-        {/* Retirement age vertical marker */}
-        {retirementAge >= minAge && retirementAge <= maxAge && (
-          <g>
-            <line
-              x1={xFor(retirementAge)}
-              x2={xFor(retirementAge)}
-              y1={padding.top}
-              y2={height - padding.bottom}
-              stroke="#7c3aed"
-              strokeDasharray="3,3"
-            />
-            <text
-              x={xFor(retirementAge) + 3}
-              y={padding.top + 9}
-              fontSize="9"
-              fill="#7c3aed"
-            >
-              retire @ {retirementAge}
-            </text>
-          </g>
-        )}
-
-        {/* x-axis labels */}
-        {[minAge, Math.round((minAge + maxAge) / 2), maxAge].map((age) => (
-          <text
-            key={age}
-            x={xFor(age)}
-            y={height - 8}
-            fontSize="9"
-            textAnchor="middle"
-            fill="#64748b"
-          >
-            age {age}
-          </text>
-        ))}
-      </svg>
-      <div className="flex gap-3 text-xs text-gray-600 mt-1 ml-12 flex-wrap">
-        <span className="flex items-center gap-1">
-          <span className="w-3 h-3 inline-block bg-pink-200 rounded-sm" />
-          P10–P90
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="w-3 h-3 inline-block bg-pink-300 rounded-sm" />
-          P25–P75
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="w-3 h-0.5 inline-block bg-pink-700" /> Median
-        </span>
-      </div>
-    </div>
-  );
-};
-
-export default RetirementCalculator;
+export default RetirementCalculatorWithBoundary;
